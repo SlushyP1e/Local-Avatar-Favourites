@@ -86,7 +86,10 @@ def merge_favourites(existing: list[dict], incoming: list[dict]) -> tuple[list[d
         if not avatar_id or avatar_id in merged:
             continue
         new = new_entry(avatar_id)
-        for key in ("name", "notes", "author", "release_status", "thumb", "thumb_url"):
+        # "thumb" is deliberately not copied: it is a local cache filename, so a
+        # shared export must never dictate a path on the importing machine.
+        # thumb_url is kept and re-resolved on the next metadata refresh.
+        for key in ("name", "notes", "author", "release_status", "thumb_url"):
             value = entry.get(key)
             if value:
                 new[key] = value
@@ -190,23 +193,58 @@ def new_entry(avatar_id: str, name: str = "") -> dict:
     }
 
 
+def sanitize_settings(raw) -> dict:
+    """Coerce a loaded settings mapping into a valid, fully-populated dict.
+
+    settings.json is user-writable and hand-editable, so every field is treated
+    as untrusted. Previously a non-numeric ``osc_send_port`` reached
+    ``int()`` in the Backend constructor and aborted start-up with a traceback
+    and no window.
+    """
+    settings = dict(DEFAULT_SETTINGS)
+    if not isinstance(raw, dict):
+        return settings
+    for key, value in raw.items():
+        if key in settings:
+            settings[key] = value
+
+    for key, default in (("osc_send_port", 9000), ("osc_receive_port", 9001)):
+        try:
+            port = int(settings.get(key, default))
+        except (TypeError, ValueError):
+            port = default
+        if not (0 < port < 65536):
+            port = default
+        settings[key] = port
+
+    host = settings.get("osc_send_ip")
+    settings["osc_send_ip"] = str(host) if isinstance(host, str) and host.strip() else "127.0.0.1"
+
+    for key in ("auth_token", "auth_username"):
+        value = settings.get(key)
+        settings[key] = value if isinstance(value, str) else ""
+
+    try:
+        settings["auth_expires"] = int(settings.get("auth_expires", 0) or 0)
+    except (TypeError, ValueError):
+        settings["auth_expires"] = 0
+    return settings
+
+
 def load_settings() -> dict:
     ensure_dirs()
-    settings = dict(DEFAULT_SETTINGS)
+    raw = None
     if SETTINGS_FILE.exists():
         try:
-            saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            if isinstance(saved, dict):
-                settings.update(saved)
+            raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            pass
-    return settings
+            raw = None
+    return sanitize_settings(raw)
 
 
 def save_settings(settings: dict) -> None:
     ensure_dirs()
-    merged = dict(DEFAULT_SETTINGS)
-    merged.update(settings)
+    merged = sanitize_settings(settings)
     tmp = SETTINGS_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(SETTINGS_FILE)
@@ -215,6 +253,30 @@ def save_settings(settings: dict) -> None:
 def sanitize_filename(value: str) -> str:
     value = re.sub(r"[^A-Za-z0-9_.-]", "_", value)
     return value or "avatar"
+
+
+def resolve_thumb(name) -> Path | None:
+    """Resolve a stored thumbnail name to a path inside the thumbnail cache.
+
+    Returns None for anything that is not a plain filename inside THUMBS_DIR.
+    Thumb names come from favourites.json and from imported files, so a crafted
+    ``thumb`` value such as ``C:\\Windows\\win.ini`` would otherwise make the app
+    read an arbitrary local file and hand it to the UI as base64.
+
+    Anything containing a separator is rejected outright rather than reduced to
+    its final component: silently rewriting ``../../x.png`` to ``thumbs/x.png``
+    would still turn the cache into a probe for files that happen to be there.
+    """
+    if not name or not isinstance(name, str):
+        return None
+    if "/" in name or "\\" in name or ":" in name or name in (".", ".."):
+        return None
+    try:
+        root = THUMBS_DIR.resolve()
+        candidate = (root / name).resolve()
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.parent == root else None
 
 
 def thumb_file_path(avatar_id: str, ext: str = "png") -> Path:

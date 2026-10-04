@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import urllib.error
 import urllib.request
 from http.cookiejar import Cookie, CookieJar
@@ -21,6 +22,9 @@ except Exception:  # pragma: no cover - defensive
 
 API_BASE = "https://api.vrchat.cloud/api/1"
 USER_AGENT = f"LocalAvatarFavourites/{__version__} (local favourites tool)"
+
+# Avatar thumbnails are ~200x300. This is generous headroom, not a target.
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
 
 
 class ApiError(Exception):
@@ -49,7 +53,8 @@ def _auth_cookie(token: str) -> Cookie:
         domain_initial_dot=False,
         path="/",
         path_specified=True,
-        secure=False,
+        # Only ever sent over HTTPS.
+        secure=True,
         expires=None,
         discard=False,
         comment=None,
@@ -189,16 +194,35 @@ class VRCApi:
         self._raise_api_error(raw, status)
         return None  # pragma: no cover
 
-    def download_image(self, url: str, dest_path: str) -> bool:
-        """Download an image to disk (auth cookie sent automatically)."""
+    def download_image(self, url: str, dest_path: str, max_bytes: int = MAX_IMAGE_BYTES) -> bool:
+        """Download an image to disk (auth cookie sent automatically).
+
+        Capped at ``max_bytes``: without a ceiling a hostile or broken URL can fill
+        the disk, since nothing here bounds the response length.
+        """
+        if not str(url or "").lower().startswith(("http://", "https://")):
+            return False
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        written = 0
         try:
-            with self._opener.open(req, timeout=30) as resp, open(dest_path, "wb") as fh:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
+            with self._opener.open(req, timeout=30) as resp:
+                declared = resp.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    return False
+                with open(dest_path, "wb") as fh:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > max_bytes:
+                            fh.close()
+                            try:
+                                os.remove(dest_path)
+                            except OSError:
+                                pass
+                            return False
+                        fh.write(chunk)
             return True
         except (urllib.error.URLError, OSError):
             return False

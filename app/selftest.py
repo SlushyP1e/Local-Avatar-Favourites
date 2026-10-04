@@ -465,13 +465,126 @@ def test_vrcache_locked_database() -> None:
         check("vrcache recovers after unlock", w.poll() == [])
 
 
+def test_storage_security() -> None:
+    """Stored thumbnail names are untrusted and must stay inside the cache."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        storage.DATA_DIR = root
+        storage.THUMBS_DIR = root / "thumbs"
+        storage.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+        (storage.THUMBS_DIR / "good.png").write_bytes(b"png-bytes")
+
+        ok = storage.resolve_thumb("good.png")
+        check("resolve_thumb accepts a plain name", ok is not None and ok.exists())
+
+        escapes = [
+            "../../../Windows/win.ini",
+            r"..\..\..\Windows\win.ini",
+            "C:\\Windows\\win.ini",
+            "/etc/passwd",
+            "sub/dir/other.png",
+            "..",
+            "",
+            None,
+        ]
+        for candidate in escapes:
+            check(f"resolve_thumb rejects {candidate!r}", storage.resolve_thumb(candidate) is None,
+                  str(storage.resolve_thumb(candidate)))
+
+
+def test_storage_import_ignores_local_paths() -> None:
+    """A shared export must not be able to point at a local file."""
+    merged, added = storage.merge_favourites([], [{
+        "id": "avtr_aaaa-bbbb",
+        "name": "Shared",
+        "thumb": "../../../../Windows/win.ini",
+        "thumb_url": "https://example.invalid/t.png",
+    }])
+    check("import adds the entry", added == 1 and len(merged) == 1)
+    check("import drops the local thumb path", merged[0].get("thumb") is None,
+          str(merged[0].get("thumb")))
+    check("import keeps the remote thumb url", merged[0].get("thumb_url") == "https://example.invalid/t.png")
+
+
+def test_settings_sanitize() -> None:
+    sanitize = storage.sanitize_settings
+
+    defaults = sanitize({})
+    check("sanitize empty -> defaults", defaults["osc_send_port"] == 9000
+          and defaults["osc_receive_port"] == 9001)
+
+    cases = [
+        ({"osc_send_port": "abc"}, "osc_send_port", 9000, "non-numeric port"),
+        ({"osc_send_port": None}, "osc_send_port", 9000, "null port"),
+        ({"osc_send_port": 0}, "osc_send_port", 9000, "zero port"),
+        ({"osc_send_port": 70000}, "osc_send_port", 9000, "out-of-range port"),
+        ({"osc_receive_port": "not a number"}, "osc_receive_port", 9001, "bad recv port"),
+        ({"osc_receive_port": -5}, "osc_receive_port", 9001, "negative recv port"),
+        ({"osc_send_port": 9010}, "osc_send_port", 9010, "valid port preserved"),
+        ({"osc_send_port": "9011"}, "osc_send_port", 9011, "numeric string port preserved"),
+    ]
+    for payload, key, expected, label in cases:
+        got = sanitize(payload)[key]
+        check(f"sanitize {label}", got == expected, str(got))
+
+    check("sanitize non-dict", sanitize(None)["osc_send_port"] == 9000)
+    check("sanitize list", sanitize([1, 2])["osc_send_port"] == 9000)
+
+    junk = sanitize({"auth_token": 12345, "auth_username": None,
+                     "osc_send_ip": "", "auth_expires": "soon", "unknown_key": "x"})
+    check("sanitize coerces non-string token", junk["auth_token"] == "")
+    check("sanitize coerces null username", junk["auth_username"] == "")
+    check("sanitize blank host -> loopback", junk["osc_send_ip"] == "127.0.0.1")
+    check("sanitize bad expiry", junk["auth_expires"] == 0)
+    check("sanitize drops unknown keys", "unknown_key" not in junk)
+
+    good = sanitize({"osc_send_ip": "10.0.0.5"})
+    check("sanitize keeps real host", good["osc_send_ip"] == "10.0.0.5")
+
+
+def test_settings_load_recovers_from_corrupt_file() -> None:
+    """A hand-edited or truncated settings.json must not break start-up."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        storage.DATA_DIR = root
+        storage.SETTINGS_FILE = root / "settings.json"
+
+        storage.SETTINGS_FILE.write_text("{ this is not json", encoding="utf-8")
+        check("corrupt settings fall back to defaults",
+              storage.load_settings()["osc_send_port"] == 9000)
+
+        storage.SETTINGS_FILE.write_text(json.dumps({"osc_send_port": "oops"}), encoding="utf-8")
+        check("invalid port in file repaired", storage.load_settings()["osc_send_port"] == 9000)
+
+        storage.SETTINGS_FILE.write_text(json.dumps({"osc_send_port": 9123}), encoding="utf-8")
+        check("valid settings still load", storage.load_settings()["osc_send_port"] == 9123)
+
+
+def test_api_image_download_guards() -> None:
+    from api import MAX_IMAGE_BYTES, VRCApi
+
+    check("image cap is sane", 0 < MAX_IMAGE_BYTES <= 16 * 1024 * 1024)
+    api = VRCApi()
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "out.png"
+        # Rejected before any network access: non-http schemes.
+        for bad in ("file:///C:/Windows/win.ini", "ftp://example.invalid/x.png", "", None):
+            check(f"download_image rejects {bad!r}", api.download_image(bad, str(dest)) is False)
+        check("rejected download wrote nothing", not dest.exists())
+
+
 def main() -> int:
     tests = [
         test_storage,
         test_storage_merge,
+        test_storage_security,
+        test_storage_import_ignores_local_paths,
+        test_settings_sanitize,
+        test_settings_load_recovers_from_corrupt_file,
         test_osc_receive,
         test_osc_send,
         test_api_helpers,
+        test_api_image_download_guards,
         test_vrclog_parse,
         test_update_compare,
         test_vrcache_pattern,

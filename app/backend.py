@@ -272,8 +272,9 @@ class Backend:
             thumb = entry.get("thumb") if entry else None
         if not thumb:
             return ""
-        path = storage.THUMBS_DIR / thumb
-        if not path.exists():
+        # The stored name is untrusted: it can arrive from an imported file.
+        path = storage.resolve_thumb(thumb)
+        if path is None or not path.exists():
             return ""
         try:
             data = path.read_bytes()
