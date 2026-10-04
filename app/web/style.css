@@ -86,7 +86,8 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   background: transparent;
   color: var(--muted);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+    transform var(--t-fast) var(--ease);
 }
 .rail-btn svg {
   width: 1.25rem;
@@ -97,7 +98,8 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.rail-btn:hover { background: var(--surface-2); color: var(--text); }
+.rail-btn:hover { background: var(--surface-2); color: var(--text); transform: scale(1.08); }
+.rail-btn:active { transform: scale(0.95); }
 .rail-btn.active { background: var(--accent-soft); color: var(--accent); }
 .rail-btn.active::before {
   content: "";
@@ -226,11 +228,18 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   font-size: 0.88rem;
   font-weight: 550;
   cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, transform 0.05s;
+  transition: background var(--t-fast), border-color var(--t-fast),
+    color var(--t-fast), transform var(--t-fast) var(--ease),
+    box-shadow var(--t-fast) var(--ease);
   white-space: nowrap;
 }
-.btn:hover { background: var(--surface-3); border-color: rgba(255, 255, 255, 0.22); }
-.btn:active { transform: translateY(1px); }
+.btn:hover {
+  background: var(--surface-3);
+  border-color: rgba(255, 255, 255, 0.24);
+  transform: translateY(-1px);
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.4);
+}
+.btn:active { transform: translateY(0) scale(0.972); box-shadow: none; }
 .btn:disabled { opacity: 0.45; cursor: default; }
 .btn.primary {
   background: var(--accent);
@@ -264,9 +273,17 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   font-size: 0.82rem;
   font-weight: 550;
   cursor: pointer;
-  transition: background 0.14s, color 0.14s, border-color 0.14s;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease),
+    box-shadow var(--t-fast) var(--ease);
 }
-.chip:hover { background: var(--surface-2); color: var(--text); }
+.chip:hover {
+  background: var(--surface-2);
+  color: var(--text);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);
+}
+.chip:active { transform: translateY(0) scale(0.97); }
 .chip.active {
   background: #fff;
   border-color: #fff;
@@ -293,7 +310,10 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   flex-direction: column;
   gap: 0.5rem;
   cursor: pointer;
+  transition: transform var(--t-med) var(--ease);
 }
+.card:hover { transform: translateY(-3px); }
+.card:active { transform: translateY(-1px) scale(0.995); }
 .poster {
   position: relative;
   aspect-ratio: 2 / 3;
@@ -302,7 +322,8 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   background: var(--surface);
   border: 1px solid var(--border);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
-  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  transition: transform var(--t-slow) var(--ease-out),
+    border-color var(--t-med) var(--ease), box-shadow var(--t-med) var(--ease);
 }
 .card:hover .poster {
   transform: translateY(-4px);
@@ -315,7 +336,9 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   height: 100%;
   object-fit: cover;
   display: block;
+  transition: transform 0.42s var(--ease-out), filter var(--t-slow) var(--ease);
 }
+.card:hover .poster img { transform: scale(1.055); }
 .poster.ph { display: grid; place-items: center; }
 .poster.ph .ph-letter {
   font-size: 2.4rem;
@@ -342,7 +365,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   z-index: 2;
   opacity: 0;
   transform: translateY(6px);
-  transition: opacity 0.18s ease, transform 0.18s ease;
+  transition: opacity var(--t-med) var(--ease), transform var(--t-med) var(--ease);
 }
 .card:hover .poster-actions, .card:focus-within .poster-actions { opacity: 1; transform: translateY(0); }
 .poster-actions .btn { flex: 1 1 auto; justify-content: center; padding: 0.4rem 0.5rem; font-size: 0.8rem; }
@@ -363,10 +386,12 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   font-size: 0.9rem;
   cursor: pointer;
   opacity: 0;
-  transition: opacity 0.15s, color 0.15s, background 0.15s;
+  transition: opacity var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+    background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
 }
 /* Visibility for .fav-btn and .poster-actions is handled in the focus section. */
-.fav-btn:hover { background: rgba(0, 0, 0, 0.7); color: #fff; }
+.fav-btn:hover { background: rgba(0, 0, 0, 0.72); color: #fff; transform: scale(1.14); }
+.fav-btn:active { transform: scale(0.94); }
 .fav-btn.on { color: var(--accent); }
 
 .badge {
@@ -438,9 +463,10 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   font-size: 0.82rem;
   font-weight: 550;
   cursor: pointer;
-  transition: background 0.14s, color 0.14s;
+  transition: background var(--t-fast) var(--ease), color var(--t-fast) var(--ease),
+    transform var(--t-fast) var(--ease);
 }
-.log-tab:hover { color: var(--text); }
+.log-tab:hover { color: var(--text); transform: translateY(-1px); }
 .log-tab.active { background: #fff; color: var(--accent-ink); }
 .log-badge {
   display: inline-flex;
@@ -467,9 +493,16 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  transition: border-color 0.15s, background 0.15s;
+  transition: border-color var(--t-fast) var(--ease), background var(--t-fast) var(--ease),
+    transform var(--t-fast) var(--ease);
 }
-.log-row:hover { border-color: rgba(255, 255, 255, 0.22); background: var(--surface-2); }
+.log-row:hover {
+  border-color: rgba(255, 255, 255, 0.24);
+  background: var(--surface-2);
+  transform: translateX(3px);
+}
+.log-row .log-thumb { transition: transform var(--t-slow) var(--ease-out); }
+.log-row:hover .log-thumb { transform: scale(1.08); }
 .log-row.private { opacity: 0.6; }
 .log-thumb {
   width: 2.3rem;
@@ -508,13 +541,18 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Badges flow along one line with the timestamp beneath. Stacking each badge
+   vertically made every row four lines tall for no benefit. */
 .log-meta {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
   gap: 0.25rem;
   flex: none;
+  max-width: 15rem;
 }
+.log-meta > .muted { flex-basis: 100%; text-align: right; }
 .log-actions { display: flex; gap: 0.4rem; flex: none; }
 
 /* ---------------------------------------------------------------- empty */
@@ -586,6 +624,55 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
 .fav-btn.on { opacity: 1; }
 .card:hover .poster-actions,
 .card:focus-within .poster-actions { opacity: 1; transform: translateY(0); }
+
+/* ------------------------------------------------------- motion & timing */
+:root {
+  /* One easing curve everywhere, so motion feels like a single system. */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --t-fast: 0.14s;
+  --t-med: 0.2s;
+  --t-slow: 0.28s;
+}
+
+/* View switching. The two panels are display:none toggles, which cannot
+   transition, so the incoming one plays a keyed entrance instead. Direction
+   follows the nav order: moving down the rail slides in from the right. */
+@keyframes view-in-next {
+  from { opacity: 0; transform: translate3d(28px, 0, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+@keyframes view-in-prev {
+  from { opacity: 0; transform: translate3d(-28px, 0, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+.view-enter-next { animation: view-in-next var(--t-slow) var(--ease) both; }
+.view-enter-prev { animation: view-in-prev var(--t-slow) var(--ease) both; }
+
+/* Header chrome cross-fades so the title does not snap. */
+@keyframes chrome-in {
+  from { opacity: 0; transform: translate3d(0, -5px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+.chrome-enter { animation: chrome-in var(--t-med) var(--ease) both; }
+
+/* Staggered list entrance. --i is the index, capped in JS so a long list does
+   not crawl. */
+@keyframes item-in {
+  from { opacity: 0; transform: translate3d(0, 12px, 0) scale(0.985); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+}
+.stagger > * {
+  animation: item-in var(--t-slow) var(--ease) both;
+  animation-delay: calc(var(--i, 0) * 14ms);
+}
+
+/* Bars that appear in response to state, rather than navigation. */
+@keyframes bar-in {
+  from { opacity: 0; transform: translate3d(0, -8px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+}
+.bar-enter { animation: bar-in var(--t-med) var(--ease) both; }
 
 /* ---------------------------------------------------------------- job bar */
 .job-bar {
@@ -677,16 +764,25 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   *, *::before, *::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
+    /* Without this the stagger delays would survive, so a long list would still
+       crawl in one item at a time even with motion disabled. */
+    animation-delay: 0ms !important;
     transition-duration: 0.001ms !important;
+    transition-delay: 0ms !important;
   }
 }
 
 /* ---------------------------------------------------------------- drawer */
+@keyframes backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
 .drawer-backdrop {
   position: fixed;
   inset: 0;
   z-index: 55;
   background: rgba(0, 0, 0, 0.55);
+  animation: backdrop-in var(--t-med) var(--ease) both;
 }
 .drawer {
   position: fixed;
@@ -784,6 +880,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   place-items: center;
   background: rgba(0, 0, 0, 0.62);
   padding: 1.2rem;
+  animation: backdrop-in var(--t-fast) var(--ease) both;
 }
 .modal-card {
   width: min(440px, 100%);

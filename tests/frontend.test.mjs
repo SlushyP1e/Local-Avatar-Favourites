@@ -262,6 +262,85 @@ test("flushDraft is a no-op with nothing pending", async () => {
 
 // --------------------------------------------------------------------- misc
 
+// ------------------------------------------------------------- view motion
+
+test("animateView slides in the direction of travel", async () => {
+  const { env, app } = setup();
+  const { setView, animateView, VIEW_ORDER } = app;
+  const gridWrap = env.document.getElementById("grid-wrap");
+  const logsWrap = env.document.getElementById("logs-wrap");
+
+  // Moving down the rail (home -> logs) slides in from the right.
+  app.currentView = "home";
+  animateView(1);
+  assert.ok(gridWrap.classList.contains("view-enter-next"),
+    "forward navigation should use view-enter-next");
+  assert.ok(!gridWrap.classList.contains("view-enter-prev"),
+    "only one direction may be active at a time");
+
+  // Moving back up slides in from the left.
+  app.currentView = "logs";
+  animateView(-1);
+  assert.ok(logsWrap.classList.contains("view-enter-prev"),
+    "backward navigation should use view-enter-prev");
+  assert.ok(!logsWrap.classList.contains("view-enter-next"),
+    "the previous direction must not linger");
+
+  assert.deepEqual(VIEW_ORDER, ["home", "logs"],
+    "nav order drives the slide direction");
+});
+
+test("animateView clears its class when the animation ends", () => {
+  const { env, app } = setup();
+  const wrap = env.document.getElementById("grid-wrap");
+  app.currentView = "home";
+  app.animateView(1);
+  assert.ok(wrap.classList.contains("view-enter-next"));
+
+  // Bubbling animations from children must not strip the parent's class.
+  wrap.dispatch("animationend", { target: env.document.getElementById("grid") });
+  assert.ok(wrap.classList.contains("view-enter-next"),
+    "a child's animationend must not clear the parent class");
+
+  wrap.dispatch("animationend", { target: wrap });
+  assert.ok(!wrap.classList.contains("view-enter-next"),
+    "the class must be removed once its own animation ends");
+});
+
+test("setView ignores a switch to the current view", () => {
+  const { app } = setup();
+  app.currentView = "home";
+  app.setView("home");
+  // No animation should have been started on an unchanged view.
+  assert.equal(app.pendingConfirm, null);
+});
+
+test("stagger caps the index so long lists do not crawl", () => {
+  const { env, app } = setup();
+  const list = env.document.getElementById("grid");
+  // Stand in for a few hundred cards.
+  list.children = Array.from({ length: 200 }, () => ({
+    style: { setProperty() {} },
+  }));
+  app.applyStagger(list);
+  assert.equal(app.STAGGER_CAP, 14,
+    "the cap is what keeps a 200 item list from taking seconds");
+});
+
+test("revealOnce only animates on the hidden edge", () => {
+  const { env, app } = setup();
+  const bar = env.document.getElementById("bulk-bar");
+  bar.classList.remove("hidden");
+  app.revealOnce(bar);
+  assert.ok(!bar.classList.contains("bar-enter"),
+    "an already-visible bar must not re-animate on every poll");
+
+  bar.classList.add("hidden");
+  app.revealOnce(bar);
+  assert.ok(bar.classList.contains("bar-enter"),
+    "becoming visible should animate once");
+});
+
 test("escapeHtml escapes angle brackets and quotes", () => {
   const { app } = setup();
   assert.equal(app.escapeHtml('<img src=x onerror="a">'),

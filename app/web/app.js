@@ -119,7 +119,12 @@ function renderSelection() {
   const bar = $("bulk-bar");
   if (!bar) return;
   const n = selection.size;
-  bar.classList.toggle("hidden", n === 0);
+  if (n === 0) {
+    bar.classList.add("hidden");
+  } else {
+    revealOnce(bar);
+    bar.classList.remove("hidden");
+  }
   $("bulk-count").textContent = n === 1 ? "1 selected" : `${n} selected`;
   document.querySelectorAll(".card").forEach((card) => {
     card.classList.toggle("checked", selection.has(card.dataset.id));
@@ -728,6 +733,15 @@ function renderDiscovery() {
   el.title = (state.discovery && state.discovery.db_path) || "";
 }
 
+// Show an element with its entrance animation, but only on the hidden ->
+// visible edge. These bars are toggled from render(), which runs on every
+// 700ms poll, so animating unconditionally would make them flicker forever.
+function revealOnce(el) {
+  if (!el || !el.classList.contains("hidden")) return;
+  replayAnimation(el, "bar-enter");
+  clearAnimationWhenDone(el, "bar-enter");
+}
+
 /* ---------------------------------------------------------------- job bar */
 function renderJob(job) {
   const bar = $("job-bar");
@@ -737,6 +751,7 @@ function renderJob(job) {
     bar.classList.add("hidden");
     return;
   }
+  revealOnce(bar);
   bar.classList.remove("hidden");
   const known = job.total > 0;
   bar.classList.toggle("indeterminate", !known);
@@ -1150,16 +1165,85 @@ async function refreshState() {
 }
 
 function startPolling() {
-  refreshState();
+  refreshState().then(() => {
+    // Give the opening view the same entrance as any navigation into it.
+    animateView(1);
+  });
   setInterval(refreshState, 700);
 }
 
 /* ------------------------------------------------------------------ wiring */
+/* ------------------------------------------------------------ view motion */
+const VIEW_ORDER = ["home", "logs"];
+const STAGGER_CAP = 14;
+
+// Restart a CSS animation that may already have run on this element.
+function replayAnimation(el, className) {
+  if (!el) return;
+  el.classList.remove(className);
+  void el.offsetWidth; // force reflow so re-adding restarts the animation
+  el.classList.add(className);
+}
+
+// Clean up once the animation finishes, so the class cannot replay later and
+// so a data refresh that rebuilds the children does not inherit a stale state.
+// Guarded on e.target because the stagger children's animations also bubble.
+function clearAnimationWhenDone(el, className) {
+  if (!el) return;
+  el.addEventListener("animationend", function done(e) {
+    if (e.target !== el) return;
+    el.classList.remove(className);
+    el.removeEventListener("animationend", done);
+  });
+}
+
+// Cap the index so a few hundred rows do not crawl in over several seconds.
+function applyStagger(container) {
+  if (!container) return;
+  const items = container.children;
+  if (!items.length) return;
+  for (let i = 0; i < items.length; i++) {
+    items[i].style.setProperty("--i", String(Math.min(i, STAGGER_CAP)));
+  }
+  replayAnimation(container, "stagger");
+  clearAnimationWhenDone(container, "stagger");
+}
+
+// Slide the incoming panel in from the side the navigation is heading towards.
+function animateView(direction) {
+  const wrap = currentView === "logs" ? $("logs-wrap") : $("grid-wrap");
+  // The logs view holds two lists; stagger whichever one is actually visible,
+  // otherwise the players tab would animate the hidden avatar list.
+  const list = currentView !== "logs"
+    ? $("grid")
+    : (logTab === "players" ? $("changes") : $("logs"));
+  const entering = direction >= 0 ? "view-enter-next" : "view-enter-prev";
+
+  // Clear both without adding either first. replayAnimation() adds as it goes,
+  // so using it to clear would leave BOTH classes attached -- and because
+  // view-enter-prev is declared last it would win, making every transition
+  // animate backwards.
+  wrap.classList.remove("view-enter-next", "view-enter-prev");
+  void wrap.offsetWidth;
+  wrap.classList.add(entering);
+  clearAnimationWhenDone(wrap, entering);
+
+  applyStagger(list);
+  replayAnimation($("page-title"), "chrome-enter");
+  clearAnimationWhenDone($("page-title"), "chrome-enter");
+}
+
 function setView(view) {
+  const previous = currentView;
+  if (previous === view) return;
+  const from = VIEW_ORDER.indexOf(previous);
+  const to = VIEW_ORDER.indexOf(view);
+  const direction = from === -1 || to === -1 ? 1 : (to > from ? 1 : -1);
   currentView = view;
   renderHeader();
   if (view === "logs") renderLogs(true);
   else renderGrid(true);
+  animateView(direction);
 }
 
 function wire() {
@@ -1209,6 +1293,9 @@ function wire() {
     tab.addEventListener("click", () => {
       logTab = tab.dataset.logtab;
       renderLogs(true);
+      // Animate the incoming list, not just the surrounding panel.
+      const list = logTab === "players" ? $("changes") : $("logs");
+      applyStagger(list);
     });
   });
 
