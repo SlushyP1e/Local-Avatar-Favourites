@@ -56,7 +56,10 @@ a = Analysis(
     ['app\\main.py'],
     pathex=[],
     binaries=[],
-    datas=[('app\\web', 'web')],
+    # app/web is the UI; assets carries icon.ico, which the tray icon loads at
+    # runtime. Without it in the bundle the notification-area icon renders blank
+    # because LoadImage finds no file.
+    datas=[('app\\web', 'web'), ('assets', 'assets')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

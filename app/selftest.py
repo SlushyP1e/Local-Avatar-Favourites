@@ -1195,7 +1195,9 @@ def test_tray_icon() -> None:
     if not available():
         return
 
-    icon = TrayIcon("Test", tip="tip")
+    repo_icon = Path(__file__).resolve().parent.parent / "assets" / "icon.ico"
+    icon = TrayIcon("Test", tip="tip",
+                    icon_path=str(repo_icon) if repo_icon.exists() else None)
     commands: list[int] = []
     icon.on_command = commands.append
     started = icon.start()
@@ -1205,6 +1207,9 @@ def test_tray_icon() -> None:
         check("tray window created", icon._hwnd is not None)
         check("tray menu built", icon._menu is not None)
         check("notify data prepared", icon._nid is not None)
+        # A blank tray icon is the visible symptom of a missing/failed icon.
+        check("tray has an icon handle", bool(icon._nid and icon._nid.hIcon),
+              "no icon loaded")
         icon.notify("Hi", "there")
         check("notify does not raise", True)
         icon.set_tip("new tip")
@@ -1225,6 +1230,12 @@ def test_tray_icon() -> None:
     check("tray stops cleanly", icon._added is False)
     icon.notify("x", "y")
     check("notify after stop is a no-op", True)
+
+    # Even with no icon file at all, a fallback handle must be produced so the
+    # tray slot is never blank.
+    bare = TrayIcon("Test", tip="tip", icon_path=None)
+    fallback = bare._load_icon()
+    check("missing icon file falls back", bool(fallback), "fallback handle was 0")
 
 
 def test_wear_last() -> None:
@@ -1397,6 +1408,73 @@ def test_prune_respects_undo_grace() -> None:
         check("counted", orphans == 1, str(orphans))
 
 
+def test_close_to_tray_contract() -> None:
+    """Pin pywebview's cancel polarity, which is the opposite of the obvious.
+
+    ``Event.set()`` returns True -- meaning "cancel" -- when a handler returns
+    False, and the WinForms backend then sets ``args.Cancel = True``. Returning
+    True from a closing handler lets the window close.
+    """
+    from webview.event import Event
+
+    from main import _Shell
+
+    class FakeTray:
+        _added = True
+
+        def __init__(self):
+            self.shown: list[tuple[str, str]] = []
+
+        def notify(self, title, message):
+            self.shown.append((title, message))
+
+    b = _isolated_backend()
+    shell = _Shell(b)
+    fake = FakeTray()
+    shell.tray = fake
+
+    def cancelled_by_pywebview() -> bool:
+        event = Event(None, should_lock=True)
+        event += shell.on_closing
+        return bool(event.set())
+
+    # No tray: the close must go through, whatever the setting says.
+    no_tray = _Shell(b)
+    no_tray.tray = None
+    event = Event(None, should_lock=True)
+    event += no_tray.on_closing
+    check("close proceeds with no tray icon", event.set() is False)
+
+    # Tray present, but the user asked to exit on close.
+    b.settings["exit_on_close"] = True
+    check("close proceeds when exit_on_close is set", cancelled_by_pywebview() is False)
+
+    # Tray present and hide-to-tray enabled: the close must be cancelled.
+    b.settings["exit_on_close"] = False
+    check("close is cancelled when hiding to tray", cancelled_by_pywebview() is True)
+    check("the user is told it is still running", bool(fake.shown), str(fake.shown))
+
+    # Quitting from the tray menu must not be intercepted.
+    b.settings["exit_on_close"] = False
+    shell.quitting = True
+    check("quit from the tray is not intercepted", cancelled_by_pywebview() is False)
+    shell.quitting = False
+
+
+def test_tray_icon_asset_is_bundled() -> None:
+    """A missing icon file means a blank notification-area icon.
+
+    The PyInstaller spec has to ship assets/, because the tray loads icon.ico
+    from disk at runtime rather than from the executable's icon resource.
+    """
+    spec = (Path(__file__).resolve().parent.parent
+            / "LocalAvatarFavourites.spec").read_text(encoding="utf-8")
+    check("spec ships the assets folder", "'assets'" in spec and "assets" in spec,
+          "assets missing from datas")
+    check("icon exists in the repo",
+          (Path(__file__).resolve().parent.parent / "assets" / "icon.ico").exists())
+
+
 def main() -> int:
     tests = [
         test_storage,
@@ -1438,6 +1516,8 @@ def main() -> int:
         test_restore_entry_for_undo,
         test_start_metadata_job_requires_login,
         test_tray_icon,
+        test_close_to_tray_contract,
+        test_tray_icon_asset_is_bundled,
         test_wear_last,
         test_exit_on_close_setting,
         test_settings_save_unchanged_ports,

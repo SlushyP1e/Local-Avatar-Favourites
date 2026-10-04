@@ -51,6 +51,11 @@ MF_SEPARATOR = 0x0800
 IMAGE_ICON = 1
 LR_LOADBYORDER = 0x00000010
 
+# IDI_APPLICATION, as a resource id for LoadIconW. Passed through MAKEINTRESOURCE
+# semantics (a pointer whose value is the id), not as a string: LoadIconW would
+# otherwise look for a resource *named* "32512" and return nothing.
+IDI_APPLICATION = 32512
+
 # NOTIFYICONDATA.dwInfoFlags
 NIIF_INFO = 0x00000001
 
@@ -140,6 +145,9 @@ def _configure_user32() -> None:
         ctypes.c_int, ctypes.c_int, wintypes.UINT,
     ]
     user32.LoadImageW.restype = wintypes.HANDLE
+
+    user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+    user32.LoadIconW.restype = wintypes.HANDLE
 
     user32.TrackPopupMenu.argtypes = [
         wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int,
@@ -278,12 +286,22 @@ class TrayIcon:
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def _load_icon(self):
+        """Load the tray icon, falling back rather than showing a blank slot."""
         path = self.icon_path
-        if not path or not os.path.exists(path):
-            return None
+        if path and os.path.exists(path):
+            try:
+                hicon = ctypes.windll.user32.LoadImageW(
+                    None, str(path), IMAGE_ICON, 0, 0, LR_LOADBYORDER,
+                )
+                if hicon:
+                    return hicon
+            except Exception:
+                pass
+        # No usable file: borrow the system application icon so the tray entry
+        # is still identifiable rather than an empty slot.
         try:
-            return ctypes.windll.user32.LoadImageW(
-                None, str(path), IMAGE_ICON, 0, 0, LR_LOADBYORDER,
+            return ctypes.windll.user32.LoadIconW(
+                None, ctypes.cast(IDI_APPLICATION, wintypes.LPCWSTR)
             )
         except Exception:
             return None

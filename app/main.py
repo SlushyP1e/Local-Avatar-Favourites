@@ -109,23 +109,32 @@ class _Shell:
     def on_closing(self) -> bool:
         """Hide to the tray unless the user asked to exit.
 
-        Returning True tells pywebview to cancel the close.
+        Polarity matters and is easy to get backwards. pywebview's
+        ``Event.set()`` treats a handler returning **False** as "cancel", and
+        the WinForms backend does ``args.Cancel = True`` when that happens. So
+        returning True here would let the window close -- which is exactly what
+        it did before this was corrected.
         """
         if self.quitting or self.tray is None or not self.tray._added:
-            return False
+            return True  # nothing to fall back to: let it close
         if self.backend.settings.get("exit_on_close", True):
-            return False
+            return True  # user chose to exit
+
         try:
             if self.window is not None:
                 self.window.hide()
         except Exception:
-            return False
-        self.tray.notify(
-            APP_TITLE,
-            "Still running in the notification area. "
-            "Right-click the icon for Open, Wear last avatar and Quit.",
-        )
-        return True
+            return True
+        try:
+            self.tray.notify(
+                APP_TITLE,
+                "Still running in the notification area. Right-click the icon "
+                "for Open, Wear last avatar and Quit. To make closing always "
+                "exit, turn off 'hide to tray' in Settings.",
+            )
+        except Exception:
+            pass
+        return False  # cancel the close
 
 
 def main() -> int:
@@ -137,11 +146,16 @@ def main() -> int:
         # One poll so the reported source status is real rather than the
         # unpolled initial state.
         backend._cache.poll()
+        icon = _icon_path()
         frozen = " - frozen bundle OK" if getattr(sys, "frozen", False) else ""
         print(f"Local Avatar Favourites {__version__}{frozen}")
         print(f"  entries loaded : {len(backend.entries)}")
         print(f"  discovery      : {backend.discovery_state()['sources']}")
         print(f"  tray available : {tray_available()}")
+        # A blank tray icon means this file was missing from the bundle.
+        print(f"  tray icon      : {icon or 'MISSING'}")
+        if icon and not os.path.exists(icon):
+            return 1
         return 0
 
     backend = Backend()
