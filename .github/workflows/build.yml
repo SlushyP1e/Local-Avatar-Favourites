@@ -53,12 +53,15 @@ jobs:
 
   build:
     name: Build Windows EXE
-    # Only tags produce a release; everything else just proves the exe builds.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Runs everywhere, including pull requests. This used to be gated on tags,
+    # which meant a change to the packaging or to upload-artifact could never be
+    # validated until a release -- so dependabot PRs touching this job showed a
+    # green tick that proved nothing. Building the exe is also the only check
+    # that catches a bundle which compiles but cannot start.
     needs: check
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -103,6 +106,25 @@ jobs:
           path: |
             dist/LocalAvatarFavourites.exe
             dist/SHA256SUMS.txt
+
+  release:
+    name: Publish release
+    # Kept separate from build so the write token is only ever handed to the one
+    # job that publishes, and never to a job that runs on pull requests.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: LocalAvatarFavourites
+          path: dist
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
