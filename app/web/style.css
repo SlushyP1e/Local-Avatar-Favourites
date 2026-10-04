@@ -1,4 +1,5 @@
 :root {
+  color-scheme: dark;
   --bg: #000000;
   --surface: rgba(255, 255, 255, 0.05);
   --surface-2: rgba(255, 255, 255, 0.08);
@@ -187,6 +188,10 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   font-size: 0.86rem;
   outline: none;
   cursor: pointer;
+}
+.select option {
+  background-color: #141414;
+  color: var(--text);
 }
 
 .text-input {

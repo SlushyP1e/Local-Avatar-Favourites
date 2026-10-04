@@ -149,6 +149,15 @@ This is an unofficial community tool. It is **not** created by or affiliated wit
 
 ---
 
+## AI disclaimer
+
+This project was built with the assistance of AI tools. While it is provided in
+good faith, AI-generated code can contain mistakes or security issues. Review
+the source before running it, and use it at your own risk. The authors accept
+no liability for any damage or data loss arising from its use.
+
+---
+
 ## License
 
 [MIT](LICENSE) — free to use, modify, and distribute.
