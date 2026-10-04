@@ -84,10 +84,24 @@ jobs:
       # The spec excludes a long list of modules, so a bundle can build
       # successfully and still be broken. This proved it: excluding 'bottle'
       # produced an exe that died on startup at webview.http.
+      #
+      # The exe is built with console=False, so it is a GUI-subsystem binary and
+      # PowerShell does not wait for it: reading $LASTEXITCODE straight after the
+      # call inspects whatever ran before, not this process. Start-Process -Wait
+      # -PassThru is what actually observes the exit code, and stdout has to be
+      # redirected or it goes nowhere.
       - name: Smoke-test the frozen bundle
         run: |
-          .\dist\LocalAvatarFavourites.exe --selftest
-          if ($LASTEXITCODE -ne 0) { throw "frozen bundle self-test failed" }
+          $log = Join-Path $env:RUNNER_TEMP "selftest.log"
+          $p = Start-Process -FilePath .\dist\LocalAvatarFavourites.exe `
+            -ArgumentList "--selftest" -Wait -PassThru `
+            -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+          Get-Content $log
+          if (Test-Path "$log.err") { Get-Content "$log.err" }
+          if ($p.ExitCode -ne 0) {
+            throw "frozen bundle self-test failed with exit code $($p.ExitCode)"
+          }
+          "frozen bundle self-test passed"
 
       - name: Report size
         run: |
