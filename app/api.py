@@ -10,6 +10,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.request
 from http.cookiejar import Cookie, CookieJar
@@ -65,11 +67,46 @@ def _auth_cookie(token: str) -> Cookie:
 
 
 class VRCApi:
-    def __init__(self, token: str = "") -> None:
+    #: Hard ceiling on request rate. VRChat terminates accounts for API abuse and
+    #: asks integrations to keep rates low, so this is enforced in the client
+    #: rather than left to callers. 0.25s => at most 4 requests/second.
+    min_interval = 0.25
+    #: Extra delay applied after a 429, doubling up to a minute.
+    max_backoff = 60.0
+
+    def __init__(self, token: str = "", min_interval: float | None = None) -> None:
         self._jar = CookieJar()
         if token:
             self._jar.set_cookie(_auth_cookie(token))
         self._opener = build_opener(HTTPCookieProcessor(self._jar))
+        if min_interval is not None:
+            self.min_interval = min_interval
+        self._throttle_lock = threading.Lock()
+        self._next_allowed = 0.0
+        self._backoff = 0.0
+        self._penalty_until = 0.0
+
+    def _throttle(self) -> None:
+        """Block until the next request is allowed."""
+        while True:
+            with self._throttle_lock:
+                now = time.monotonic()
+                wait = max(self._next_allowed, self._penalty_until) - now
+                if wait <= 0:
+                    self._next_allowed = now + self.min_interval
+                    return
+            time.sleep(min(wait, 5.0))
+
+    def _note_rate_limit(self) -> None:
+        with self._throttle_lock:
+            self._backoff = min(max(self._backoff * 2 or self.min_interval * 2,
+                                    self.min_interval), self.max_backoff)
+            self._penalty_until = time.monotonic() + self._backoff
+
+    def _clear_rate_limit(self) -> None:
+        with self._throttle_lock:
+            self._backoff = 0.0
+            self._penalty_until = 0.0
 
     # ------------------------------------------------------------------ tokens
     @property
@@ -101,11 +138,17 @@ class VRCApi:
             raw = f"{basic[0]}:{basic[1]}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        self._throttle()
         try:
             with self._opener.open(req, timeout=timeout) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            body_bytes = exc.read()
+            if exc.code == 429:
+                self._note_rate_limit()
+            else:
+                self._clear_rate_limit()
+            return exc.code, body_bytes
         except urllib.error.URLError as exc:
             raise ApiError(f"Network error: {exc.reason}") from exc
 
@@ -183,6 +226,40 @@ class VRCApi:
                 return payload
         self._raise_api_error(raw, status)
         return {}  # pragma: no cover
+
+    # ---------------------------------------------------------------- favorites
+    def add_favorite(self, avatar_id: str, group: str = "avatars1") -> dict:
+        """Add an avatar to your VRChat favourites via POST /favorites.
+
+        This is what makes a discovered id useful: OSC can only switch to
+        avatars in your VRChat Favourites, Recents or your own uploads, so an
+        id found in the local cache is not wearable until it is favourited.
+        """
+        status, raw = self._request(
+            "POST", "/favorites",
+            data={"type": "avatar", "favoriteId": avatar_id, "tags": [group]},
+        )
+        if status == 200:
+            return self._json(raw)
+        self._raise_api_error(raw, status)
+        return {}  # pragma: no cover
+
+    def remove_favorite(self, avatar_id: str, group: str = "avatars1") -> bool:
+        status, _raw = self._request(
+            "DELETE", f"/favorites/{avatar_id}", data={"tags": [group]}
+        )
+        return status == 200
+
+    def list_favorite_avatars(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        """A page of your VRChat favourites. These are real, wearable ids."""
+        status, raw = self._request(
+            "GET", f"/avatars/favorites?n={int(limit)}&offset={int(offset)}"
+        )
+        if status != 200:
+            self._raise_api_error(raw, status)
+            return []
+        payload = self._json(raw)
+        return payload if isinstance(payload, list) else []
 
     # ------------------------------------------------------------------ avatars
     def get_avatar(self, avatar_id: str) -> dict | None:

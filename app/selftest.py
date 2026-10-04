@@ -754,6 +754,195 @@ def test_auth_token_encryption() -> None:
               storage.load_settings()["auth_token"] == "legacy-plain")
 
 
+def test_favourite_in_vrchat() -> None:
+    """A discovered id is useless until VRChat can switch to it."""
+    from api import ApiError, AuthError, VRCApi
+
+    b = _isolated_backend()
+    avatar_id = "avtr_0f0f0f0f-1e1e-2d2d-3c3c-4b4b4b4b4b4b"
+    b.add_by_id(avatar_id)
+
+    # Not logged in: refuse rather than silently doing nothing.
+    res = b.favourite_in_vrchat(avatar_id)
+    check("favourite requires login", res["ok"] is False and res["title"] == "Not logged in")
+
+    calls = []
+
+    class FakeApi(VRCApi):
+        def __init__(self, mode="ok"):
+            super().__init__("token")
+            self.mode = mode
+
+        def is_logged_in(self):
+            return True
+
+        def add_favorite(self, aid, group="avatars1"):
+            calls.append((aid, group))
+            if self.mode == "auth":
+                raise AuthError("expired")
+            if self.mode == "duplicate":
+                raise ApiError("You already have that friend favorited")
+            if self.mode == "boom":
+                raise ApiError("something else went wrong")
+            return {"ok": True}
+
+    b.api = FakeApi()
+    res = b.favourite_in_vrchat(avatar_id)
+    check("favourite succeeds", res["ok"] is True, str(res))
+    check("favourite used the avatars1 group", calls == [(avatar_id, "avatars1")], str(calls))
+
+    b.api = FakeApi("duplicate")
+    res = b.favourite_in_vrchat(avatar_id)
+    check("duplicate reported as already", res["ok"] is True and res.get("already") is True, str(res))
+
+    b.api = FakeApi("boom")
+    res = b.favourite_in_vrchat(avatar_id)
+    check("other api errors surface", res["ok"] is False and res["title"], str(res))
+
+    b.api = FakeApi("auth")
+    res = b.favourite_in_vrchat(avatar_id)
+    check("auth error flagged as expired", res["ok"] is False
+          and res["title"] == "Session expired", str(res))
+    check("auth error sets the session flag", b.session_expired is True)
+
+
+def test_import_vrchat_favourites() -> None:
+    from api import VRCApi
+
+    b = _isolated_backend()
+
+    class FakeApi(VRCApi):
+        def __init__(self):
+            super().__init__("token")
+
+        def is_logged_in(self):
+            return True
+
+        def list_favorite_avatars(self, limit=100, offset=0):
+            return [
+                {"id": "avtr_aaaaaaaa-1111-2222-3333-444444444444", "name": "Alpha",
+                 "authorName": "Ann", "releaseStatus": "public",
+                 "thumbnailImageUrl": "https://example.invalid/a.png",
+                 "unityPackages": [{"platform": "android"}, {"platform": "standalonewindows"}]},
+                {"id": "avtr_bbbbbbbb-1111-2222-3333-444444444444", "name": "Beta"},
+            ]
+
+    b.api = FakeApi()
+    res = b.import_vrchat_favourites()
+    check("import reports both", res["ok"] is True and res["added"] == 2, str(res))
+    by_id = {e["id"]: e for e in b.entries}
+    check("import kept the name", by_id["avtr_aaaaaaaa-1111-2222-3333-444444444444"]["name"] == "Alpha")
+    check("import kept the author", by_id["avtr_aaaaaaaa-1111-2222-3333-444444444444"]["author"] == "Ann")
+    check("import derived platforms",
+          by_id["avtr_aaaaaaaa-1111-2222-3333-444444444444"]["platforms"] == ["Quest", "PC"])
+    check("import marks them wearable",
+          all(e.get("vrchat_favorite") for e in b.entries))
+
+    # Second run must not duplicate.
+    res = b.import_vrchat_favourites()
+    check("re-import adds nothing", res["added"] == 0 and len(b.entries) == 2, str(res))
+
+
+def test_import_vrchat_requires_login() -> None:
+    b = _isolated_backend()
+    res = b.import_vrchat_favourites()
+    check("import requires login", res["ok"] is False and res["title"] == "Not logged in")
+
+
+def test_entry_index_stays_consistent() -> None:
+    """The id index must never go stale, or lookups silently miss entries."""
+    b = _isolated_backend()
+    ids = [f"avtr_{i:08x}-1111-2222-3333-444444444444" for i in range(6)]
+
+    for avatar_id in ids[:4]:
+        b.add_by_id(avatar_id)
+    for position, avatar_id in enumerate(ids[:4]):
+        entry = b._entry(avatar_id)
+        check(f"index finds entry {position}", entry is not None)
+        check("entry identity is stable", entry is not None
+              and b.entries[b.entries.index(entry)] is entry)
+
+    # Duplicates are still rejected via the index.
+    check("duplicate rejected", b.add_by_id(ids[0])["ok"] is False)
+
+    # Deletion must drop the key, not leave a dangling reference.
+    b.delete(ids[1])
+    check("deleted entry is gone from the index", b._entry(ids[1]) is None)
+    check("deleted entry is gone from the list",
+          all(e["id"] != ids[1] for e in b.entries))
+    check("index size matches list", len(b._index) == len(b.entries),
+          f"{len(b._index)} vs {len(b.entries)}")
+
+    # Mutating through the found entry keeps the index valid.
+    entry = b._entry(ids[2])
+    entry["name"] = "Renamed"
+    check("in-place mutation is visible", b._entry(ids[2])["name"] == "Renamed")
+
+    # An import replaces the list wholesale and must be reindexed.
+    merged, _added = storage.merge_favourites(
+        b.entries, [{"id": ids[4], "name": "Imported"}])
+    b.entries = merged
+    b._reindex()
+    check("reindex picks up replacements", b._entry(ids[4]) is not None)
+    check("index still matches after import", len(b._index) == len(b.entries))
+
+    # Case-insensitive lookup.
+    check("lookup is case-insensitive", b._entry(ids[4].upper()) is not None)
+
+
+def test_save_all_logs_is_not_quadratic() -> None:
+    """save_all_logs used a linear scan per log entry; the index fixes that."""
+    b = _isolated_backend()
+    log_ids = [f"avtr_{i:08x}-5555-6666-7777-888888888888" for i in range(200)]
+    for avatar_id in log_ids:
+        b.log.append({
+            "id": avatar_id, "name": "", "first_seen": "2026-01-01T00:00:00+00:00",
+            "last_seen": "2026-01-01T00:00:00+00:00", "seen_bucket": "2026-01-01T00:00",
+            "count": 1, "private": False, "source": "cache-db",
+        })
+
+    start = time.perf_counter()
+    res = b.save_all_logs()
+    elapsed = time.perf_counter() - start
+
+    check("bulk save reported all", res["added"] == 200, str(res["added"]))
+    check("bulk save created the entries", len(b.entries) == 200)
+    check("bulk save index matches", len(b._index) == 200)
+    # Linear would be 200*200/2 = 20k scans; a dict lookup keeps this trivial.
+    check("bulk save is fast", elapsed < 2.0, f"{elapsed:.3f}s")
+
+
+def test_api_rate_limit_backoff() -> None:
+    """429 must trigger a growing penalty rather than hammering the API."""
+    from api import VRCApi
+
+    api = VRCApi("tok", min_interval=0.01)
+    check("starts with no penalty", api._backoff == 0.0)
+
+    api._note_rate_limit()
+    first = api._backoff
+    check("first 429 sets a penalty", first > 0, str(first))
+
+    api._note_rate_limit()
+    check("penalty grows", api._backoff > first, f"{first} -> {api._backoff}")
+
+    for _ in range(20):
+        api._note_rate_limit()
+    check("penalty is capped", api._backoff <= api.max_backoff, str(api._backoff))
+
+    api._clear_rate_limit()
+    check("cleared after success", api._backoff == 0.0)
+
+    # Throttling must actually delay a burst.
+    slow = VRCApi("tok", min_interval=0.05)
+    start = time.perf_counter()
+    for _ in range(4):
+        slow._throttle()
+    elapsed = time.perf_counter() - start
+    # 4 calls at 50ms apart spans 150ms.
+    check("throttle spaces requests", elapsed >= 0.14, f"{elapsed:.3f}s")
+
+
 def main() -> int:
     tests = [
         test_storage,
@@ -783,6 +972,12 @@ def main() -> int:
         test_expired_token_is_not_private,
         test_osc_settings_not_persisted_on_failure,
         test_discovery_state_reported,
+        test_favourite_in_vrchat,
+        test_import_vrchat_favourites,
+        test_import_vrchat_requires_login,
+        test_entry_index_stays_consistent,
+        test_save_all_logs_is_not_quadratic,
+        test_api_rate_limit_backoff,
     ]
     failed = 0
     for test in tests:

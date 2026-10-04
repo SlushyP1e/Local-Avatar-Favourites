@@ -108,6 +108,8 @@ class Backend:
         self.session_expired = False
 
         self.entries: list[dict] = storage.load_favourites()
+        self._index: dict[str, dict] = {}
+        self._reindex()
         self.log: list[dict] = storage.load_log()
         self.changes: list[dict] = storage.load_changes()
         self.settings: dict = storage.load_settings()
@@ -185,12 +187,22 @@ class Backend:
     def _touch(self, section: str) -> None:
         self._revs[section] = self._revs.get(section, 0) + 1
 
-    def _entry(self, avatar_id: str) -> dict | None:
-        avatar_id = self._norm_id(avatar_id)
+    def _reindex(self) -> None:
+        """Rebuild the id -> entry map after the list is replaced wholesale."""
+        self._index = {}
         for entry in self.entries:
-            if self._norm_id(entry.get("id")) == avatar_id:
-                return entry
-        return None
+            avatar_id = self._norm_id(entry.get("id"))
+            if avatar_id:
+                self._index[avatar_id] = entry
+
+    def _index_add(self, entry: dict) -> None:
+        avatar_id = self._norm_id(entry.get("id"))
+        if avatar_id:
+            self._index[avatar_id] = entry
+
+    def _entry(self, avatar_id: str) -> dict | None:
+        # Was a linear scan, which made save_all_logs O(n^2) over the list.
+        return self._index.get(self._norm_id(avatar_id))
 
     def _set_status(self, text: str) -> None:
         self.status = text
@@ -380,6 +392,7 @@ class Backend:
                         "message": "That avatar is already in your list."}
             entry = storage.new_entry(avatar_id)
             self.entries.append(entry)
+            self._index_add(entry)
             storage.save_favourites(self.entries)
             self._touch("entries")
         if self.api.is_logged_in():
@@ -407,6 +420,7 @@ class Backend:
                         "message": "That avatar is already in your list."}
             entry = storage.new_entry(avatar_id)
             self.entries.append(entry)
+            self._index_add(entry)
             storage.save_favourites(self.entries)
             self._touch("entries")
         if self.api.is_logged_in():
@@ -434,6 +448,7 @@ class Backend:
         with self._lock:
             before = len(self.entries)
             self.entries = [e for e in self.entries if self._norm_id(e.get("id")) != avatar_id]
+            self._reindex()
             if len(self.entries) == before:
                 return {"ok": False}
             storage.save_favourites(self.entries)
@@ -475,6 +490,92 @@ class Backend:
             self._touch("entries")
             return {"ok": True, "favorite": entry["favorite"]}
 
+    # ---------------------------------------------------------------- discovery
+    def favourite_in_vrchat(self, avatar_id: str) -> dict:
+        """Add an avatar to your VRChat favourites so OSC can switch to it."""
+        avatar_id = self._norm_id(avatar_id)
+        if not avatar_id:
+            return {"ok": False, "title": "Nothing selected", "message": "No avatar selected."}
+        if not self.api.is_logged_in():
+            return {"ok": False, "title": "Not logged in",
+                    "message": "Log in via Settings first."}
+        self._set_status("Adding to your VRChat favourites...")
+        try:
+            self.api.add_favorite(avatar_id)
+        except AuthError as exc:
+            self._handle_session_expired(exc)
+            return {"ok": False, "title": "Session expired",
+                    "message": "Log in again in Settings, then retry."}
+        except ApiError as exc:
+            message = str(exc)
+            if "already" in message.lower():
+                self._set_status("Already in your VRChat favourites.")
+                return {"ok": True, "already": True}
+            return {"ok": False, "title": "Could not add favourite", "message": message}
+        self._set_status("Added to your VRChat favourites - you can wear it now.")
+        return {"ok": True}
+
+    def unfavourite_in_vrchat(self, avatar_id: str) -> dict:
+        avatar_id = self._norm_id(avatar_id)
+        if not self.api.is_logged_in():
+            return {"ok": False, "title": "Not logged in",
+                    "message": "Log in via Settings first."}
+        try:
+            self.api.remove_favorite(avatar_id)
+        except AuthError as exc:
+            self._handle_session_expired(exc)
+            return {"ok": False, "title": "Session expired",
+                    "message": "Log in again in Settings, then retry."}
+        except ApiError as exc:
+            return {"ok": False, "title": "Could not remove favourite", "message": str(exc)}
+        self._set_status("Removed from your VRChat favourites.")
+        return {"ok": True}
+
+    def import_vrchat_favourites(self, limit: int = 100) -> dict:
+        """Pull your VRChat favourites into the local list.
+
+        These are exactly the avatars OSC is able to switch to, so this is the
+        fastest way to get a working list without typing ids by hand.
+        """
+        if not self.api.is_logged_in():
+            return {"ok": False, "title": "Not logged in",
+                    "message": "Log in via Settings first."}
+        self._set_status("Reading your VRChat favourites...")
+        try:
+            remote = self.api.list_favorite_avatars(limit=max(1, min(int(limit), 100)))
+        except AuthError as exc:
+            self._handle_session_expired(exc)
+            return {"ok": False, "title": "Session expired",
+                    "message": "Log in again in Settings, then retry."}
+        except ApiError as exc:
+            return {"ok": False, "title": "Could not read favourites", "message": str(exc)}
+
+        added = 0
+        unresolved: list[str] = []
+        with self._lock:
+            for avatar in remote:
+                avatar_id = self._norm_id(avatar.get("id"))
+                if not avatar_id or self._entry(avatar_id):
+                    continue
+                entry = storage.new_entry(avatar_id, avatar.get("name") or "")
+                entry["author"] = avatar.get("authorName") or ""
+                entry["release_status"] = (avatar.get("releaseStatus") or "").lower()
+                entry["platforms"] = self._platforms(avatar)
+                entry["thumb_url"] = avatar.get("thumbnailImageUrl") or ""
+                entry["vrchat_favorite"] = True
+                self.entries.append(entry)
+                self._index_add(entry)
+                added += 1
+                unresolved.append(avatar_id)
+            if added:
+                storage.save_favourites(self.entries)
+                self._touch("entries")
+        self._set_status(f"Imported {added} avatar(s) from VRChat.")
+        if unresolved:
+            threading.Thread(target=self._bulk_metadata, args=(unresolved,),
+                             daemon=True).start()
+        return {"ok": True, "added": added}
+
     # ------------------------------------------------------------------ logs
     def save_from_log(self, avatar_id: str) -> dict:
         avatar_id = self._norm_id(avatar_id)
@@ -492,6 +593,7 @@ class Backend:
             if log_entry and log_entry.get("name"):
                 entry["name"] = log_entry["name"]
             self.entries.append(entry)
+            self._index_add(entry)
             storage.save_favourites(self.entries)
             self._touch("entries")
         if self.api.is_logged_in():
@@ -526,6 +628,7 @@ class Backend:
                 if log_entry.get("name"):
                     entry["name"] = log_entry["name"]
                 self.entries.append(entry)
+                self._index_add(entry)
                 added_ids.append(avatar_id)
             if added_ids:
                 storage.save_favourites(self.entries)
@@ -662,6 +765,7 @@ class Backend:
         with self._lock:
             merged, added = storage.merge_favourites(self.entries, incoming)
             self.entries = merged
+            self._reindex()
             storage.save_favourites(self.entries)
             self._touch("entries")
         self._set_status(f"Imported {added} avatar(s).")

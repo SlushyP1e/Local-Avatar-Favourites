@@ -560,6 +560,17 @@ function renderDrawer() {
 
   $("btn-fav").textContent = entry.favorite ? "♥ Favorited" : "♥ Favorite";
   $("btn-fav").classList.toggle("primary", !!entry.favorite);
+
+  // Wearing an avatar over OSC only works if VRChat can switch to it, which
+  // means it has to be in your VRChat Favourites, Recents or your own uploads.
+  // Surfaced here because a local favourite on its own may not be wearable.
+  const vrcBtn = $("btn-vrc-fav");
+  vrcBtn.textContent = entry.vrchat_favorite ? "✓ In VRChat Favourites" : "Favourite in VRChat";
+  vrcBtn.classList.toggle("primary", !!entry.vrchat_favorite);
+  vrcBtn.disabled = !!entry.vrchat_favorite;
+  $("d-wearable").textContent = entry.vrchat_favorite
+    ? "VRChat can switch to this avatar."
+    : "Tip: add it to your VRChat Favourites so it can be worn over OSC.";
 }
 
 const SOURCE_LABELS = {
@@ -717,6 +728,13 @@ function cardMenuItems(entry) {
     },
     { icon: "⧉", label: "Copy Avatar ID", action: () => copyEntryId(entry.id) },
     { icon: "⟳", label: "Refresh Metadata", action: () => refreshMetaFor(entry.id) },
+    {
+      icon: "♥",
+      label: entry.vrchat_favorite
+        ? "Remove from VRChat Favourites"
+        : "Favourite in VRChat (makes it wearable)",
+      action: () => toggleVrchatFavourite(entry.id),
+    },
     { sep: true },
     {
       icon: "✕",
@@ -778,6 +796,23 @@ async function refreshMeta() {
   if (!selectedId) return;
   const res = await call("refresh_metadata", selectedId);
   if (!res.ok && res.title) showAlert(res.title, res.message);
+}
+
+async function toggleVrchatFavourite(id) {
+  if (!id) return;
+  const entry = entryById(id);
+  const removing = !!(entry && entry.vrchat_favorite);
+  const yes = await showConfirm(
+    removing ? "Remove from VRChat" : "Add to VRChat Favourites",
+    removing
+      ? `Remove "${entry.name}" from your VRChat Favourites? You will no longer be able to switch to it over OSC.`
+      : `Add "${entry ? entry.name : id}" to your VRChat Favourites? ` +
+        "This is what allows switching to it over OSC, and it will appear in VRChat itself.");
+  if (!yes) return;
+  const res = await call(removing ? "unfavourite_in_vrchat" : "favourite_in_vrchat", id);
+  if (!res.ok) { if (res.title) showAlert(res.title, res.message); return; }
+  toast(res.already ? "Already in your VRChat Favourites." : "Updated your VRChat Favourites.");
+  await refreshState();
 }
 
 /* The in-progress edit for the currently open drawer.
@@ -910,6 +945,19 @@ async function saveSettings() {
 }
 
 /* ------------------------------------------------------------------ files & updates */
+async function importVrchatFavourites() {
+  const res = await call("import_vrchat_favourites", 100);
+  if (!res || !res.ok) {
+    if (res && res.title) showAlert(res.title, res.message);
+    return;
+  }
+  toast(res.added
+    ? `Imported ${res.added} avatar${res.added === 1 ? "" : "s"} from VRChat.`
+    : "All your VRChat Favourites are already in your list.");
+  closeModal("modal-settings");
+  await refreshState();
+}
+
 async function exportFavourites() {
   const res = await call("export_favourites");
   if (!res || res.cancelled) return;
@@ -1033,6 +1081,7 @@ function wire() {
   $("btn-delete").addEventListener("click", del);
   $("btn-copy").addEventListener("click", copyId);
   $("btn-refresh").addEventListener("click", refreshMeta);
+  $("btn-vrc-fav").addEventListener("click", () => toggleVrchatFavourite(selectedId));
   $("btn-fav").addEventListener("click", () => { if (selectedId) toggleFavorite(selectedId); });
 
   $("d-name").addEventListener("input", scheduleSave);
@@ -1051,6 +1100,7 @@ function wire() {
   $("set-save").addEventListener("click", saveSettings);
   $("set-open-folder").addEventListener("click", () => call("open_data_folder"));
   $("set-export").addEventListener("click", exportFavourites);
+  $("set-import-vrc").addEventListener("click", importVrchatFavourites);
   $("set-import").addEventListener("click", importFavourites);
   $("set-update").addEventListener("click", () => checkUpdates(false));
   $("set-refresh-all").addEventListener("click", async () => {
