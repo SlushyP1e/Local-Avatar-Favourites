@@ -12,14 +12,14 @@ import os
 import sqlite3
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import storage
-from osc import OSCBridge, AVATAR_CHANGE_ADDRESS
+from osc import AVATAR_CHANGE_ADDRESS, OSCBridge
+
 RESULTS: list[str] = []
 
 
@@ -163,7 +163,7 @@ def test_update_compare() -> None:
 
 # --------------------------------------------------------------- vrcache
 def _fake_ids(count: int, start: int = 0) -> list[str]:
-    return ["avtr_%08x-1234-1234-1234-%012x" % (i, i) for i in range(start, start + count)]
+    return [f"avtr_{i:08x}-1234-1234-1234-{i:012x}" for i in range(start, start + count)]
 
 
 def _write_sqlite(path: Path, ids: list[str]) -> None:
@@ -294,7 +294,7 @@ def test_vrcache_rowid_regression() -> None:
 
 
 def test_vrcache_degraded_sources() -> None:
-    from vrcache import MISSING, SOURCE_AMPLITUDE, SOURCE_SQLITE, UNSUPPORTED, VRCacheWatcher
+    from vrcache import MISSING, SOURCE_SQLITE, UNSUPPORTED, VRCacheWatcher
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -370,7 +370,7 @@ def test_vrcache_amplitude() -> None:
         check("vrcache amplitude status preserved", w.status[SOURCE_AMPLITUDE] == before[SOURCE_AMPLITUDE])
 
         # VRChat clears the file after uploading: new ids still get picked up.
-        amp.write_bytes((" ".join(_fake_ids(2, start=700)).encode()))
+        amp.write_bytes(" ".join(_fake_ids(2, start=700)).encode())
         check("vrcache amplitude after rewrite", w.poll() == _fake_ids(2, start=700))
 
 
@@ -385,13 +385,13 @@ def test_vrcache_dedupe_across_layers() -> None:
 
         low, amp = _fixture(
             root / "dedupe",
-            ids=backlog + [shared[0]],
+            ids=[*backlog, shared[0]],
             amplitude=(" ".join(live + shared)).encode(),
         )
         w = VRCacheWatcher(low_dir=low, amp_path=amp)
         # Seed only from the database so amplitude entries are still "new".
         w._read_sqlite(emit=False)
-        w._seen.update(backlog + [shared[0]])
+        w._seen.update([*backlog, shared[0]])
 
         got = w.poll()
         check("vrcache dedupes shared id across layers", got == live, str(got))
@@ -448,7 +448,7 @@ def test_vrcache_locked_database() -> None:
             w = VRCacheWatcher(low_dir=low, amp_path=amp, busy_timeout=0.2)
             try:
                 result = w.poll()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 result = f"raised {type(exc).__name__}: {exc}"
             check("vrcache locked db does not raise", result == [], str(result))
         finally:
@@ -535,8 +535,8 @@ def test_settings_sanitize() -> None:
     check("sanitize coerces non-string token", junk["auth_token"] == "")
     check("sanitize coerces null username", junk["auth_username"] == "")
     check("sanitize blank host -> loopback", junk["osc_send_ip"] == "127.0.0.1")
-    check("sanitize bad expiry", junk["auth_expires"] == 0)
     check("sanitize drops unknown keys", "unknown_key" not in junk)
+    check("sanitize drops retired keys", "auth_expires" not in junk)
 
     good = sanitize({"osc_send_ip": "10.0.0.5"})
     check("sanitize keeps real host", good["osc_send_ip"] == "10.0.0.5")
@@ -573,6 +573,187 @@ def test_api_image_download_guards() -> None:
         check("rejected download wrote nothing", not dest.exists())
 
 
+def _isolated_backend():
+    """A Backend with no OSC socket, no threads and no real VRChat files."""
+    from backend import Backend
+    from vrcache import VRCacheWatcher
+
+    root = Path(tempfile.mkdtemp())
+    storage.DATA_DIR = root
+    storage.FAVS_FILE = root / "favourites.json"
+    storage.SETTINGS_FILE = root / "settings.json"
+    storage.LOG_FILE = root / "avatar_log.json"
+    storage.CHANGES_FILE = root / "avatar_changes.json"
+    storage.THUMBS_DIR = root / "thumbs"
+    storage.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+
+    cache = VRCacheWatcher(low_dir=root / "low", amp_path=root / "amp.cache")
+    cache.amp_file.parent.mkdir(parents=True, exist_ok=True)
+    cache.amp_file.write_bytes(b"")
+    return Backend(start_services=False, cache=cache)
+
+
+def test_log_dedupe_across_sources() -> None:
+    """OSC and the log file both report the same change; count it once."""
+    from datetime import datetime, timedelta
+
+    b = _isolated_backend()
+    avatar_id = "avtr_11111111-2222-3333-4444-555555555555"
+
+    check("first sighting recorded", b._record_log(avatar_id, source="osc") is True)
+    check("count starts at 1", b.log[0]["count"] == 1, str(b.log))
+
+    # The log file reports the same change with its own timestamp. Both formats
+    # come from datetime.isoformat(), so the minute bucket lines up.
+    first = datetime.fromisoformat(b.log[0]["last_seen"])
+    same_minute = first.replace(second=30).isoformat(timespec="seconds")
+    check("osc then log in same minute is a duplicate",
+          b._record_log(avatar_id, when=same_minute, source="log") is False)
+    check("count still 1", b.log[0]["count"] == 1, str(b.log))
+
+    # A genuinely later sighting does count.
+    later = (first + timedelta(minutes=5)).isoformat(timespec="seconds")
+    check("later sighting counts", b._record_log(avatar_id, when=later, source="log") is True)
+    check("count becomes 2", b.log[0]["count"] == 2, str(b.log))
+    check("source updated", b.log[0]["source"] == "log", str(b.log[0]))
+
+    # A different avatar is independent.
+    other = "avtr_99999999-8888-7777-6666-555555555555"
+    check("other avatar recorded", b._record_log(other, source="cache-db") is True)
+    check("two log entries", len(b.log) == 2)
+
+
+def test_log_dedupe_persisted() -> None:
+    """A saved log entry without a bucket must not be replayed forever."""
+    b = _isolated_backend()
+    avatar_id = "avtr_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    storage.save_log([{
+        "id": avatar_id, "name": "", "first_seen": "2026-01-01 00:00:00+00:00",
+        "last_seen": "2026-01-01 00:00:00+00:00", "count": 4, "private": False,
+    }])
+    b.log = storage.load_log()
+    check("legacy entry has no bucket", "seen_bucket" not in b.log[0])
+    check("legacy entry is counted again", b._record_log(avatar_id) is True)
+    check("legacy count incremented", b.log[0]["count"] == 5, str(b.log[0]))
+
+
+def test_expired_token_is_not_private() -> None:
+    """A 401 must never be recorded as 'this avatar is private'."""
+    from api import AuthError, VRCApi
+
+    b = _isolated_backend()
+    avatar_id = "avtr_12341234-1234-1234-1234-123412341234"
+    b._record_log(avatar_id, source="cache-db")
+
+    # get_avatar raises AuthError on 401 rather than returning None.
+    api = VRCApi("token")
+    status = {"code": 401}
+    def fake_request(method, path, data=None, basic=None, timeout=20):
+        return status["code"], b'{"error":{"message":"Missing Credentials"}}'
+    api._request = fake_request
+    b.api = api
+
+    b._metadata_worker(avatar_id)
+    check("session flagged expired", b.session_expired is True)
+    check("status asks for re-login", "log in again" in b.status.lower(), b.status)
+    check("avatar NOT marked private", b.log[0].get("private") is False, str(b.log[0]))
+
+    # And a genuine 404 is still treated as private.
+    b.session_expired = False
+    b.status = ""
+    status["code"] = 404
+    b.api._request = fake_request
+    b._metadata_worker(avatar_id)
+    check("404 does not expire the session", b.session_expired is False)
+    check("404 marks the avatar private", b.log[0].get("private") is True, str(b.log[0]))
+
+    # Re-authenticating clears the flag.
+    b._handle_session_expired(AuthError("nope"))
+    check("expiry recorded", b.session_expired is True)
+
+
+def test_osc_settings_not_persisted_on_failure() -> None:
+    """A failed bind must leave settings.json untouched."""
+    b = _isolated_backend()
+
+    # Occupy the receive port so the candidate bridge cannot bind it.
+    import socket
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blocker.bind(("127.0.0.1", 0))
+    taken = blocker.getsockname()[1]
+    try:
+        storage.save_settings({"osc_send_port": 9000, "osc_receive_port": 9001})
+        res = b.save_settings(9100, taken)
+        check("failed bind reports failure", res.get("ok") is False, str(res))
+
+        reloaded = storage.load_settings()
+        check("failed bind did not persist send port", reloaded["osc_send_port"] == 9000,
+              str(reloaded["osc_send_port"]))
+        check("failed bind did not persist recv port", reloaded["osc_receive_port"] == 9001,
+              str(reloaded["osc_receive_port"]))
+    finally:
+        blocker.close()
+
+    check("identical ports rejected", b.save_settings(9000, 9000).get("ok") is False)
+    check("non-numeric rejected", b.save_settings("x", 9001).get("ok") is False)
+    check("out of range rejected", b.save_settings(0, 9001).get("ok") is False)
+
+
+def test_discovery_state_reported() -> None:
+    b = _isolated_backend()
+    state = b.discovery_state()
+    check("discovery reports sources", "cache-db" in state["sources"] and "log" in state["sources"],
+          str(state.get("sources")))
+    check("discovery reports backlog count", isinstance(state["backlog"], int))
+    check("discovery reports db path", state["db_path"].endswith("avatars.sqlite"), state["db_path"])
+
+    live = b.get_state()
+    check("get_state includes discovery", "discovery" in live)
+    check("get_state includes session_expired", live.get("session_expired") is False)
+
+    settings = b.get_settings()
+    check("get_settings includes discovery", "discovery" in settings)
+
+
+def test_auth_token_encryption() -> None:
+    """The VRChat token must never be written to disk in the clear."""
+    if not storage.dpapi_available():
+        return
+
+    encrypted = storage.protect_secret("tok-secret-value")
+    check("dpapi produces ciphertext", bool(encrypted))
+    check("ciphertext hides the token", "tok-secret-value" not in encrypted)
+    check("dpapi round-trips", storage.unprotect_secret(encrypted) == "tok-secret-value")
+    check("decrypting garbage yields empty", storage.unprotect_secret("not-base64!!") == "")
+    check("decrypting empty yields empty", storage.unprotect_secret("") == "")
+    check("encrypting empty yields empty", storage.protect_secret("") == "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        storage.DATA_DIR = root
+        storage.SETTINGS_FILE = root / "settings.json"
+        storage.save_settings({"auth_token": "tok-on-disk", "auth_username": "me"})
+        raw = storage.SETTINGS_FILE.read_text(encoding="utf-8")
+        check("token absent from settings.json", "tok-on-disk" not in raw, raw)
+        check("encrypted field present", storage.AUTH_TOKEN_ENC_KEY in raw)
+        check("token loads back", storage.load_settings()["auth_token"] == "tok-on-disk")
+        check("username loads back", storage.load_settings()["auth_username"] == "me")
+
+        # A plaintext token from an older version is still read.
+        storage.SETTINGS_FILE.write_text(
+            json.dumps({"auth_token": "legacy-plain"}), encoding="utf-8")
+        check("legacy plaintext token loads",
+              storage.load_settings()["auth_token"] == "legacy-plain")
+
+        # ...and is upgraded to encrypted on the next write.
+        loaded = storage.load_settings()
+        storage.save_settings(loaded)
+        check("legacy token upgraded",
+              "legacy-plain" not in storage.SETTINGS_FILE.read_text(encoding="utf-8"))
+        check("upgraded token still loads",
+              storage.load_settings()["auth_token"] == "legacy-plain")
+
+
 def main() -> int:
     tests = [
         test_storage,
@@ -581,6 +762,7 @@ def main() -> int:
         test_storage_import_ignores_local_paths,
         test_settings_sanitize,
         test_settings_load_recovers_from_corrupt_file,
+        test_auth_token_encryption,
         test_osc_receive,
         test_osc_send,
         test_api_helpers,
@@ -596,13 +778,18 @@ def main() -> int:
         test_vrcache_dedupe_across_layers,
         test_vrcache_is_read_only,
         test_vrcache_locked_database,
+        test_log_dedupe_across_sources,
+        test_log_dedupe_persisted,
+        test_expired_token_is_not_private,
+        test_osc_settings_not_persisted_on_failure,
+        test_discovery_state_reported,
     ]
     failed = 0
     for test in tests:
         try:
             test()
             RESULTS.append(f"[PASS] {test.__name__}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             failed += 1
             RESULTS.append(f"[FAIL] {test.__name__}: {exc}")
     for line in RESULTS:

@@ -10,9 +10,11 @@ let state = {
   current_avatar_id: null,
   status: "",
   logged_in: false,
+  session_expired: false,
   username: "",
   pending_2fa: false,
   version: "",
+  discovery: { sources: {}, backlog: 0, db_path: "" },
   osc: { listening: false, error: null, seen_traffic: false },
 };
 
@@ -123,24 +125,49 @@ function showAlert(title, message) {
   openModal("modal-alert");
 }
 
+// Only one confirm may be pending; opening a second settles the first so its
+// awaiting caller can never be left hanging forever.
+let pendingConfirm = null;
+
 function showConfirm(title, message) {
+  if (pendingConfirm) pendingConfirm(false);
   return new Promise((resolve) => {
     $("confirm-title").textContent = title || "Confirm";
     $("confirm-message").textContent = message || "";
     openModal("modal-confirm");
+
     const modal = $("modal-confirm");
     const ok = $("confirm-ok");
-    const cleanup = () => {
+    const cancel = $("confirm-cancel");
+
+    // Every exit path must settle the promise: OK, Cancel, backdrop and Escape.
+    // Previously only OK and the backdrop resolved, so clicking Cancel left the
+    // awaiting code running forever.
+    const finish = (value) => {
       ok.removeEventListener("click", onOk);
+      cancel.removeEventListener("click", onCancel);
       modal.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onKeydown, true);
+      pendingConfirm = null;
       closeModal("modal-confirm");
+      resolve(value);
     };
-    const onOk = () => { cleanup(); resolve(true); };
-    const onBackdrop = (e) => {
-      if (e.target === modal) { cleanup(); resolve(false); }
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    const onBackdrop = (e) => { if (e.target === modal) finish(false); };
+    const onKeydown = (e) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      e.preventDefault();
+      finish(false);
     };
+
     ok.addEventListener("click", onOk);
+    cancel.addEventListener("click", onCancel);
     modal.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onKeydown, true);
+
+    pendingConfirm = finish;
   });
 }
 
@@ -203,11 +230,14 @@ function ensureThumb(entry) {
     thumbPending[id] = true;
     call("get_thumbnail", id).then((data) => {
       thumbPending[id] = false;
-      if (data) {
-        thumbCache[id] = data;
-        thumbKey[id] = entry.thumb;
-        applyThumb(id);
-      }
+      // call() resolves to {ok:false} when the bridge throws, and that object is
+      // truthy. Storing it produced src="[object Object]" and, because it was
+      // cached against the thumb name, the broken image never recovered.
+      if (typeof data !== "string" || !data) return;
+      if (data === thumbCache[id]) return;
+      thumbCache[id] = data;
+      thumbKey[id] = entry.thumb;
+      applyThumb(id);
     });
   }
   return thumbCache[id] || "";
@@ -234,6 +264,9 @@ function renderHeader() {
   $("chips").classList.toggle("hidden", isLogs);
   $("grid-wrap").classList.toggle("hidden", isLogs);
   $("logs-wrap").classList.toggle("hidden", !isLogs);
+  // Sort only affects the avatar grid, so hiding it here avoids a control that
+  // visibly does nothing. Search applies to both views and stays visible.
+  $("sort").classList.toggle("hidden", isLogs);
 }
 
 function renderGrid(force) {
@@ -270,6 +303,11 @@ function renderGrid(force) {
       + (entry.id === state.current_avatar_id ? " wearing" : "")
       + (entry.id === selectedId ? " selected" : "");
     card.dataset.id = entry.id;
+    // The grid was previously mouse-only: cards were not focusable and the
+    // hover-revealed controls could not be reached by keyboard.
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-label", entry.name || "Avatar");
 
     const src = ensureThumb(entry) || placeholderDataUri(entry.name);
     const favOn = entry.favorite ? "on" : "";
@@ -297,6 +335,12 @@ function renderGrid(force) {
       </div>`;
 
     card.addEventListener("click", () => openDrawer(entry.id));
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openDrawer(entry.id);
+      }
+    });
     card.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, cardMenuItems(entry));
@@ -314,12 +358,26 @@ function renderGrid(force) {
   grid.appendChild(frag);
 }
 
+function matchesLogFilter(entry) {
+  const q = $("search").value.trim().toLowerCase();
+  if (!q) return true;
+  const fav = entryById(entry.id);
+  const hay = [entry.name, entry.id, fav ? fav.name : "", fav ? fav.author : ""]
+    .join(" ").toLowerCase();
+  return hay.includes(q);
+}
+
 function renderLogs(force) {
   if (currentView !== "logs") return;
 
   const showAvatars = logTab === "avatars";
-  const logs = state.logs || [];
-  const changes = state.changes || [];
+  const allLogs = state.logs || [];
+  const allChanges = state.changes || [];
+  // The search box is shared with the grid, so honour it here too rather than
+  // letting it sit there doing nothing on this tab.
+  const logs = allLogs.filter(matchesLogFilter);
+  const changes = allChanges.filter((c) =>
+    (c.player + " " + c.avatar).toLowerCase().includes($("search").value.trim().toLowerCase()));
 
   document.querySelectorAll(".log-tab").forEach((tab) => {
     tab.classList.toggle("active", tab.dataset.logtab === logTab);
@@ -343,7 +401,7 @@ function renderLogs(force) {
 
 function renderAvatarLogs(logs, force) {
   const sig = JSON.stringify(logs.map((e) =>
-    [e.id, e.name, e.count, e.last_seen, e.private, !!entryById(e.id)]));
+    [e.id, e.name, e.count, e.last_seen, e.private, e.source, !!entryById(e.id)]));
   if (!force && sig === lastLogsSig) return;
   lastLogsSig = sig;
 
@@ -361,6 +419,9 @@ function renderAvatarLogs(logs, force) {
                     : placeholderDataUri(name || log.id);
     const countBadge = log.count > 1 ? `<span class="platform-badge">×${log.count}</span>` : "";
     const privateBadge = log.private ? `<span class="platform-badge">private</span>` : "";
+    const sourceBadge = log.source
+      ? `<span class="platform-badge" title="Discovered from ${escapeHtml(SOURCE_LABELS[log.source] || log.source)}">${escapeHtml(SOURCE_LABELS[log.source] || log.source)}</span>`
+      : "";
     const saved = !!fav;
     const disabled = saved || log.private ? " disabled" : "";
 
@@ -373,7 +434,7 @@ function renderAvatarLogs(logs, force) {
         <div class="log-sub">${escapeHtml(log.id)}</div>
       </div>
       <div class="log-meta">
-        ${countBadge}${privateBadge}
+        ${sourceBadge}${countBadge}${privateBadge}
         <span class="muted small">${escapeHtml(relTime(log.last_seen))}</span>
       </div>
       <div class="log-actions">
@@ -470,9 +531,13 @@ function renderDrawer() {
 
   const active = document.activeElement;
   suppressSave = true;
-  if (active !== $("d-name")) $("d-name").value = entry.name || "";
-  if (active !== $("d-notes")) $("d-notes").value = entry.notes || "";
-  if (active !== $("d-tags")) $("d-tags").value = (entry.tags || []).join(", ");
+  // While a draft is pending these fields are the user's unsaved text, not stale
+  // model values: render() runs on every poll, and overwriting them would make
+  // the edit appear to vanish whenever the field lost focus.
+  const editing = !!draft && draft.id === entry.id;
+  if (!editing && active !== $("d-name")) $("d-name").value = entry.name || "";
+  if (!editing && active !== $("d-notes")) $("d-notes").value = entry.notes || "";
+  if (!editing && active !== $("d-tags")) $("d-tags").value = (entry.tags || []).join(", ");
   suppressSave = false;
 
   const src = ensureThumb(entry) || placeholderDataUri(entry.name);
@@ -497,6 +562,40 @@ function renderDrawer() {
   $("btn-fav").classList.toggle("primary", !!entry.favorite);
 }
 
+const SOURCE_LABELS = {
+  "cache-db": "local cache",
+  amplitude: "live feed",
+  log: "VRChat log",
+  osc: "OSC",
+};
+
+const SOURCE_ORDER = ["cache-db", "amplitude", "log"];
+
+// One line saying which local source is actually producing ids, so a degraded
+// source is visible rather than looking like "no new avatars".
+function renderDiscovery() {
+  const el = $("discovery-state");
+  if (!el) return;
+  const sources = (state.discovery && state.discovery.sources) || {};
+  const backlog = (state.discovery && state.discovery.backlog) || 0;
+  const parts = [];
+  for (const key of SOURCE_ORDER) {
+    const status = sources[key];
+    if (!status) continue;
+    if (status === "ok" || status === "empty") {
+      parts.push(SOURCE_LABELS[key] + (status === "empty" ? " (idle)" : ""));
+    } else {
+      parts.push(SOURCE_LABELS[key] + " unavailable");
+    }
+  }
+  let text = parts.join(" · ");
+  if (backlog) text += "  ·  " + backlog.toLocaleString() + " ids seen all-time";
+  el.textContent = text;
+  const down = SOURCE_ORDER.some((k) => ["missing", "unsupported", "unreadable"].includes(sources[k]));
+  el.classList.toggle("warn-text", down);
+  el.title = (state.discovery && state.discovery.db_path) || "";
+}
+
 function renderStatus() {
   const osc = state.osc;
   const dot = $("osc-dot");
@@ -515,6 +614,12 @@ function renderStatus() {
     $("osc-text").textContent = "OSC: waiting for VRChat...";
   }
 
+  // A full WinError string blows out the footer height, so keep the pill short
+  // and leave the detail in the tooltip.
+  $("osc-pill").title = osc.error || "";
+
+  $("session-expired").classList.toggle("hidden", !state.session_expired);
+
   const current = entryById(state.current_avatar_id);
   $("current").textContent = state.current_avatar_id
     ? "Current: " + (current ? current.name : state.current_avatar_id)
@@ -523,6 +628,8 @@ function renderStatus() {
   $("login-state").textContent = state.logged_in
     ? "Logged in" + (state.username ? " as " + state.username : "")
     : "Not logged in";
+
+  renderDiscovery();
 
   if (state.status && state.status !== lastStatus) {
     lastStatus = state.status;
@@ -539,8 +646,11 @@ function render() {
 }
 
 /* ------------------------------------------------------------------ drawer */
-function openDrawer(id) {
+async function openDrawer(id) {
+  // Persist any edit to the previously open avatar before switching away.
+  if (draft && draft.id !== id) await flushDraft(false);
   selectedId = id;
+  draft = null;
   document.querySelectorAll(".card").forEach((c) =>
     c.classList.toggle("selected", c.dataset.id === id));
   renderDrawer();
@@ -548,10 +658,13 @@ function openDrawer(id) {
   $("drawer-backdrop").classList.remove("hidden");
 }
 
-function closeDrawer() {
+async function closeDrawer() {
+  // Flush first: closing used to drop a pending debounced edit entirely.
+  if (draft) await flushDraft(false);
   $("drawer").classList.add("hidden");
   $("drawer-backdrop").classList.add("hidden");
   selectedId = null;
+  draft = null;
   document.querySelectorAll(".card").forEach((c) => c.classList.remove("selected"));
 }
 
@@ -667,15 +780,40 @@ async function refreshMeta() {
   if (!res.ok && res.title) showAlert(res.title, res.message);
 }
 
+/* The in-progress edit for the currently open drawer.
+   scheduleSave() used to read selectedId and the field values when the
+   debounce timer fired, so closing the drawer or clicking another card within
+   600ms of typing either discarded the edit or wrote it to the wrong avatar.
+   The snapshot is taken on every keystroke instead, and flushed explicitly
+   whenever the selection changes or the drawer closes. */
+let draft = null;
+
+function captureDraft() {
+  if (suppressSave || !selectedId) return;
+  draft = {
+    id: selectedId,
+    name: $("d-name").value,
+    notes: $("d-notes").value,
+    tags: $("d-tags").value,
+  };
+}
+
+async function flushDraft(announce) {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const pending = draft;
+  draft = null;
+  if (!pending) return false;
+  const res = await call("save_details", pending.id, pending.name, pending.notes, pending.tags);
+  if (announce && res && res.ok) toast("Saved.");
+  return !!(res && res.ok);
+}
+
 function scheduleSave() {
   if (suppressSave || !selectedId) return;
+  captureDraft();
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    if (!selectedId) return;
-    await call("save_details", selectedId, $("d-name").value, $("d-notes").value, $("d-tags").value);
-    toast("Saved.");
-    await refreshState();
-  }, 600);
+  saveTimer = setTimeout(() => { flushDraft(false); }, 600);
 }
 
 /* ------------------------------------------------------------------ settings */
@@ -813,9 +951,11 @@ async function refreshState() {
   state.current_avatar_id = next.current_avatar_id;
   state.status = next.status;
   state.logged_in = next.logged_in;
+  state.session_expired = !!next.session_expired;
   state.username = next.username;
   state.pending_2fa = next.pending_2fa;
   state.osc = next.osc || state.osc;
+  state.discovery = next.discovery || state.discovery;
   state.version = next.version || state.version;
   if (next.entries != null) state.entries = next.entries;
   if (next.logs != null) state.logs = next.logs;
@@ -842,6 +982,7 @@ function wire() {
   $("btn-add-current").addEventListener("click", addCurrent);
   $("btn-add-id").addEventListener("click", addByIdPrompt);
   $("rail-settings").addEventListener("click", openSettings);
+  $("session-expired").addEventListener("click", openSettings);
 
   document.querySelectorAll(".rail-btn[data-view]").forEach((btn) => {
     btn.addEventListener("click", () => setView(btn.dataset.view));
@@ -854,7 +995,10 @@ function wire() {
     });
   });
 
-  $("search").addEventListener("input", renderGrid);
+  $("search").addEventListener("input", () => {
+    renderGrid();
+    renderLogs();
+  });
   $("sort").addEventListener("change", renderGrid);
 
   document.querySelectorAll(".log-tab").forEach((tab) => {
@@ -928,6 +1072,10 @@ function wire() {
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       if (!$("context-menu").classList.contains("hidden")) { hideContextMenu(); return; }
+      // showConfirm owns Escape while it is open; it stops propagation in the
+      // capture phase so the promise settles. This guard is belt-and-braces so
+      // the dialog can never be hidden without settling.
+      if (pendingConfirm) return;
       const open = [...document.querySelectorAll(".modal:not(.hidden)")];
       if (open.length) { open.forEach((m) => closeModal(m.id)); return; }
       if (!$("drawer").classList.contains("hidden")) closeDrawer();

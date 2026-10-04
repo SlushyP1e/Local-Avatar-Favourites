@@ -76,7 +76,7 @@ class VRCApi:
     def token(self) -> str:
         for cookie in self._jar:
             if cookie.name == "auth":
-                return cookie.value
+                return cookie.value or ""
         return ""
 
     def is_logged_in(self) -> bool:
@@ -98,7 +98,7 @@ class VRCApi:
             body = json.dumps(data).encode("utf-8")
             headers["Content-Type"] = "application/json"
         if basic is not None:
-            raw = f"{basic[0]}:{basic[1]}".encode("utf-8")
+            raw = f"{basic[0]}:{basic[1]}".encode()
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
@@ -107,7 +107,7 @@ class VRCApi:
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
         except urllib.error.URLError as exc:
-            raise ApiError(f"Network error: {exc.reason}")
+            raise ApiError(f"Network error: {exc.reason}") from exc
 
     @staticmethod
     def _json(raw: bytes) -> dict:
@@ -186,10 +186,16 @@ class VRCApi:
 
     # ------------------------------------------------------------------ avatars
     def get_avatar(self, avatar_id: str) -> dict | None:
+        """Fetch one avatar.
+
+        Raises AuthError on 401 and returns None only for a genuine 404. The two
+        used to collapse into None, so an expired token looked identical to a
+        private avatar and the caller marked everything private.
+        """
         status, raw = self._request("GET", f"/avatars/{avatar_id}")
         if status == 200:
             return self._json(raw)
-        if status in (401, 404):
+        if status == 404:
             return None
         self._raise_api_error(raw, status)
         return None  # pragma: no cover

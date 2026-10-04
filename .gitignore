@@ -4,10 +4,15 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.mypy_cache/
+.ruff_cache/
 
 # PyInstaller
 build/
 dist/
+
+# Node (frontend tests only; no runtime dependencies)
+node_modules/
 
 # Editor / OS
 .vscode/

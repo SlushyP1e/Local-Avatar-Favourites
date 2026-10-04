@@ -16,7 +16,10 @@
   --accent-soft: rgba(255, 255, 255, 0.14);
   --ok: #f5f5f5;
   --wait: #a0a0a0;
-  --bad: #6a6a6a;
+  /* One accent hue, reserved for genuine failure. It was #6a6a6a, which is
+     dimmer than --wait, so an error read as calmer than simply being idle. */
+  --bad: #ff6b5e;
+  --warn: #ffb454;
   --radius: 8px;
   --radius-sm: 6px;
   --rail-w: 64px;
@@ -341,7 +344,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   transform: translateY(6px);
   transition: opacity 0.18s ease, transform 0.18s ease;
 }
-.card:hover .poster-actions { opacity: 1; transform: translateY(0); }
+.card:hover .poster-actions, .card:focus-within .poster-actions { opacity: 1; transform: translateY(0); }
 .poster-actions .btn { flex: 1 1 auto; justify-content: center; padding: 0.4rem 0.5rem; font-size: 0.8rem; }
 
 .fav-btn {
@@ -362,7 +365,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   opacity: 0;
   transition: opacity 0.15s, color 0.15s, background 0.15s;
 }
-.card:hover .fav-btn, .fav-btn.on { opacity: 1; }
+/* Visibility for .fav-btn and .poster-actions is handled in the focus section. */
 .fav-btn:hover { background: rgba(0, 0, 0, 0.7); color: #fff; }
 .fav-btn.on { color: var(--accent); }
 
@@ -560,6 +563,37 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
 .dot.wait { background: var(--wait); }
 .toast { color: var(--accent); opacity: 0; transition: opacity 0.3s; font-size: 0.82rem; }
 .toast.show { opacity: 1; }
+.pill.warn {
+  color: var(--warn);
+  border-color: var(--warn);
+  cursor: pointer;
+}
+.pill.warn:hover { background: rgba(255, 180, 84, 0.12); }
+.warn-text { color: var(--warn); }
+
+/* Keyboard focus must be visible, and the card's own controls have to be
+   reachable without a mouse: .fav-btn and .poster-actions were opacity 0 until
+   hover, which left an invisible but clickable heart. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.card:focus-visible { outline: none; }
+.card:focus-visible .poster { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.card:hover .fav-btn,
+.card:focus-within .fav-btn,
+.fav-btn.on { opacity: 1; }
+.card:hover .poster-actions,
+.card:focus-within .poster-actions { opacity: 1; transform: translateY(0); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
 
 /* ---------------------------------------------------------------- drawer */
 .drawer-backdrop {

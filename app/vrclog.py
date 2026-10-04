@@ -24,6 +24,13 @@ AVATAR_ID_RE = re.compile(
 SWITCH_RE = re.compile(r"\[Behaviour\] Switching (.+) to avatar (.+?)\s*$")
 TIMESTAMP_RE = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2}) (\d{2}):(\d{2}):(\d{2})")
 
+# VRChat's log grows without bound during a session. On a new session we start
+# this far from the end rather than at byte 0: re-parsing a few hundred
+# megabytes in one gulp blocks the poll loop and holds the GIL.
+TAIL_BYTES = 4 * 1024 * 1024
+# Upper bound on how much is consumed per poll, so a burst cannot stall the loop.
+MAX_CHUNK_BYTES = 2 * 1024 * 1024
+
 
 def log_directory() -> Path:
     return (Path(os.environ.get("USERPROFILE", str(Path.home())))
@@ -35,7 +42,8 @@ def _line_time(line: str) -> str:
     if not match:
         return ""
     try:
-        dt = datetime(*(int(g) for g in match.groups()))
+        year, month, day, hour, minute, second = (int(g) for g in match.groups())
+        dt = datetime(year, month, day, hour, minute, second)
         return dt.astimezone().isoformat(timespec="seconds")
     except ValueError:
         return ""
@@ -63,21 +71,32 @@ class VRCLogWatcher:
         if latest is None:
             return events
 
-        if self._path != latest:
-            # New session (or VRChat restarted): read the current file from the
-            # start so events made before the app launched are still captured.
-            self._path = latest
-            self._offset = 0
-
         try:
             size = latest.stat().st_size
-            if size < self._offset:
-                self._offset = 0
-            if size == self._offset:
-                return events
-            with open(latest, "r", encoding="utf-8", errors="ignore") as handle:
-                handle.seek(self._offset)
-                chunk = handle.read()
+        except OSError:
+            return events
+
+        if self._path != latest:
+            # New session (or VRChat restarted). Start near the end of the file:
+            # anything older has already been reported by a previous run, and
+            # reading the whole file from byte 0 is slow enough to stall us.
+            self._path = latest
+            self._offset = max(0, size - TAIL_BYTES)
+
+        if size < self._offset:
+            # Truncated or replaced underneath us; start over from the tail.
+            self._offset = max(0, size - TAIL_BYTES)
+        if size == self._offset:
+            return events
+
+        try:
+            with open(latest, encoding="utf-8", errors="ignore") as handle:
+                if self._offset:
+                    # A mid-file seek can land inside a line; drop the fragment.
+                    handle.seek(self._offset)
+                    handle.readline()
+                    handle.seek(handle.tell())
+                chunk = handle.read(MAX_CHUNK_BYTES)
                 self._offset = handle.tell()
         except OSError:
             return events

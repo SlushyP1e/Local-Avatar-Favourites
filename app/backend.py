@@ -25,6 +25,8 @@ import storage
 from api import ApiError, AuthError, TwoFactorRequired, VRCApi
 from osc import OSCBridge
 from version import __version__
+from versions import is_newer
+from vrcache import VRCacheWatcher
 from vrclog import VRCLogWatcher
 
 RELEASES_API = "https://api.github.com/repos/SlushyP1e/Local-Avatar-Favourites/releases/latest"
@@ -34,6 +36,16 @@ IMAGE_MIME = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
 }
+
+MAX_LOG_ENTRIES = 800
+MAX_CHANGE_ENTRIES = 1000
+DISCOVERY_FEED_MAX = 300
+
+# Where a logged avatar id came from. Surfaced in the UI so it is obvious which
+# source is actually producing discoveries.
+SOURCE_OSC = "osc"
+SOURCE_LOG = "log"
+SOURCE_CACHE = "cache-db"
 
 
 def _set_clipboard(text: str) -> bool:
@@ -74,7 +86,15 @@ def _set_clipboard(text: str) -> bool:
 
 
 class Backend:
-    def __init__(self) -> None:
+    """Bridge exposed to the web UI.
+
+    ``start_services=False`` builds the object without binding the OSC socket,
+    reading VRChat's real files or starting the poll thread, so tests can drive
+    the logic without touching the user's install.
+    """
+
+    def __init__(self, start_services: bool = True,
+                 cache: VRCacheWatcher | None = None) -> None:
         self._lock = threading.RLock()
         self._window = None
         self._pending_api: VRCApi | None = None
@@ -83,7 +103,9 @@ class Backend:
         self._running: set[str] = set()
         self.status = ""
         self._revs = {"entries": 0, "logs": 0, "changes": 0}
-        self._update_info: dict | None = None
+        # Set when the stored token stops working, so the UI can ask for a fresh
+        # login instead of silently reporting every avatar as private.
+        self.session_expired = False
 
         self.entries: list[dict] = storage.load_favourites()
         self.log: list[dict] = storage.load_log()
@@ -96,11 +118,21 @@ class Backend:
             receive_port=int(self.settings.get("osc_receive_port", 9001)),
         )
         self.osc.add_avatar_change_listener(self._on_avatar_change)
-        self.osc.start()
+        if start_services:
+            self.osc.start()
 
         self._watcher = VRCLogWatcher()
+        self._cache = cache if cache is not None else VRCacheWatcher()
+        if start_services:
+            try:
+                # Record the existing backlog as already-seen so starting the app
+                # does not emit tens of thousands of "new" discoveries at once.
+                self._cache.bootstrap()
+            except Exception:
+                pass
         self._stopped = False
-        threading.Thread(target=self._log_loop, daemon=True).start()
+        if start_services:
+            threading.Thread(target=self._log_loop, daemon=True).start()
 
     def stop(self) -> None:
         self._stopped = True
@@ -114,6 +146,13 @@ class Backend:
                     self._ingest_log_events(events)
             except Exception:
                 pass
+            try:
+                # The local cache is the richest source of real ids; the text log
+                # is a weak fallback that mostly sees our own avatar.
+                for avatar_id in self._cache.poll():
+                    self._record_log(avatar_id, source=SOURCE_CACHE)
+            except Exception:
+                pass
             time.sleep(1.0)
 
     def _ingest_log_events(self, events: list[dict]) -> None:
@@ -122,13 +161,14 @@ class Backend:
             changed_changes = False
             for event in events:
                 if event["type"] == "avatar-id":
-                    if self._record_log(event["id"], event.get("time", ""), save=False):
+                    if self._record_log(event["id"], event.get("time", ""),
+                                        save=False, source=SOURCE_LOG):
                         changed_log = True
-                elif event["type"] == "avatar-change":
-                    if self._record_change(event.get("player", ""),
-                                           event.get("avatar", ""),
-                                           event.get("time", "")):
-                        changed_changes = True
+                elif event["type"] == "avatar-change" and self._record_change(
+                    event.get("player", ""),
+                    event.get("avatar", ""),
+                    event.get("time", "")):
+                    changed_changes = True
             if changed_log:
                 storage.save_log(self.log)
             if changed_changes:
@@ -156,33 +196,48 @@ class Backend:
         self.status = text
 
     def _on_avatar_change(self, avatar_id: str) -> None:
-        self._record_log(avatar_id)
+        self._record_log(avatar_id, source=SOURCE_OSC)
         self._set_status(f"VRChat is wearing {avatar_id}.")
 
-    def _record_log(self, avatar_id: str, when: str = "", save: bool = True) -> bool:
+    def _record_log(self, avatar_id: str, when: str = "", save: bool = True,
+                     source: str = SOURCE_OSC) -> bool:
+        """Record that an avatar id was seen.
+
+        ``source`` records where the id came from. De-duplication uses a
+        minute-resolution bucket rather than the exact timestamp: the same
+        avatar change arrives twice in normal operation, once over OSC and once
+        via the log file, with different timestamps, so the old exact comparison
+        counted every change twice.
+        """
         avatar_id = (avatar_id or "").strip().lower()
         if not avatar_id:
             return False
         stamp = when or storage.now_iso()
+        bucket = stamp[:16]
         with self._lock:
             entry = next((e for e in self.log if e.get("id") == avatar_id), None)
             if entry:
-                if when and entry.get("last_seen") == stamp:
+                if entry.get("seen_bucket") == bucket:
                     return False
+                entry["seen_bucket"] = bucket
                 entry["last_seen"] = stamp
                 entry["count"] = int(entry.get("count", 1)) + 1
+                if entry.get("source") != source:
+                    entry["source"] = source
             else:
                 self.log.append({
                     "id": avatar_id,
                     "name": "",
                     "first_seen": stamp,
                     "last_seen": stamp,
+                    "seen_bucket": bucket,
                     "count": 1,
                     "private": False,
+                    "source": source,
                 })
-            if len(self.log) > 800:
+            if len(self.log) > MAX_LOG_ENTRIES:
                 self.log.sort(key=lambda e: e.get("last_seen", ""))
-                self.log = self.log[-800:]
+                self.log = self.log[-MAX_LOG_ENTRIES:]
             if save:
                 storage.save_log(self.log)
             self._touch("logs")
@@ -210,9 +265,9 @@ class Backend:
                     "last_seen": stamp,
                     "count": 1,
                 })
-            if len(self.changes) > 1000:
+            if len(self.changes) > MAX_CHANGE_ENTRIES:
                 self.changes.sort(key=lambda e: e.get("last_seen", ""))
-                self.changes = self.changes[-1000:]
+                self.changes = self.changes[-MAX_CHANGE_ENTRIES:]
             self._touch("changes")
         return True
 
@@ -240,9 +295,11 @@ class Backend:
                 "current_avatar_id": self.osc.current_avatar_id,
                 "status": self.status,
                 "logged_in": self.api.is_logged_in(),
+                "session_expired": self.session_expired,
                 "username": self.settings.get("auth_username", ""),
                 "pending_2fa": self._pending_api is not None,
                 "revs": dict(self._revs),
+                "discovery": self.discovery_state(),
                 "osc": {
                     "listening": self.osc.listening,
                     "error": self.osc.error,
@@ -261,10 +318,32 @@ class Backend:
             "osc_receive_port": self.settings.get("osc_receive_port", 9001),
             "username": self.settings.get("auth_username", ""),
             "logged_in": self.api.is_logged_in(),
+            "session_expired": self.session_expired,
             "pending_2fa": self._pending_api is not None,
             "twofa_methods": list(self._pending_2fa_methods),
             "twofa_method": self._pending_2fa_method,
+            "discovery": self.discovery_state(),
         }
+
+    def discovery_state(self) -> dict:
+        """Which local source is producing avatar ids, and how much it has seen.
+
+        Reported to the UI so a working source looks working and a degraded one
+        is visible, rather than both appearing as "nothing new".
+        """
+        status = dict(self._cache.status)
+        # The text log remains the lowest-priority source.
+        status.setdefault(SOURCE_LOG, "ok")
+        return {
+            "sources": status,
+            "backlog": self._cache.backlog_size(),
+            "db_path": str(self._cache.db_path),
+        }
+
+    def get_backlog(self, limit: int = 60, offset: int = 0) -> dict:
+        """A page of previously-seen ids, newest first."""
+        ids = self._cache.backlog(limit=limit, offset=offset)
+        return {"ok": True, "ids": ids, "total": self._cache.backlog_size()}
 
     def get_thumbnail(self, avatar_id: str) -> str:
         with self._lock:
@@ -458,9 +537,19 @@ class Backend:
             self._set_status(f"Saved {len(added_ids)} avatar(s). Log in to fetch metadata.")
         return {"ok": True, "added": len(added_ids)}
 
+    def _handle_session_expired(self, exc: Exception) -> None:
+        """Record that the stored token is no longer usable and prompt a re-login."""
+        with self._lock:
+            if self.session_expired:
+                return
+            self.session_expired = True
+        self._set_status(
+            "VRChat session expired - log in again in Settings to fetch names and thumbnails."
+        )
+
     def _bulk_metadata(self, ids: list[str]) -> None:
         for avatar_id in ids:
-            if self._stopped:
+            if self._stopped or self.session_expired:
                 return
             with self._lock:
                 if avatar_id in self._running:
@@ -470,6 +559,8 @@ class Backend:
                 self._metadata_worker(avatar_id)
             except Exception:
                 pass
+            # Be a good API citizen: VRChat terminates accounts for abuse, and
+            # the README's own advice is to keep request rates low.
             time.sleep(0.6)
 
     def clear_changes(self) -> dict:
@@ -577,21 +668,6 @@ class Backend:
         return {"ok": True, "added": added}
 
     # ------------------------------------------------------------------ updates
-    @staticmethod
-    def _is_newer(latest: str, current: str) -> bool:
-        def parts(value: str) -> list[int]:
-            out = []
-            for chunk in str(value).split("."):
-                digits = "".join(ch for ch in chunk if ch.isdigit())
-                out.append(int(digits) if digits else 0)
-            return out
-
-        a, b = parts(latest), parts(current)
-        length = max(len(a), len(b))
-        a += [0] * (length - len(a))
-        b += [0] * (length - len(b))
-        return a > b
-
     def check_updates(self) -> dict:
         req = urllib.request.Request(
             RELEASES_API,
@@ -605,8 +681,7 @@ class Backend:
             return {"ok": False, "current": __version__}
         tag = str(payload.get("tag_name") or "").lstrip("v")
         url = payload.get("html_url") or ""
-        self._update_info = {"latest": tag, "url": url}
-        if tag and self._is_newer(tag, __version__):
+        if tag and is_newer(tag, __version__):
             return {"ok": True, "update": True, "latest": tag,
                     "url": url, "current": __version__}
         return {"ok": True, "update": False, "latest": tag, "current": __version__}
@@ -699,10 +774,19 @@ class Backend:
                 self._pending_2fa_methods = []
                 return {"status": "error", "message": str(last_error)}
 
+        if api is None:
+            # Unreachable in practice: both branches above either populate `api`
+            # or return early. Checked so a future change cannot silently
+            # promote a None client.
+            self._pending_api = None
+            self._pending_2fa_methods = []
+            return {"status": "error", "message": "Login failed."}
+
         self._pending_api = None
         self._pending_2fa_methods = []
         self._pending_2fa_method = ""
         self.api = api
+        self.session_expired = False
         self.settings["auth_token"] = api.token
         if username:
             self.settings["auth_username"] = username
@@ -714,6 +798,7 @@ class Backend:
         self._pending_2fa_methods = []
         self._pending_2fa_method = ""
         self.api = VRCApi("")
+        self.session_expired = False
         self.settings["auth_token"] = ""
         storage.save_settings(self.settings)
         return {"ok": True}
@@ -727,19 +812,31 @@ class Backend:
             return {"ok": False, "message": "Ports must be numbers."}
         if not (0 < send_port < 65536) or not (0 < recv_port < 65536):
             return {"ok": False, "message": "Ports must be between 1 and 65535."}
-        self.settings["osc_send_port"] = send_port
-        self.settings["osc_receive_port"] = recv_port
-        storage.save_settings(self.settings)
-        self.osc.stop()
-        self.osc = OSCBridge(
+        if send_port == recv_port:
+            return {"ok": False,
+                    "message": "The send and receive ports must be different."}
+
+        # Bind before persisting. The old order wrote the settings first and only
+        # then discovered the port was unavailable, so a single conflict left
+        # the app unable to start OSC on every subsequent launch with no way to
+        # recover from the UI.
+        previous = self.osc
+        candidate = OSCBridge(
             send_ip=self.settings.get("osc_send_ip", "127.0.0.1"),
             send_port=send_port,
             receive_port=recv_port,
         )
-        self.osc.add_avatar_change_listener(self._on_avatar_change)
-        self.osc.start()
-        if self.osc.error:
-            return {"ok": False, "message": self.osc.error}
+        candidate.add_avatar_change_listener(self._on_avatar_change)
+        candidate.start()
+        if candidate.error:
+            candidate.stop()
+            return {"ok": False, "message": candidate.error}
+
+        previous.stop()
+        self.osc = candidate
+        self.settings["osc_send_port"] = send_port
+        self.settings["osc_receive_port"] = recv_port
+        storage.save_settings(self.settings)
         self._set_status("OSC settings applied.")
         return {"ok": True}
 
@@ -772,6 +869,12 @@ class Backend:
         try:
             try:
                 avatar = api.get_avatar(avatar_id)
+            except AuthError as exc:
+                # An expired or revoked token must never be recorded as "this
+                # avatar is private": that silently greyed out the whole log and
+                # made Save all skip everything.
+                self._handle_session_expired(exc)
+                return
             except ApiError as exc:
                 self._set_status(f"Metadata failed for {avatar_id}: {exc}")
                 return

@@ -73,6 +73,7 @@
           </div>
           <span id="logs-count" class="muted"></span>
           <span class="spacer"></span>
+          <span id="discovery-state" class="muted small"></span>
           <button id="logs-save-all" class="btn small primary hidden">Save all</button>
           <button id="logs-clear" class="btn small">Clear logs</button>
         </div>
@@ -99,10 +100,14 @@
           <span class="dot" id="osc-dot"></span>
           <span id="osc-text">OSC: starting...</span>
         </span>
+        <span id="session-expired" class="pill warn hidden" role="status"
+              title="The stored VRChat session is no longer valid. Open Settings to log in again.">
+          Session expired — open Settings to log in
+        </span>
         <span id="current" class="muted"></span>
         <span class="spacer"></span>
         <span id="count" class="muted"></span>
-        <span id="toast" class="toast"></span>
+        <span id="toast" class="toast" role="status" aria-live="polite"></span>
         <span id="login-state" class="muted"></span>
       </footer>
     </main>
@@ -164,7 +169,7 @@
       <h2 id="confirm-title">Confirm</h2>
       <p id="confirm-message" class="muted"></p>
       <div class="modal-actions">
-        <button class="btn ghost" data-close>Cancel</button>
+        <button id="confirm-cancel" class="btn ghost">Cancel</button>
         <button id="confirm-ok" class="btn primary">Continue</button>
       </div>
     </div>

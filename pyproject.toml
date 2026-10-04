@@ -1,0 +1,69 @@
+[project]
+name = "local-avatar-favourites"
+description = "Keep an unlimited local list of VRChat avatars with notes, tags and one-click switching over OSC."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dynamic = ["version"]
+# Upper bounds matter here: the packaged executable is built by PyInstaller
+# against whatever resolves at build time, so an unbounded major bump can break
+# a release with no source change.
+dependencies = [
+    "python-osc>=1.8,<2",
+    "pywebview>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pyinstaller>=6.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/SlushyP1e/Local-Avatar-Favourites"
+
+[tool.setuptools.dynamic]
+version = { attr = "app.version.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The modules use flat sibling imports (import storage, from api import ...), which
+# works because the app directory is the script directory rather than a package.
+src = ["app"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "C4"]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "RUF012",  # mutable class attrs need ClassVar annotations we do not use
+    "SIM105",  # contextlib.suppress is not clearly better here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The self-test deliberately reaches into module globals and private helpers.
+"app/selftest.py" = ["E402", "F841", "B010"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["api", "backend", "osc", "storage", "version", "versions",
+                     "vrcache", "vrclog"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "app"
+files = ["app"]
+# pywebview and python-osc ship no stubs.
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# The self-test intentionally builds deliberately malformed values and assigns to
+# module globals and methods in order to redirect storage into a temp directory.
+module = "selftest"
+allow_untyped_defs = true
+disable_error_code = ["arg-type", "assignment", "method-assign", "return-value"]

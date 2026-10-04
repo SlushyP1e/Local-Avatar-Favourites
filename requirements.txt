@@ -1,2 +1,2 @@
-python-osc>=1.8.0
-pywebview>=5.0
+python-osc>=1.8,<2
+pywebview>=6,<7
