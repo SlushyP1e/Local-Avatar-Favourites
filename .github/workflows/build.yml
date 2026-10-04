@@ -14,6 +14,14 @@ on:
 permissions:
   contents: read
 
+env:
+  # The self-test prints real VRChat data, and VRChat names are full of
+  # characters the Windows console codepage cannot encode. Without this the
+  # reporter can die mid-run on a name like ［Protogen］Kuro and the whole suite
+  # reports as failed. The suite also reconfigures its own streams, but pinning
+  # the mode here keeps the runner's output readable too.
+  PYTHONUTF8: "1"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -82,8 +90,12 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
+      # --clean matches build.bat. PyInstaller reuses build\, and a stale bundle
+      # is indistinguishable from a broken feature: the UI silently loses
+      # behaviour with nothing reporting an error. A fresh checkout makes this
+      # unlikely here, but the two build paths should not differ.
       - name: Build executable
-        run: python -m PyInstaller --noconfirm LocalAvatarFavourites.spec
+        run: python -m PyInstaller --noconfirm --clean LocalAvatarFavourites.spec
 
       # The spec excludes a long list of modules, so a bundle can build
       # successfully and still be broken. This proved it: excluding 'bottle'
@@ -135,11 +147,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      # No checkout: this job only republishes the artifact the build job
+      # already produced, so it needs no source. The download and checkout
+      # versions must match the ones the build job used -- upload-artifact@v7
+      # output is not readable by download-artifact@v4, which is what was
+      # pinned here before.
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: LocalAvatarFavourites
           path: dist

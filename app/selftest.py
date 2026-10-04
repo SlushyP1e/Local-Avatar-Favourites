@@ -1764,6 +1764,21 @@ def test_motion_setting() -> None:
 
 
 def main() -> int:
+    # Results carry real VRChat data, and VRChat names are full of characters a
+    # legacy console cannot encode -- ［Protogen］Kuro alone is enough to raise
+    # UnicodeEncodeError, because the fullwidth bracket ［ is not in cp1252,
+    # which is the Windows ANSI default. The reporter then dies mid-run and the
+    # whole suite reports as failed, hiding the results it had already produced.
+    # Switch to UTF-8 and replace anything still unencodable, so a name can never
+    # turn a passing run into a failing one.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
     tests = [
         test_storage,
         test_storage_merge,
