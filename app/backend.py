@@ -510,7 +510,6 @@ class Backend:
     def delete(self, avatar_id: str) -> dict:
         avatar_id = self._norm_id(avatar_id)
         with self._lock:
-            entry = self._entry(avatar_id)
             before = len(self.entries)
             self.entries = [e for e in self.entries if self._norm_id(e.get("id")) != avatar_id]
             self._reindex()
@@ -518,9 +517,11 @@ class Backend:
                 return {"ok": False}
             storage.save_favourites(self.entries)
             self._touch("entries")
-        # Reclaim the cached image too, rather than leaving it to accumulate.
-        if entry and entry.get("thumb"):
-            storage.delete_thumb(entry["thumb"])
+        # The cached image is deliberately left on disk: Undo re-inserts this
+        # entry's thumb filename, and deleting the file here left Undo restoring
+        # a name pointing at nothing, so the avatar came back with no picture.
+        # Orphans are collected by prune_orphans_on_start and the Settings
+        # "Clean thumbnails" action instead.
         self._set_status("Removed from favourites.")
         return {"ok": True}
 
@@ -1129,24 +1130,33 @@ class Backend:
         if exit_on_close is not None:
             self.settings["exit_on_close"] = bool(exit_on_close)
 
-        # Bind before persisting. The old order wrote the settings first and only
-        # then discovered the port was unavailable, so a single conflict left
-        # the app unable to start OSC on every subsequent launch with no way to
-        # recover from the UI.
-        previous = self.osc
-        candidate = OSCBridge(
-            send_ip=self.settings.get("osc_send_ip", "127.0.0.1"),
-            send_port=send_port,
-            receive_port=recv_port,
-        )
-        candidate.add_avatar_change_listener(self._on_avatar_change)
-        candidate.start()
-        if candidate.error:
-            candidate.stop()
-            return {"ok": False, "message": candidate.error}
-
-        previous.stop()
-        self.osc = candidate
+        # Only the receive port is actually bound. If it has not changed there is
+        # nothing to rebind -- and attempting one would fail against our own
+        # listener, which is holding that very port. Only the outgoing target
+        # needs updating.
+        current_recv = int(self.osc.receive_port)
+        if recv_port == current_recv:
+            self.osc.retarget(self.settings.get("osc_send_ip", "127.0.0.1"), send_port)
+            if self.osc.error:
+                return {"ok": False, "message": self.osc.error}
+        else:
+            # Bind before persisting. The old order wrote the settings first and
+            # only then discovered the port was unavailable, so a single conflict
+            # left the app unable to start OSC on every later launch with no way
+            # to recover from the UI.
+            previous = self.osc
+            candidate = OSCBridge(
+                send_ip=self.settings.get("osc_send_ip", "127.0.0.1"),
+                send_port=send_port,
+                receive_port=recv_port,
+            )
+            candidate.add_avatar_change_listener(self._on_avatar_change)
+            candidate.start()
+            if candidate.error:
+                candidate.stop()
+                return {"ok": False, "message": candidate.error}
+            previous.stop()
+            self.osc = candidate
         self.settings["osc_send_port"] = send_port
         self.settings["osc_receive_port"] = recv_port
         storage.save_settings(self.settings)

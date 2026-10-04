@@ -967,6 +967,11 @@ def test_thumbnail_pruning() -> None:
         (storage.THUMBS_DIR / "orphan.png").write_bytes(b"x")
         (storage.THUMBS_DIR / "nested").mkdir()
 
+        # Age the orphan past the undo grace window so it is collectable.
+        aged = 1_000_000_000
+        os.utime(storage.THUMBS_DIR / "orphan.png", (aged, aged))
+        os.utime(storage.THUMBS_DIR / keep, (aged, aged))
+
         orphans, trimmed = storage.prune_thumbs({keep})
         check("orphan removed", orphans == 1, str(orphans))
         check("kept file survives", (storage.THUMBS_DIR / keep).exists())
@@ -1005,18 +1010,27 @@ def test_thumbnail_pruning() -> None:
         check("clear_thumbs on empty dir", storage.clear_thumbs() == 0)
 
 
-def test_delete_removes_thumbnail() -> None:
+def test_delete_leaves_thumbnail_for_undo() -> None:
+    """Deleting keeps the cached image so Undo can restore it.
+
+    Replaced by test_undo_keeps_the_thumbnail, which covers the whole round
+    trip including actually serving the image again.
+    """
     b = _isolated_backend()
     avatar_id = "avtr_7a7a7a7a-1111-2222-3333-444444444444"
     b.add_by_id(avatar_id)
     entry = b._entry(avatar_id)
     entry["thumb"] = "orphan-me.png"
-    storage.thumb_file_path(avatar_id).parent.mkdir(parents=True, exist_ok=True)
-    (storage.THUMBS_DIR / "orphan-me.png").write_bytes(b"x")
+    storage.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+    image = storage.THUMBS_DIR / "orphan-me.png"
+    image.write_bytes(b"x")
 
     check("delete succeeds", b.delete(avatar_id)["ok"] is True)
-    check("thumbnail deleted with the favourite",
-          not (storage.THUMBS_DIR / "orphan-me.png").exists())
+    check("entry removed", b._entry(avatar_id) is None)
+    check("image kept for undo", image.exists())
+    check("image is collectable once past the grace window",
+          storage.prune_thumbs(set(), grace_seconds=0.0)[0] == 1)
+    check("image gone after pruning", not image.exists())
 
 
 def test_job_progress() -> None:
@@ -1279,6 +1293,110 @@ def test_tray_state_reported() -> None:
     check("notify reaches the tray", tray.shown == [("Title", "Message")], str(tray.shown))
 
 
+def test_settings_save_unchanged_ports() -> None:
+    """Saving settings without changing the ports must not try to rebind.
+
+    The rebind binds the same receive port the live listener is already holding,
+    so it failed with WinError 10048 against ourselves.
+    """
+    from osc import OSCBridge
+
+    b = _isolated_backend()
+    # Give the backend a real listener, as in normal operation.
+    b.osc = OSCBridge(send_ip="127.0.0.1", send_port=9000, receive_port=18771)
+    b.osc.start()
+    check("test bridge is listening", b.osc.listening, b.osc.error or "")
+    try:
+        # Same receive port: only the outgoing target can have changed.
+        res = b.save_settings(9000, 18771, exit_on_close=False)
+        check("unchanged ports save cleanly", res.get("ok") is True, str(res))
+        check("still listening after save", b.osc.listening, b.osc.error or "")
+        check("exit_on_close applied", b.settings["exit_on_close"] is False)
+        check("settings persisted", storage.load_settings()["osc_receive_port"] == 18771)
+
+        # Only the send port changed: still no rebind needed.
+        res = b.save_settings(9002, 18771)
+        check("send-only change saves cleanly", res.get("ok") is True, str(res))
+        check("send port retargeted", b.osc.send_port == 9002, str(b.osc.send_port))
+        check("same listener object reused", b.osc.listening, b.osc.error or "")
+
+        # A genuinely new receive port does rebind, and works.
+        res = b.save_settings(9000, 18772)
+        check("port change rebinds", res.get("ok") is True, str(res))
+        check("new receive port active", b.osc.receive_port == 18772)
+        check("listening on the new port", b.osc.listening, b.osc.error or "")
+    finally:
+        b.osc.stop()
+
+    # An unavailable new port must still fail without persisting.
+    import socket
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    blocker.bind(("127.0.0.1", 0))
+    taken = blocker.getsockname()[1]
+    try:
+        storage.save_settings({"osc_send_port": 9000, "osc_receive_port": 9001})
+        res = b.save_settings(9100, taken)
+        check("genuine conflict still reported", res.get("ok") is False, str(res))
+        check("conflict left settings alone",
+              storage.load_settings()["osc_send_port"] == 9000)
+    finally:
+        blocker.close()
+
+
+def test_undo_keeps_the_thumbnail() -> None:
+    """Delete then Undo must bring the picture back, not just the record."""
+    b = _isolated_backend()
+    avatar_id = "avtr_beefbeef-1111-2222-3333-444444444444"
+    b.add_by_id(avatar_id)
+    entry = b._entry(avatar_id)
+    entry["name"] = "Has a picture"
+    entry["thumb"] = "beef.png"
+    image = storage.THUMBS_DIR / "beef.png"
+    image.write_bytes(b"fake-png-bytes")
+
+    check("delete succeeds", b.delete(avatar_id)["ok"] is True)
+    check("thumbnail survives the delete", image.exists(),
+          "undo would restore a filename pointing at nothing")
+
+    res = b.restore_entry(entry)
+    check("restore succeeds", res["ok"] is True, str(res))
+    back = b._entry(avatar_id)
+    check("entry is back", back is not None)
+    check("thumb filename restored", back.get("thumb") == "beef.png")
+    check("image still readable", image.exists())
+
+    # And the picture is actually served again.
+    served = b.get_thumbnail(avatar_id)
+    check("thumbnail served after undo", served.startswith("data:image/png;base64,"),
+          served[:40])
+
+
+def test_prune_respects_undo_grace() -> None:
+    """A just-deleted avatar must keep its image until undo expires."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        storage.THUMBS_DIR = root / "thumbs"
+        storage.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+
+        fresh = storage.THUMBS_DIR / "fresh.png"
+        fresh.write_bytes(b"x")
+        # An orphan that predates the undo window.
+        old = storage.THUMBS_DIR / "old.png"
+        old.write_bytes(b"x")
+        ancient = 1_000_000_000
+        os.utime(old, (ancient, ancient))
+
+        orphans, _ = storage.prune_thumbs(set())
+        check("fresh orphan is spared", fresh.exists(), "undo would lose the image")
+        check("old orphan removed", not old.exists())
+        check("only the old one counted", orphans == 1, str(orphans))
+
+        # Once it is old enough it goes.
+        orphans, _ = storage.prune_thumbs(set(), grace_seconds=0.0)
+        check("fresh orphan removed with no grace", not fresh.exists())
+        check("counted", orphans == 1, str(orphans))
+
+
 def main() -> int:
     tests = [
         test_storage,
@@ -1322,9 +1440,12 @@ def main() -> int:
         test_tray_icon,
         test_wear_last,
         test_exit_on_close_setting,
+        test_settings_save_unchanged_ports,
+        test_undo_keeps_the_thumbnail,
+        test_prune_respects_undo_grace,
         test_tray_state_reported,
         test_thumbnail_pruning,
-        test_delete_removes_thumbnail,
+        test_delete_leaves_thumbnail_for_undo,
     ]
     failed = 0
     for test in tests:

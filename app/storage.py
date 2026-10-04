@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import time
 from ctypes import wintypes
 from datetime import UTC, datetime
 from pathlib import Path
@@ -399,14 +400,20 @@ def delete_thumb(name) -> bool:
         return False
 
 
-def prune_thumbs(keep: set[str], max_files: int = 2000) -> tuple[int, int]:
+def prune_thumbs(keep: set[str], max_files: int = 2000,
+                 grace_seconds: float = 60.0) -> tuple[int, int]:
     """Drop thumbnails no longer referenced by a favourite.
 
     Deletes orphaned files outright, then trims the cache by oldest-first so it
-    cannot grow without bound. Returns (orphans_removed, trimmed).
+    cannot grow without bound. Files written within ``grace_seconds`` are left
+    alone: an avatar deleted moments ago may still be sitting in the undo buffer,
+    and restoring it must find its image intact.
+
+    Returns (orphans_removed, trimmed).
     """
     removed = 0
     trimmed = 0
+    now = time.time()
     try:
         files = [p for p in THUMBS_DIR.iterdir() if p.is_file()]
     except OSError:
@@ -415,6 +422,13 @@ def prune_thumbs(keep: set[str], max_files: int = 2000) -> tuple[int, int]:
     survivors: list[Path] = []
     for path in files:
         if path.name in keep:
+            survivors.append(path)
+            continue
+        try:
+            if now - path.stat().st_mtime < grace_seconds:
+                survivors.append(path)
+                continue
+        except OSError:
             survivors.append(path)
             continue
         try:

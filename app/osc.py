@@ -99,6 +99,24 @@ class OSCBridge:
         self._client = None
 
     # ------------------------------------------------------------------- send
+    def retarget(self, send_ip: str | None = None, send_port: int | None = None) -> None:
+        """Point the sender somewhere else without touching the listener.
+
+        Only the receive port is actually bound, so changing where we send does
+        not require a rebind -- and must not do one, because the current
+        listener is holding that port.
+        """
+        with self._lock:
+            if send_ip:
+                self.send_ip = send_ip
+            if send_port:
+                self.send_port = int(send_port)
+            try:
+                self._client = SimpleUDPClient(self.send_ip, self.send_port)
+            except Exception as exc:  # pragma: no cover - defensive
+                self._client = None
+                self.error = f"Could not create OSC sender: {exc}"
+
     def change_avatar(self, avatar_id: str) -> bool:
         if self._client is None:
             return False
