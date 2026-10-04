@@ -25,9 +25,17 @@ THUMBS_DIR = DATA_DIR / "thumbs"
 
 _MIGRATED = False
 
-# Animation preference. "system" respects the OS accessibility setting,
-# "full" overrides it, "none" disables motion outright.
+# Animation preference. "full" overrides the OS setting, "system" respects it,
+# "none" disables motion outright.
+#
+# Defaults to "full" rather than "system": Windows exposes one
+# "Show animations" toggle for both accessibility and plain performance reasons,
+# and Chromium reports both as prefers-reduced-motion. Honouring that by default
+# left the app looking broken on any machine tuned for performance, with no way
+# to tell that anything was wrong. Motion is a headline feature here, and anyone
+# who needs it off has both this setting and the Windows toggle.
 MOTION_MODES = ("system", "full", "none")
+DEFAULT_MOTION = "full"
 
 DEFAULT_SETTINGS = {
     "osc_send_ip": "127.0.0.1",
@@ -37,7 +45,7 @@ DEFAULT_SETTINGS = {
     "auth_username": "",
     # When false, closing the window hides to the notification area instead.
     "exit_on_close": True,
-    "motion": "system",
+    "motion": DEFAULT_MOTION,
 }
 
 
@@ -322,7 +330,7 @@ def sanitize_settings(raw) -> dict:
     # Accept surrounding whitespace and any casing, so a hand-edited
     # "FULL" behaves the same as one saved through the UI.
     motion = str(settings.get("motion") or "system").strip().lower()
-    settings["motion"] = motion if motion in MOTION_MODES else "system"
+    settings["motion"] = motion if motion in MOTION_MODES else DEFAULT_MOTION
 
     return settings
 

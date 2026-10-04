@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 # The app directory is a script directory rather than a package: sibling modules
 # are imported flat (import storage, from api import ...). Put this directory on
@@ -33,6 +34,12 @@ def _web_dir() -> str:
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, "web")
+
+
+# Markers that must be present in the bundled stylesheet. PyInstaller reuses
+# build/ between runs, and a stale bundle looks exactly like a broken feature:
+# the UI silently loses behaviour with no error anywhere.
+CSS_MARKERS = ("data-motion", "view-in-next", "prefers-reduced-motion")
 
 
 def _icon_path() -> str | None:
@@ -138,9 +145,9 @@ class _Shell:
 
 
 def main() -> int:
-    # CI runs the packaged executable with --selftest. A bundle that is missing
-    # an import fails here instead of on the user's first launch, which matters
-    # because the spec deliberately excludes a long list of modules.
+    # CI, and anyone debugging a packaged build, runs the executable with
+    # --selftest. A bundle missing an import or shipping a stale stylesheet fails
+    # here rather than looking like a broken feature.
     if "--selftest" in sys.argv:
         backend = Backend(start_services=False)
         # One poll so the reported source status is real rather than the
@@ -152,9 +159,26 @@ def main() -> int:
         print(f"  entries loaded : {len(backend.entries)}")
         print(f"  discovery      : {backend.discovery_state()['sources']}")
         print(f"  tray available : {tray_available()}")
-        # A blank tray icon means this file was missing from the bundle.
-        print(f"  tray icon      : {icon or 'MISSING'}")
+        print(f"  tray icon file : {icon or 'MISSING'}")
+        # A stale bundle looks identical to a broken feature, so verify the
+        # stylesheet that actually shipped.
+        css_path = os.path.join(_web_dir(), "style.css")
+        missing = []
+        try:
+            css = Path(css_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"  css            : UNREADABLE ({exc})")
+            missing = list(CSS_MARKERS)
+        else:
+            missing = [m for m in CSS_MARKERS if m not in css]
+            print(f"  css            : {len(css)} bytes, "
+                  f"{'all markers present' if not missing else 'MISSING ' + ', '.join(missing)}")
+
         if icon and not os.path.exists(icon):
+            print("  tray icon file : MISSING")
+            return 1
+        if missing:
+            print("  ERROR: bundled stylesheet is stale -- rebuild with --clean")
             return 1
         return 0
 

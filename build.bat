@@ -63,13 +63,27 @@ if not errorlevel 1 (
 
 echo.
 echo Building executable...
-"%PYTHON%" -m PyInstaller --noconfirm LocalAvatarFavourites.spec
+REM --clean matters: PyInstaller reuses build\, and a stale bundle looks
+REM exactly like a broken feature because the UI silently loses behaviour.
+"%PYTHON%" -m PyInstaller --noconfirm --clean LocalAvatarFavourites.spec
 if errorlevel 1 goto :err
+
+echo.
+echo Smoke-testing the executable...
+"%PYTHON%" app\main.py --selftest
+if errorlevel 1 goto :stale
 
 echo.
 echo Done. Executable: dist\LocalAvatarFavourites.exe
 pause
 exit /b 0
+
+:stale
+echo.
+echo The executable failed its self-test. If it reports a stale stylesheet,
+echo delete the build\ directory and run this script again.
+pause
+exit /b 1
 
 :nopython
 echo.

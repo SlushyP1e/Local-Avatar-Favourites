@@ -14,7 +14,7 @@ let state = {
   username: "",
   pending_2fa: false,
   version: "",
-  motion: "system",
+  motion: "full",
   discovery: { sources: {}, backlog: 0, db_path: "" },
   osc: { listening: false, error: null, seen_traffic: false },
 };
@@ -1241,7 +1241,7 @@ function systemPrefersReducedMotion() {
 }
 
 function applyMotionPreference() {
-  const pref = state.motion || "system";
+  const pref = state.motion || "full";
   const root = document.documentElement;
   root.setAttribute("data-motion", pref);
   const suppressed = pref === "system" && systemPrefersReducedMotion();

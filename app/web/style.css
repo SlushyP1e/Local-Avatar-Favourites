@@ -98,7 +98,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.rail-btn:hover { background: var(--surface-2); color: var(--text); transform: scale(1.08); }
+.rail-btn:hover { background: var(--surface-2); color: var(--text); transform: scale(1.12); }
 .rail-btn:active { transform: scale(0.95); }
 .rail-btn.active { background: var(--accent-soft); color: var(--accent); }
 .rail-btn.active::before {
@@ -312,7 +312,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   cursor: pointer;
   transition: transform var(--t-med) var(--ease);
 }
-.card:hover { transform: translateY(-3px); }
+.card:hover { transform: translateY(-6px); }
 .card:active { transform: translateY(-1px) scale(0.995); }
 .poster {
   position: relative;
@@ -326,7 +326,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
     border-color var(--t-med) var(--ease), box-shadow var(--t-med) var(--ease);
 }
 .card:hover .poster {
-  transform: translateY(-4px);
+  transform: translateY(-6px);
   border-color: rgba(255, 255, 255, 0.24);
   box-shadow: 0 12px 26px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.1);
 }
@@ -338,7 +338,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   display: block;
   transition: transform 0.42s var(--ease-out), filter var(--t-slow) var(--ease);
 }
-.card:hover .poster img { transform: scale(1.055); }
+.card:hover .poster img { transform: scale(1.085); }
 .poster.ph { display: grid; place-items: center; }
 .poster.ph .ph-letter {
   font-size: 2.4rem;
@@ -390,7 +390,7 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
     background var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
 }
 /* Visibility for .fav-btn and .poster-actions is handled in the focus section. */
-.fav-btn:hover { background: rgba(0, 0, 0, 0.72); color: #fff; transform: scale(1.14); }
+.fav-btn:hover { background: rgba(0, 0, 0, 0.72); color: #fff; transform: scale(1.22); }
 .fav-btn:active { transform: scale(0.94); }
 .fav-btn.on { color: var(--accent); }
 
@@ -499,10 +499,10 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
 .log-row:hover {
   border-color: rgba(255, 255, 255, 0.24);
   background: var(--surface-2);
-  transform: translateX(3px);
+  transform: translateX(6px);
 }
 .log-row .log-thumb { transition: transform var(--t-slow) var(--ease-out); }
-.log-row:hover .log-thumb { transform: scale(1.08); }
+.log-row:hover .log-thumb { transform: scale(1.12); }
 .log-row.private { opacity: 0.6; }
 .log-thumb {
   width: 2.3rem;
@@ -630,47 +630,47 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   /* One easing curve everywhere, so motion feels like a single system. */
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --t-fast: 0.14s;
-  --t-med: 0.2s;
-  --t-slow: 0.28s;
+  --t-fast: 0.16s;
+  --t-med: 0.24s;
+  --t-slow: 0.34s;
 }
 
 /* View switching. The two panels are display:none toggles, which cannot
    transition, so the incoming one plays a keyed entrance instead. Direction
    follows the nav order: moving down the rail slides in from the right. */
 @keyframes view-in-next {
-  from { opacity: 0; transform: translate3d(28px, 0, 0); }
-  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+  from { opacity: 0; transform: translate3d(42px, 0, 0) scale(0.985); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
 }
 @keyframes view-in-prev {
-  from { opacity: 0; transform: translate3d(-28px, 0, 0); }
-  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+  from { opacity: 0; transform: translate3d(-42px, 0, 0) scale(0.985); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
 }
 .view-enter-next { animation: view-in-next var(--t-slow) var(--ease) both; }
 .view-enter-prev { animation: view-in-prev var(--t-slow) var(--ease) both; }
 
 /* Header chrome cross-fades so the title does not snap. */
 @keyframes chrome-in {
-  from { opacity: 0; transform: translate3d(0, -5px, 0); }
-  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+  from { opacity: 0; transform: translate3d(0, -7px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
 }
 .chrome-enter { animation: chrome-in var(--t-med) var(--ease) both; }
 
 /* Staggered list entrance. --i is the index, capped in JS so a long list does
    not crawl. */
 @keyframes item-in {
-  from { opacity: 0; transform: translate3d(0, 12px, 0) scale(0.985); }
+  from { opacity: 0; transform: translate3d(0, 18px, 0) scale(0.97); }
   to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
 }
 .stagger > * {
   animation: item-in var(--t-slow) var(--ease) both;
-  animation-delay: calc(var(--i, 0) * 14ms);
+  animation-delay: calc(var(--i, 0) * 18ms);
 }
 
 /* Bars that appear in response to state, rather than navigation. */
 @keyframes bar-in {
-  from { opacity: 0; transform: translate3d(0, -8px, 0); }
-  to   { opacity: 1; transform: translate3d(0, 0, 0); }
+  from { opacity: 0; transform: translate3d(0, -12px, 0); }
+  to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
 }
 .bar-enter { animation: bar-in var(--t-med) var(--ease) both; }
 

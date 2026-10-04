@@ -115,6 +115,24 @@ which is usually what you want while in a world.
 
 ---
 
+## Animations
+
+The avatar grid and the log scanner slide into each other, lists stagger in, and
+cards, buttons, chips and log rows respond on hover.
+
+Windows has one **"Show animations"** switch that WebView2 reports as
+`prefers-reduced-motion`, and it is just as often turned off to save performance
+as it is for accessibility. So motion is **on by default** rather than following
+that switch. **Settings → Appearance → Animations** offers:
+
+| Setting | Behaviour |
+| --- | --- |
+| Always animate | On regardless of Windows (default) |
+| Follow Windows | Respects the Windows animation setting |
+| Never animate | Off |
+
+---
+
 ## Optional: VRChat login (for names & thumbnails)
 
 Fetching an avatar's **name** and **thumbnail** uses the VRChat API, which requires being logged in.
@@ -138,6 +156,7 @@ Without login, everything still works — new favourites just show a placeholder
 - **Undo** — a few seconds to put a deleted avatar back, notes and all
 - **Progress and cancel** on long metadata refreshes
 - **Tray icon** — Open, Wear last avatar, Quit; closing the window can hide to the notification area
+- **Motion** — sliding transitions between the avatar grid and the log scanner, staggered list entrances, hover feedback
 - **Live tracking** — the avatar you're currently wearing is highlighted in the list
 - **Notes & tags** per avatar
 - **Search** across names, notes, tags, and IDs (works in both views)

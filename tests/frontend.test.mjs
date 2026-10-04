@@ -382,6 +382,21 @@ test("system-reduced motion is flagged only in system mode", () => {
     "an explicit override must not report suppression");
 });
 
+test("motion defaults to full so it works regardless of the OS toggle", () => {
+  // Windows uses one "Show animations" switch for accessibility and for plain
+  // performance tuning. Honouring it by default left the app looking broken.
+  const off = makeEnvironment({}, { systemReducesMotion: true });
+  const on = makeEnvironment({}, { systemReducesMotion: false });
+
+  for (const env of [off, on]) {
+    const app = loadApp(env);
+    assert.equal(app.state.motion, "full",
+      "the default must animate even when Windows suppresses motion");
+    // Default mode must never report suppression, so no nagging toast.
+    assert.equal(app.applyMotionPreference(), false);
+  }
+});
+
 test("the motion note explains the cause", () => {
   const env = makeEnvironment({}, { systemReducesMotion: true });
   const app = loadApp(env);

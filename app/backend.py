@@ -342,7 +342,7 @@ class Backend:
                 "revs": dict(self._revs),
 "discovery": self.discovery_state(),
                 "job": self._jobs.active(),
-                "motion": self.settings.get("motion", "system"),
+                "motion": self.settings.get("motion", storage.DEFAULT_MOTION),
                 "tray": bool(getattr(self, "_tray", None)),
                 "osc": {
                     "listening": self.osc.listening,
@@ -368,7 +368,7 @@ class Backend:
             "twofa_method": self._pending_2fa_method,
             "discovery": self.discovery_state(),
             "exit_on_close": bool(self.settings.get("exit_on_close", True)),
-            "motion": self.settings.get("motion", "system"),
+            "motion": self.settings.get("motion", storage.DEFAULT_MOTION),
             "tray": bool(getattr(self, "_tray", None)),
         }
 
@@ -1136,7 +1136,9 @@ class Backend:
         # that would otherwise silently suppress every transition.
         if motion is not None:
             mode = str(motion).strip().lower()
-            self.settings["motion"] = mode if mode in storage.MOTION_MODES else "system"
+            self.settings["motion"] = (
+                mode if mode in storage.MOTION_MODES else storage.DEFAULT_MOTION
+            )
 
         # Only the receive port is actually bound. If it has not changed there is
         # nothing to rebind -- and attempting one would fail against our own

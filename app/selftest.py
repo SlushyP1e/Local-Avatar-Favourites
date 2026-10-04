@@ -1479,23 +1479,25 @@ def test_motion_setting() -> None:
     """Animation preference must survive a round trip and reject junk."""
     b = _isolated_backend()
 
-    check("motion defaults to system", b.settings.get("motion") == "system",
+    check("motion defaults to full", b.settings.get("motion") == "full",
           str(b.settings.get("motion")))
-    check("motion reported in settings", b.get_settings()["motion"] == "system")
-    check("motion reported in state", b.get_state()["motion"] == "system")
+    check("default is documented", storage.DEFAULT_MOTION == "full")
+    check("motion reported in settings", b.get_settings()["motion"] == "full")
+    check("motion reported in state", b.get_state()["motion"] == "full")
 
-    for mode in ("full", "none", "system"):
+    for mode in ("system", "full", "none"):
         b.save_settings(9000, 9001, motion=mode)
         check(f"motion accepts {mode}", b.settings["motion"] == mode, str(b.settings["motion"]))
         check(f"motion {mode} persists",
               storage.load_settings()["motion"] == mode,
               str(storage.load_settings()["motion"]))
 
-    # Junk must not be stored verbatim; it would end up as an unknown attribute
-    # on <html> and silently disable the override.
+    # Junk must fall back to the default, not to a value that becomes an
+    # unrecognised attribute on <html> and silently disables the override.
     for junk in ("fullish", "", "reduced", None, 5, ["full"]):
         b.save_settings(9000, 9001, motion=junk)
-        check(f"motion rejects {junk!r}", b.settings["motion"] == "system",
+        check(f"motion rejects {junk!r}",
+              b.settings["motion"] == storage.DEFAULT_MOTION,
               str(b.settings["motion"]))
 
     # Casing and padding are accepted rather than treated as junk, so the two
