@@ -2,7 +2,21 @@
 
 A small standalone Windows tool for VRChat that keeps an **unlimited local list of favourite avatars** (with notes, tags, search, and thumbnails) and lets you **switch to them with one click** while in-game.
 
-![uses: OSC](https://img.shields.io/badge/uses-OSC-8a2be2) ![platform: Windows](https://img.shields.io/badge/platform-Windows-blue) ![built: Python](https://img.shields.io/badge/built-Python_3.11-green)
+![uses: OSC](https://img.shields.io/badge/uses-OSC-8a2be2) ![platform: Windows](https://img.shields.io/badge/platform-Windows-blue) ![built: Python](https://img.shields.io/badge/built-Python_3.11-green) ![license: MIT](https://img.shields.io/badge/license-MIT-green)
+
+![Local Avatar Favourites preview](docs/preview.gif)
+
+---
+
+## Screenshots
+
+| Favourites grid | Avatar details |
+| --- | --- |
+| ![Favourites grid](docs/screenshot-home.png) | ![Avatar details](docs/screenshot-drawer.png) |
+
+| Avatar logs | Settings |
+| --- | --- |
+| ![Avatar logs](docs/screenshot-logs.png) | ![Settings](docs/screenshot-settings.png) |
 
 ---
 
@@ -108,6 +122,8 @@ app/
   api.py        optional VRChat API login + metadata/thumbnails
   storage.py    favourites.json, settings.json, thumbnail cache
   selftest.py   headless tests
+  version.py    application version (single source of truth)
+docs/           README screenshots and preview GIF
 build.bat       PyInstaller build script
 requirements.txt
 ```
