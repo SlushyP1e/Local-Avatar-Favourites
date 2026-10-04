@@ -1,6 +1,7 @@
 @echo off
 REM Build a standalone Windows exe with PyInstaller.
 setlocal EnableExtensions
+cd /d "%~dp0"
 
 REM ---- locate Python (don't rely on PATH) ----
 set "PYTHON="
@@ -62,12 +63,7 @@ if not errorlevel 1 (
 
 echo.
 echo Building executable...
-"%PYTHON%" -m PyInstaller --noconfirm --onefile --windowed ^
-  --name "LocalAvatarFavourites" ^
-  --icon "assets\icon.ico" ^
-  --add-data "app\web;web" ^
-  --collect-all webview ^
-  app\main.py
+"%PYTHON%" -m PyInstaller --noconfirm LocalAvatarFavourites.spec
 if errorlevel 1 goto :err
 
 echo.

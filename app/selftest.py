@@ -18,7 +18,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import storage
 from osc import OSCBridge, AVATAR_CHANGE_ADDRESS
-
 RESULTS: list[str] = []
 
 
@@ -100,8 +99,56 @@ def test_api_helpers() -> None:
     check("cookie domain", cookie.domain == "api.vrchat.cloud")
 
 
+def test_storage_merge() -> None:
+    existing = [storage.new_entry("avtr_aaaa", "Existing")]
+    incoming = [
+        {"id": "AVTR_aaaa", "name": "Duplicate"},          # duplicate (case-insensitive)
+        {"id": "avtr_bbbb", "name": "New", "tags": ["x"], "favorite": True},
+        {"name": "No id"},                                  # skipped
+    ]
+    merged, added = storage.merge_favourites(existing, incoming)
+    check("merge skips duplicates", added == 1 and len(merged) == 2)
+    by_id = {e["id"]: e for e in merged}
+    check("merge imports fields", by_id["avtr_bbbb"]["name"] == "New"
+          and by_id["avtr_bbbb"]["favorite"] is True)
+    check("normalize id", storage.normalize_id("  AVTR_X  ") == "avtr_x")
+
+
+def test_vrclog_parse() -> None:
+    import vrclog
+
+    events: list[dict] = []
+    vrclog.VRCLogWatcher._parse_line(
+        "2024.01.02 03:04:05 Log        -  [Behaviour] Switching Bob to avatar Cool Avatar", events)
+    check("vrclog switch parse", len(events) == 1 and events[0]["type"] == "avatar-change"
+          and events[0]["player"] == "Bob" and events[0]["avatar"] == "Cool Avatar")
+
+    id_events: list[dict] = []
+    vrclog.VRCLogWatcher._parse_line(
+        "2024.01.02 03:04:05 Log - avtr_12345678-1234-1234-1234-123456789abc loaded", id_events)
+    check("vrclog id parse", len(id_events) == 1 and id_events[0]["type"] == "avatar-id"
+          and id_events[0]["id"].startswith("avtr_"))
+
+
+def test_update_compare() -> None:
+    from backend import Backend
+
+    check("version newer", Backend._is_newer("1.2.0", "1.1.0"))
+    check("version same", not Backend._is_newer("1.1.0", "1.1.0"))
+    check("version older", not Backend._is_newer("1.0.0", "1.1.0"))
+    check("version minor ordering", Backend._is_newer("1.10.0", "1.9.0"))
+
+
 def main() -> int:
-    tests = [test_storage, test_osc_receive, test_osc_send, test_api_helpers]
+    tests = [
+        test_storage,
+        test_storage_merge,
+        test_osc_receive,
+        test_osc_send,
+        test_api_helpers,
+        test_vrclog_parse,
+        test_update_compare,
+    ]
     failed = 0
     for test in tests:
         try:

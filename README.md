@@ -73,6 +73,8 @@ Without login, everything still works — new favourites just show a placeholder
 - **Sort** by name or newest
 - **Thumbnails** (with optional login)
 - **Copy avatar ID** to clipboard
+- **Export / import** your favourites as a JSON file (backup or share)
+- **Update check** against GitHub Releases
 
 ---
 
@@ -128,3 +130,9 @@ Edit the files in `app/web/` and re-run to see changes.
 ## Disclaimer
 
 This is an unofficial community tool. It is **not** created by or affiliated with VRChat. Use of VRChat's API should comply with VRChat's [Creator Guidelines](https://hello.vrchat.com/creator-guidelines) — keep request rates low and use the tool responsibly.
+
+---
+
+## License
+
+[MIT](LICENSE) — free to use, modify, and distribute.

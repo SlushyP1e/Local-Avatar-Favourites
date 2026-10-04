@@ -12,6 +12,7 @@ let state = {
   logged_in: false,
   username: "",
   pending_2fa: false,
+  version: "",
   osc: { listening: false, error: null, seen_traffic: false },
 };
 
@@ -20,6 +21,7 @@ let currentFilter = "all";    // all | favorites | public | quest | pc
 let logTab = "avatars";       // avatars | players
 let selectedId = null;
 let lastStatus = "";
+let lastRevs = null;
 let lastGridSig = null;
 let lastLogsSig = null;
 let lastChangesSig = null;
@@ -691,6 +693,7 @@ async function openSettings() {
     : (s.pending_2fa ? "2FA required - enter your code and click Log in." : "");
   $("set-login").disabled = !!s.logged_in;
   $("set-logout").disabled = !s.logged_in;
+  $("set-version").textContent = s.version ? "Local Avatar Favourites v" + s.version : "";
   openModal("modal-settings");
 }
 
@@ -768,11 +771,56 @@ async function saveSettings() {
   await refreshState();
 }
 
+/* ------------------------------------------------------------------ files & updates */
+async function exportFavourites() {
+  const res = await call("export_favourites");
+  if (!res || res.cancelled) return;
+  if (!res.ok) { if (res.title) showAlert(res.title, res.message); return; }
+  toast(`Exported ${res.count} avatar${res.count === 1 ? "" : "s"}.`);
+}
+
+async function importFavourites() {
+  const res = await call("import_favourites");
+  if (!res || res.cancelled) return;
+  if (!res.ok) { if (res.title) showAlert(res.title, res.message); return; }
+  toast(res.added
+    ? `Imported ${res.added} avatar${res.added === 1 ? "" : "s"}.`
+    : "No new avatars to import.");
+  await refreshState();
+}
+
+async function checkUpdates(quiet) {
+  const res = await call("check_updates");
+  if (!res || !res.ok) {
+    if (!quiet) toast("Could not check for updates.");
+    return;
+  }
+  if (res.update) {
+    const yes = await showConfirm(
+      "Update available",
+      `A newer version (v${res.latest}) is available. You're on v${res.current}. ` +
+      "Open the download page?");
+    if (yes) await call("open_url", res.url);
+  } else if (!quiet) {
+    toast("You're up to date (v" + res.current + ").");
+  }
+}
+
 /* ------------------------------------------------------------------ state loop */
 async function refreshState() {
-  const next = await call("get_state");
-  if (!next || !next.entries) return;
-  state = next;
+  const next = await call("get_state", lastRevs);
+  if (!next || !next.revs) return;
+  state.current_avatar_id = next.current_avatar_id;
+  state.status = next.status;
+  state.logged_in = next.logged_in;
+  state.username = next.username;
+  state.pending_2fa = next.pending_2fa;
+  state.osc = next.osc || state.osc;
+  state.version = next.version || state.version;
+  if (next.entries != null) state.entries = next.entries;
+  if (next.logs != null) state.logs = next.logs;
+  if (next.changes != null) state.changes = next.changes;
+  lastRevs = next.revs;
   if (selectedId && !entryById(selectedId)) selectedId = null;
   render();
 }
@@ -858,6 +906,9 @@ function wire() {
   $("set-method").addEventListener("change", updateTwoFactorLabel);
   $("set-save").addEventListener("click", saveSettings);
   $("set-open-folder").addEventListener("click", () => call("open_data_folder"));
+  $("set-export").addEventListener("click", exportFavourites);
+  $("set-import").addEventListener("click", importFavourites);
+  $("set-update").addEventListener("click", () => checkUpdates(false));
   $("set-refresh-all").addEventListener("click", async () => {
     const res = await call("refresh_all_metadata");
     if (!res.ok && res.title) showAlert(res.title, res.message);
@@ -890,4 +941,5 @@ function wire() {
 window.addEventListener("pywebviewready", () => {
   wire();
   startPolling();
+  setTimeout(() => checkUpdates(true), 3000);
 });

@@ -21,6 +21,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
@@ -28,14 +29,11 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pyinstaller
 
+      - name: Run self-test
+        run: python -m app.selftest
+
       - name: Build executable
-        run: >
-          python -m PyInstaller --noconfirm --onefile --windowed
-          --name "LocalAvatarFavourites"
-          --icon "assets/icon.ico"
-          --add-data "app/web;web"
-          --collect-all webview
-          app/main.py
+        run: python -m PyInstaller --noconfirm LocalAvatarFavourites.spec
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

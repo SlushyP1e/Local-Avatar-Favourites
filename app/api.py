@@ -14,8 +14,13 @@ import urllib.request
 from http.cookiejar import Cookie, CookieJar
 from urllib.request import HTTPCookieProcessor, build_opener
 
+try:
+    from version import __version__
+except Exception:  # pragma: no cover - defensive
+    __version__ = "0.0.0"
+
 API_BASE = "https://api.vrchat.cloud/api/1"
-USER_AGENT = "LocalAvatarFavourites/1.0.0 (local favourites tool)"
+USER_AGENT = f"LocalAvatarFavourites/{__version__} (local favourites tool)"
 
 
 class ApiError(Exception):
