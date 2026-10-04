@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Local Avatar Favourites</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ---------------------------------------------------- left nav rail -->
+    <nav class="rail">
+      <div class="rail-logo" title="Local Avatar Favourites">◈</div>
+
+      <button class="rail-btn active" data-view="home" title="Avatars" aria-label="Avatars">
+        <svg viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>
+      </button>
+      <button class="rail-btn" data-view="logs" title="Avatar Logs" aria-label="Avatar Logs">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.4 2.7 2.4 15.3 0 18"/><path d="M12 3c-2.4 2.7-2.4 15.3 0 18"/></svg>
+      </button>
+
+      <div class="rail-spacer"></div>
+
+      <button class="rail-btn" id="rail-settings" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+    </nav>
+
+    <!-- ---------------------------------------------------- main -->
+    <main class="main">
+      <header class="page-header">
+        <div class="header-top">
+          <h1 id="page-title">Avatars</h1>
+          <div class="header-tools">
+            <div class="search">
+              <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+              <input id="search" type="text" placeholder="Search avatars..." autocomplete="off" />
+            </div>
+            <select id="sort" class="select">
+              <option value="newest">Newest</option>
+              <option value="name">Name</option>
+            </select>
+            <button id="btn-add-current" class="btn primary">
+              <span class="ico">+</span> Add Current
+            </button>
+            <button id="btn-add-id" class="btn"><span class="ico">+</span> Add by ID</button>
+          </div>
+        </div>
+        <div class="chips" id="chips">
+          <button class="chip active" data-filter="all">All</button>
+          <button class="chip" data-filter="favorites">Favorites</button>
+          <button class="chip" data-filter="public">Public</button>
+          <button class="chip" data-filter="quest">Quest Compatible</button>
+          <button class="chip" data-filter="pc">PC</button>
+        </div>
+      </header>
+
+      <div class="grid-wrap" id="grid-wrap">
+        <div class="grid" id="grid"></div>
+        <div id="grid-empty" class="empty hidden">
+          <div class="empty-ico">◈</div>
+          <p class="empty-title">Nothing here yet</p>
+          <p class="muted">Use <b>Add Current</b> to save the avatar you're wearing, or
+            <b>Add by ID</b> to paste an <code>avtr_...</code> ID.</p>
+        </div>
+      </div>
+
+      <div class="grid-wrap hidden" id="logs-wrap">
+        <div class="logs-toolbar">
+          <div class="logs-tabs">
+            <button class="log-tab active" data-logtab="avatars">Avatars</button>
+            <button class="log-tab" data-logtab="players">Player changes</button>
+          </div>
+          <span id="logs-count" class="muted"></span>
+          <span class="spacer"></span>
+          <button id="logs-save-all" class="btn small primary hidden">Save all</button>
+          <button id="logs-clear" class="btn small">Clear logs</button>
+        </div>
+        <div class="logs" id="logs"></div>
+        <div id="logs-empty" class="empty hidden">
+          <div class="empty-ico">◈</div>
+          <p class="empty-title">No avatars logged yet</p>
+          <p class="muted">Avatar IDs that appear in VRChat's log (avatar changes, cache
+            loads, lookups) show up here. Save one to add it to your favourites and
+            clone it later.</p>
+        </div>
+        <div class="logs hidden" id="changes"></div>
+        <div id="changes-empty" class="empty hidden">
+          <div class="empty-ico">◈</div>
+          <p class="empty-title">No player changes yet</p>
+          <p class="muted">When VRChat reports "Switching &lt;player&gt; to avatar &lt;name&gt;"
+            it's recorded here. VRChat only logs the avatar <b>name</b> for other players,
+            not its ID.</p>
+        </div>
+      </div>
+
+      <footer class="statusbar">
+        <span id="osc-pill" class="pill">
+          <span class="dot" id="osc-dot"></span>
+          <span id="osc-text">OSC: starting...</span>
+        </span>
+        <span id="current" class="muted"></span>
+        <span class="spacer"></span>
+        <span id="count" class="muted"></span>
+        <span id="toast" class="toast"></span>
+        <span id="login-state" class="muted"></span>
+      </footer>
+    </main>
+  </div>
+
+  <!-- ---------------------------------------------------- detail drawer -->
+  <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+  <aside id="drawer" class="drawer hidden">
+    <button id="drawer-close" class="drawer-close" aria-label="Close">×</button>
+    <div class="drawer-poster">
+      <img id="preview" alt="" />
+      <span id="wearing-badge" class="badge wearing-badge hidden">● Wearing</span>
+    </div>
+    <div class="drawer-head">
+      <input id="d-name" class="name-input" type="text" placeholder="Avatar name" />
+      <div id="d-author" class="drawer-author"></div>
+      <div id="d-platforms" class="badge-row"></div>
+    </div>
+
+    <div class="id-row">
+      <div class="id-text">
+        <span class="field-label">Avatar ID</span>
+        <code id="d-id"></code>
+      </div>
+      <button id="btn-copy" class="btn small">Copy</button>
+    </div>
+    <div id="d-added" class="muted small"></div>
+
+    <label class="field-label" for="d-notes">Notes</label>
+    <textarea id="d-notes" class="text-input notes" placeholder="Why you like it, where you found it..."></textarea>
+
+    <label class="field-label" for="d-tags">Tags <span class="muted">(comma separated)</span></label>
+    <input id="d-tags" class="text-input" type="text" placeholder="cute, dark, robot" />
+
+    <div class="drawer-actions">
+      <button id="btn-wear" class="btn primary grow">Wear Avatar</button>
+      <button id="btn-fav" class="btn" title="Toggle favorite">♥ Favorite</button>
+      <button id="btn-refresh" class="btn">Refresh</button>
+      <button id="btn-delete" class="btn danger">Delete</button>
+    </div>
+  </aside>
+
+  <!-- ---------------------------------------------------- add by ID -->
+  <div id="modal-id" class="modal hidden">
+    <div class="modal-card">
+      <h2>Add by ID</h2>
+      <p class="muted">Paste an avatar ID (starts with <code>avtr_</code>).</p>
+      <input id="id-input" class="text-input" type="text" placeholder="avtr_xxxxxxxx-xxxx-..." />
+      <div class="modal-actions">
+        <button class="btn ghost" data-close>Cancel</button>
+        <button id="id-submit" class="btn primary">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------------------------------------------------- confirm -->
+  <div id="modal-confirm" class="modal hidden">
+    <div class="modal-card">
+      <h2 id="confirm-title">Confirm</h2>
+      <p id="confirm-message" class="muted"></p>
+      <div class="modal-actions">
+        <button class="btn ghost" data-close>Cancel</button>
+        <button id="confirm-ok" class="btn primary">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------------------------------------------------- alert -->
+  <div id="modal-alert" class="modal hidden">
+    <div class="modal-card">
+      <h2 id="alert-title">Notice</h2>
+      <p id="alert-message" class="muted"></p>
+      <div class="modal-actions">
+        <button class="btn primary" data-close>OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ---------------------------------------------------- settings -->
+  <div id="modal-settings" class="modal hidden">
+    <div class="modal-card wide">
+      <h2>Settings</h2>
+
+      <h3 class="section-title">OSC connection</h3>
+      <div class="form-grid">
+        <label class="field-label" for="set-send">Send to VRChat (port)</label>
+        <input id="set-send" class="text-input" type="number" min="1" max="65535" />
+        <label class="field-label" for="set-recv">Receive from VRChat (port)</label>
+        <input id="set-recv" class="text-input" type="number" min="1" max="65535" />
+      </div>
+
+      <h3 class="section-title">VRChat login <span class="muted normal">(for names &amp; thumbnails)</span></h3>
+      <p class="muted small">Optional. Used only to fetch avatar names and thumbnails from the
+        VRChat API. Stored locally, never uploaded.</p>
+      <div class="form-grid">
+        <label class="field-label" for="set-user">Username or email</label>
+        <input id="set-user" class="text-input" type="text" autocomplete="off" />
+        <label class="field-label" for="set-pass">Password</label>
+        <input id="set-pass" class="text-input" type="password" autocomplete="off" />
+        <label class="field-label" for="set-totp" id="set-totp-label">2FA code</label>
+        <div class="totp-field">
+          <input id="set-totp" class="text-input" type="text" inputmode="numeric" placeholder="only if enabled" />
+          <select id="set-method" class="select hidden" title="2FA method"></select>
+        </div>
+      </div>
+      <div class="login-row">
+        <button id="set-login" class="btn primary">Log in</button>
+        <button id="set-logout" class="btn ghost">Log out</button>
+        <span id="set-login-status" class="muted small"></span>
+      </div>
+
+      <hr class="sep" />
+      <div class="settings-footer">
+        <button id="set-open-folder" class="btn ghost">Open data folder</button>
+        <button id="set-refresh-all" class="btn">Refresh all metadata</button>
+        <span class="spacer"></span>
+        <button id="set-save" class="btn primary">Save &amp; Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="context-menu" class="context-menu hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
