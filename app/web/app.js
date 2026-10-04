@@ -30,6 +30,14 @@ let lastChangesSig = null;
 let suppressSave = false;
 let saveTimer = null;
 
+// Multi-select. Ctrl+click toggles one, Shift+click takes a range, and a plain
+// click keeps the old single-select drawer behaviour.
+let selection = new Set();
+let lastClickedId = null;
+// Entries removed by the last delete, kept so it can be undone.
+let undoBuffer = [];
+let activeJob = null;
+
 const thumbCache = {};    // id -> data URI
 const thumbKey = {};      // id -> thumb filename currently cached
 const thumbPending = {};  // id -> true
@@ -71,6 +79,98 @@ function relTime(iso) {
 
 function entryById(id) {
   return state.entries.find((e) => e.id === id) || null;
+}
+
+/* ------------------------------------------------------------- selection */
+function clearSelection() {
+  selection.clear();
+  lastClickedId = null;
+  renderSelection();
+}
+
+function toggleSelect(id, additive) {
+  if (!additive) {
+    const only = selection.size === 1 && selection.has(id);
+    selection.clear();
+    if (!only) selection.add(id);
+  } else if (selection.has(id)) {
+    selection.delete(id);
+  } else {
+    selection.add(id);
+  }
+  lastClickedId = id;
+  renderSelection();
+}
+
+function selectRange(toId) {
+  const list = visibleEntries().map((e) => e.id);
+  const from = list.indexOf(lastClickedId);
+  const to = list.indexOf(toId);
+  if (from === -1 || to === -1) {
+    toggleSelect(toId, true);
+    return;
+  }
+  const [lo, hi] = from < to ? [from, to] : [to, from];
+  for (let i = lo; i <= hi; i++) selection.add(list[i]);
+  renderSelection();
+}
+
+function renderSelection() {
+  const bar = $("bulk-bar");
+  if (!bar) return;
+  const n = selection.size;
+  bar.classList.toggle("hidden", n === 0);
+  $("bulk-count").textContent = n === 1 ? "1 selected" : `${n} selected`;
+  document.querySelectorAll(".card").forEach((card) => {
+    card.classList.toggle("checked", selection.has(card.dataset.id));
+  });
+}
+
+async function runBulk(action, value) {
+  const ids = [...selection];
+  if (!ids.length) return;
+  if (action === "delete") {
+    const yes = await showConfirm(
+      "Delete",
+      `Remove ${ids.length} avatar${ids.length === 1 ? "" : "s"} from your favourites? ` +
+      "You can undo this for a few seconds afterwards.");
+    if (!yes) return;
+  }
+  const res = await call("bulk_action", ids, action, value || "");
+  if (!res || !res.ok) {
+    if (res && res.title) showAlert(res.title, res.message);
+    else if (res && res.message) toast(res.message);
+    return;
+  }
+  clearSelection();
+  await refreshState();
+}
+
+/* ----------------------------------------------------------------- undo */
+function offerUndo(entries, label) {
+  const bar = $("undo-bar");
+  if (!bar || !entries.length) return;
+  undoBuffer = entries;
+  $("undo-label").textContent = label;
+  bar.classList.remove("hidden");
+  clearTimeout(offerUndo._t);
+  offerUndo._t = setTimeout(() => {
+    bar.classList.add("hidden");
+    undoBuffer = [];
+  }, 8000);
+}
+
+async function doUndo() {
+  const entries = undoBuffer;
+  undoBuffer = [];
+  $("undo-bar").classList.add("hidden");
+  let restored = 0;
+  for (const entry of entries) {
+    const res = await call("restore_entry", entry);
+    if (res && res.ok) restored++;
+  }
+  toast(restored === 1 ? "Restored 1 avatar." : `Restored ${restored} avatars.`);
+  await refreshState();
 }
 
 function matchesFilter(entry) {
@@ -357,11 +457,20 @@ function renderGrid(force) {
         ${badgesHtml}
       </div>`;
 
-    card.addEventListener("click", () => openDrawer(entry.id));
+    card.addEventListener("click", (e) => {
+      // Ctrl/Cmd toggles selection, Shift extends a range, plain click opens
+      // the drawer as before.
+      if (e.ctrlKey || e.metaKey) { toggleSelect(entry.id, false); return; }
+      if (e.shiftKey) { selectRange(entry.id); return; }
+      openDrawer(entry.id);
+    });
     card.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
         openDrawer(entry.id);
+      } else if (e.key.toLowerCase() === "x" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        toggleSelect(entry.id, false);
       }
     });
     card.addEventListener("contextmenu", (e) => {
@@ -619,6 +728,37 @@ function renderDiscovery() {
   el.title = (state.discovery && state.discovery.db_path) || "";
 }
 
+/* ---------------------------------------------------------------- job bar */
+function renderJob(job) {
+  const bar = $("job-bar");
+  if (!bar) return;
+  activeJob = job || null;
+  if (!job) {
+    bar.classList.add("hidden");
+    return;
+  }
+  bar.classList.remove("hidden");
+  const known = job.total > 0;
+  bar.classList.toggle("indeterminate", !known);
+
+  const label = job.cancelled
+    ? (job.finished ? "Cancelled" : "Cancelling...")
+    : (job.finished ? "Finished" : "Working...");
+  $("job-label").textContent = label;
+
+  const bits = [];
+  if (known) bits.push(`${job.done} of ${job.total}`);
+  if (job.failed) bits.push(`${job.failed} failed`);
+  if (job.elapsed != null) bits.push(`${Math.round(job.elapsed)}s`);
+  $("job-detail").textContent = job.message
+    ? `${job.message}${bits.length ? "  ·  " + bits.join(" · ") : ""}`
+    : bits.join(" · ");
+
+  $("job-fill").style.width = (job.percent || 0) + "%";
+  $("job-cancel").classList.toggle("hidden", !!job.finished);
+  $("job-cancel").disabled = !!job.cancelled;
+}
+
 function renderStatus() {
   const osc = state.osc;
   const dot = $("osc-dot");
@@ -666,6 +806,7 @@ function render() {
   renderLogs();
   renderDrawer();
   renderStatus();
+  renderSelection();
 }
 
 /* ------------------------------------------------------------------ drawer */
@@ -763,9 +904,13 @@ async function refreshMetaFor(id) {
 async function deleteEntry(id, name) {
   const yes = await showConfirm("Delete", `Remove "${name}" from your favourites?`);
   if (!yes) return;
-  await call("delete", id);
+  const entry = entryById(id);
+  const res = await call("delete", id);
   if (selectedId === id) closeDrawer();
+  selection.delete(id);
   await refreshState();
+  // Keep the entry so it can be put back, notes and all.
+  if (entry && (!res || res.ok)) offerUndo([entry], `Removed "${name}".`);
 }
 
 async function saveFromLog(id) {
@@ -783,11 +928,7 @@ async function forgetLog(id) {
 async function del() {
   const entry = entryById(selectedId);
   if (!entry) return;
-  const yes = await showConfirm("Delete", `Remove "${entry.name}" from your favourites?`);
-  if (!yes) return;
-  await call("delete", selectedId);
-  closeDrawer();
-  await refreshState();
+  await deleteEntry(selectedId, entry.name);
 }
 
 async function copyId() {
@@ -844,6 +985,11 @@ async function openSettings() {
   const s = await call("get_settings");
   $("set-send").value = s.osc_send_port;
   $("set-recv").value = s.osc_receive_port;
+  $("set-exit-on-close").checked = s.exit_on_close !== false;
+  $("set-tray-note").textContent = s.tray
+    ? "With this off, closing the window keeps the app in the notification area. " +
+      "Right-click the tray icon for Open, Wear last avatar and Quit."
+    : "The notification-area icon is unavailable, so closing the window always exits.";
   $("set-user").value = s.username || "";
   $("set-pass").value = "";
   $("set-totp").value = "";
@@ -925,7 +1071,8 @@ async function doLogout() {
 }
 
 async function saveSettings() {
-  const res = await call("save_settings", $("set-send").value, $("set-recv").value);
+  const res = await call("save_settings", $("set-send").value, $("set-recv").value,
+                         $("set-exit-on-close").checked);
   if (!res.ok) { showAlert("Invalid settings", res.message || "Could not save settings."); return; }
   closeModal("modal-settings");
   toast("Settings saved.");
@@ -993,6 +1140,7 @@ async function refreshState() {
   state.osc = next.osc || state.osc;
   state.discovery = next.discovery || state.discovery;
   state.version = next.version || state.version;
+  renderJob(next.job);
   if (next.entries != null) state.entries = next.entries;
   if (next.logs != null) state.logs = next.logs;
   if (next.changes != null) state.changes = next.changes;
@@ -1015,6 +1163,26 @@ function setView(view) {
 }
 
 function wire() {
+  $("bulk-clear").addEventListener("click", clearSelection);
+  $("bulk-fav").addEventListener("click", () => runBulk("favorite"));
+  $("bulk-wear").addEventListener("click", () => runBulk("wear"));
+  $("bulk-refresh").addEventListener("click", () => runBulk("refresh"));
+  $("bulk-delete").addEventListener("click", () => runBulk("delete"));
+  $("bulk-tag").addEventListener("click", async () => {
+    const value = prompt("Tag to add to the selected avatars:");
+    if (value && value.trim()) await runBulk("tag", value.trim());
+  });
+  $("bulk-untag").addEventListener("click", async () => {
+    const value = prompt("Tag to remove from the selected avatars:");
+    if (value && value.trim()) await runBulk("untag", value.trim());
+  });
+  $("undo-btn").addEventListener("click", doUndo);
+  $("job-cancel").addEventListener("click", async () => {
+    if (!activeJob || !activeJob.id) return;
+    const res = await call("cancel_job", activeJob.id);
+    toast(res && res.ok ? "Cancelling..." : "That job already finished.");
+  });
+
   $("btn-add-current").addEventListener("click", addCurrent);
   $("btn-add-id").addEventListener("click", addByIdPrompt);
   $("rail-settings").addEventListener("click", openSettings);

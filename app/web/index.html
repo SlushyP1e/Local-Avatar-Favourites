@@ -55,7 +55,28 @@
         </div>
       </header>
 
+      <!-- ---------------------------------------------------- job progress -->
+      <div id="job-bar" class="job-bar hidden" role="status" aria-live="polite">
+        <div class="job-info">
+          <span id="job-label">Working...</span>
+          <span id="job-detail" class="muted small"></span>
+        </div>
+        <div class="job-track"><div id="job-fill" class="job-fill"></div></div>
+        <button id="job-cancel" class="btn small ghost">Cancel</button>
+      </div>
+
       <div class="grid-wrap" id="grid-wrap">
+        <div id="bulk-bar" class="bulk-bar hidden">
+          <span id="bulk-count" class="muted small">0 selected</span>
+          <button id="bulk-wear" class="btn small primary">Wear</button>
+          <button id="bulk-fav" class="btn small">Favorite</button>
+          <button id="bulk-tag" class="btn small">Tag</button>
+          <button id="bulk-untag" class="btn small">Remove tag</button>
+          <button id="bulk-refresh" class="btn small">Refresh</button>
+          <button id="bulk-delete" class="btn small danger">Delete</button>
+          <span class="spacer"></span>
+          <button id="bulk-clear" class="btn small ghost">Clear</button>
+        </div>
         <div class="grid" id="grid"></div>
         <div id="grid-empty" class="empty hidden">
           <div class="empty-ico">◈</div>
@@ -219,6 +240,16 @@
         <span id="set-login-status" class="muted small"></span>
       </div>
 
+      <h3 class="section-title">Running in VRChat</h3>
+      <div class="form-grid">
+        <label class="field-label" for="set-exit-on-close">Closing the window</label>
+        <label class="check-label">
+          <input id="set-exit-on-close" type="checkbox" />
+          <span>Exit completely</span>
+        </label>
+      </div>
+      <p id="set-tray-note" class="muted small"></p>
+
       <hr class="sep" />
       <div class="settings-footer">
         <button id="set-open-folder" class="btn ghost">Open data folder</button>
@@ -232,6 +263,11 @@
         <button id="set-save" class="btn primary">Save &amp; Close</button>
       </div>
       <p class="muted small">
+        Select avatars with <b>Ctrl</b>+click (or <kbd>Shift</kbd>+click for a range) to
+        favourite, tag, refresh or delete several at once. Undo is available for a few
+        seconds after a delete.
+      </p>
+      <p class="muted small">
         <b>Import VRChat Favourites</b> is just a shortcut for copying avatars you already
         have in VRChat across, with their names and thumbnails. Any avatar ID works just as
         well with <b>Add by ID</b>.
@@ -240,7 +276,12 @@
     </div>
   </div>
 
-  <div id="context-menu" class="context-menu hidden"></div>
+  <div id="undo-bar" class="undo-bar hidden" role="status">
+      <span id="undo-label" class="muted small"></span>
+      <button id="undo-btn" class="btn small">Undo</button>
+    </div>
+
+    <div id="context-menu" class="context-menu hidden"></div>
 
   <script src="app.js"></script>
 </body>

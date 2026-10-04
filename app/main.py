@@ -19,9 +19,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import webview
 
 from backend import Backend
+from tray import TrayIcon
+from tray import available as tray_available
 from version import __version__
 
 APP_TITLE = "Local Avatar Favourites"
+TRAY_IDLE = 0.0
 
 
 def _web_dir() -> str:
@@ -30,6 +33,99 @@ def _web_dir() -> str:
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, "web")
+
+
+def _icon_path() -> str | None:
+    """Locate icon.ico next to the bundled data, for the tray icon."""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(base, "assets", "icon.ico")
+    else:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(root, "assets", "icon.ico")
+    return candidate if os.path.exists(candidate) else None
+
+
+class _Shell:
+    """Glue between the webview window and the tray icon."""
+
+    def __init__(self, backend: Backend) -> None:
+        self.backend = backend
+        self.window = None
+        self.tray: TrayIcon | None = None
+        self.quitting = False
+
+    def attach(self, window) -> None:
+        self.window = window
+        self.backend.attach_window(window)
+
+    def start_tray(self) -> bool:
+        if not tray_available():
+            return False
+        self.tray = TrayIcon(APP_TITLE, icon_path=_icon_path())
+        self.tray.on_command = self._on_tray  # type: ignore[assignment]
+        try:
+            return self.tray.start()
+        except Exception:
+            self.tray = None
+            return False
+
+    def _on_tray(self, command: int) -> None:
+        if command == TrayIcon.OPEN:
+            self.show()
+        elif command == TrayIcon.WEAR_LAST:
+            self._wear_last()
+        elif command == TrayIcon.QUIT:
+            self.quit()
+
+    def _wear_last(self) -> None:
+        try:
+            self.backend.wear_last()
+        except Exception:
+            pass
+
+    def show(self) -> None:
+        if self.window is None:
+            return
+        try:
+            self.window.restore()
+        except Exception:
+            pass
+        try:
+            self.window.show()
+        except Exception:
+            pass
+
+    def quit(self) -> None:
+        self.quitting = True
+        if self.tray is not None:
+            self.tray.stop()
+        try:
+            if self.window is not None:
+                self.window.destroy()
+        except Exception:
+            pass
+
+    def on_closing(self) -> bool:
+        """Hide to the tray unless the user asked to exit.
+
+        Returning True tells pywebview to cancel the close.
+        """
+        if self.quitting or self.tray is None or not self.tray._added:
+            return False
+        if self.backend.settings.get("exit_on_close", True):
+            return False
+        try:
+            if self.window is not None:
+                self.window.hide()
+        except Exception:
+            return False
+        self.tray.notify(
+            APP_TITLE,
+            "Still running in the notification area. "
+            "Right-click the icon for Open, Wear last avatar and Quit.",
+        )
+        return True
 
 
 def main() -> int:
@@ -45,9 +141,12 @@ def main() -> int:
         print(f"Local Avatar Favourites {__version__}{frozen}")
         print(f"  entries loaded : {len(backend.entries)}")
         print(f"  discovery      : {backend.discovery_state()['sources']}")
+        print(f"  tray available : {tray_available()}")
         return 0
 
     backend = Backend()
+    shell = _Shell(backend)
+
     index = os.path.join(_web_dir(), "index.html")
     window = webview.create_window(
         APP_TITLE,
@@ -57,9 +156,25 @@ def main() -> int:
         height=720,
         min_size=(760, 560),
         background_color="#0b0c10",
+        on_top=False,
     )
-    backend.attach_window(window)
-    webview.start()
+    shell.attach(window)
+
+    def on_loaded() -> None:
+        # Start the tray only once the window exists, so Open has something to
+        # restore, and the icon never outlives a failed launch.
+        shell.start_tray()
+        backend.set_tray(shell.tray)
+
+    window.events.loaded += on_loaded  # type: ignore[union-attr]
+    window.events.closing += shell.on_closing  # type: ignore[union-attr]
+
+    try:
+        webview.start()
+    finally:
+        backend.stop()
+        if shell.tray is not None:
+            shell.tray.stop()
     return 0
 
 

@@ -104,6 +104,17 @@ tool has recorded.
 
 ---
 
+## Running alongside VRChat
+
+A tray icon keeps the app reachable without a taskbar slot. Right-click it for
+**Open**, **Wear last avatar** and **Quit**.
+
+By default closing the window exits the app. Turn that off under **Settings →
+Running in VRChat** and closing will hide it to the notification area instead,
+which is usually what you want while in a world.
+
+---
+
 ## Optional: VRChat login (for names & thumbnails)
 
 Fetching an avatar's **name** and **thumbnail** uses the VRChat API, which requires being logged in.
@@ -123,6 +134,10 @@ Without login, everything still works — new favourites just show a placeholder
 - **Add Current** — one-click save of the avatar you're wearing
 - **Add by ID** — paste any `avtr_...` ID
 - **Wear / switch** via OSC, with a clear message if VRChat refuses one
+- **Multi-select** — Ctrl+click, Shift+click for a range, then favourite, tag, refresh or delete in bulk
+- **Undo** — a few seconds to put a deleted avatar back, notes and all
+- **Progress and cancel** on long metadata refreshes
+- **Tray icon** — Open, Wear last avatar, Quit; closing the window can hide to the notification area
 - **Live tracking** — the avatar you're currently wearing is highlighted in the list
 - **Notes & tags** per avatar
 - **Search** across names, notes, tags, and IDs (works in both views)
@@ -180,6 +195,8 @@ app/
   osc.py        OSC sender + receiver (python-osc)
   api.py        optional VRChat API login + metadata/thumbnails
   storage.py    favourites.json, settings.json, thumbnail cache
+  jobs.py       progress and cancellation for long bulk operations
+  tray.py       Windows notification-area icon
   vrcache.py    layered local avatar-ID discovery (read-only)
   vrclog.py     VRChat text-log tailer
   versions.py   semantic version comparison for the update check

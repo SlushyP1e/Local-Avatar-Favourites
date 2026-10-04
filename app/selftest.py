@@ -12,6 +12,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1018,6 +1019,266 @@ def test_delete_removes_thumbnail() -> None:
           not (storage.THUMBS_DIR / "orphan-me.png").exists())
 
 
+def test_job_progress() -> None:
+    """Long bulk work must be visible and cancellable."""
+    from jobs import JobRegistry, JobRunner
+
+    registry = JobRegistry()
+    runner = JobRunner(registry)
+
+    release = threading.Event()
+    processed: list[str] = []
+
+    def worker(avatar_id):
+        processed.append(avatar_id)
+        release.wait(timeout=2.0)
+        return True
+
+    ids = _fake_ids(4)
+    job_id = runner.start("metadata", ids, worker)
+    check("job id returned", bool(job_id), job_id)
+
+    job = registry.get(job_id)
+    check("job is visible", job is not None)
+    check("job knows its total", job["total"] == 4, str(job))
+    check("job exposes its id", job["id"] == job_id)
+    check("job starts unfinished", job["finished"] is False)
+
+    # Progress appears as work completes.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job = registry.get(job_id)
+        if job and job["done"] >= 1:
+            break
+        time.sleep(0.02)
+    check("progress advances", job["done"] >= 1, str(job))
+    check("percent is derived from done", job["percent"] > 0, str(job))
+
+    check("cancel is accepted", registry.cancel(job_id) is True)
+    check("cancel marks the job", registry.get(job_id)["cancelled"] is True)
+    check("cancelling twice is refused", registry.cancel(job_id) is True)
+
+    release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job = registry.get(job_id)
+        if job and job["finished"]:
+            break
+        time.sleep(0.02)
+    job = registry.get(job_id)
+    check("job finishes", job["finished"] is True, str(job))
+    check("cancel is reported in the summary", "cancel" in job["message"].lower(), job["message"])
+    check("cancelling a finished job is refused", registry.cancel(job_id) is False)
+    check("no active job once finished", registry.active() is None)
+
+
+def test_job_counts_failures() -> None:
+    from jobs import JobRegistry, JobRunner
+
+    registry = JobRegistry()
+    runner = JobRunner(registry)
+
+    def worker(avatar_id):
+        if avatar_id.endswith(("1", "3")):
+            return False
+        if avatar_id.endswith("2"):
+            raise RuntimeError("boom")
+        return True
+
+    job_id = runner.start("metadata", _fake_ids(4), worker)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        job = registry.get(job_id)
+        if job and job["finished"]:
+            break
+        time.sleep(0.02)
+
+    job = registry.get(job_id)
+    check("all work attempted", job["done"] == 4, str(job))
+    check("successes counted", job["ok"] == 1, str(job))
+    check("failures counted", job["failed"] == 3, str(job))
+    check("summary mentions failures", "failed" in job["message"], job["message"])
+    check("finished job reaches 100%", job["percent"] == 100.0, str(job))
+
+
+def test_bulk_actions() -> None:
+    b = _isolated_backend()
+    ids = [f"avtr_{i:08x}-aaaa-bbbb-cccc-dddddddddddd" for i in range(4)]
+    for avatar_id in ids:
+        b.add_by_id(avatar_id)
+    b._entry(ids[0])["tags"] = ["keep"]
+
+    res = b.bulk_action(ids, "favorite")
+    check("bulk favorite ok", res["ok"] and res["changed"] == 4, str(res))
+    check("all favorited", all(b._entry(i)["favorite"] for i in ids))
+
+    res = b.bulk_action(ids, "unfavorite")
+    check("bulk unfavorite ok", res["changed"] == 4, str(res))
+    check("none favorited", not any(b._entry(i)["favorite"] for i in ids))
+
+    res = b.bulk_action(ids, "tag", "quest")
+    check("bulk tag ok", res["changed"] == 4, str(res))
+    check("tag applied", all("quest" in b._entry(i)["tags"] for i in ids))
+    check("existing tags kept", "keep" in b._entry(ids[0])["tags"])
+
+    res = b.bulk_action(ids, "untag", "quest")
+    check("bulk untag ok", res["changed"] == 4, str(res))
+    check("tag removed", not any("quest" in b._entry(i)["tags"] for i in ids))
+    check("other tags survive", b._entry(ids[0])["tags"] == ["keep"])
+
+    check("tag requires a value", b.bulk_action(ids, "tag", "")["ok"] is False)
+    check("unknown action rejected", b.bulk_action(ids, "frobnicate")["ok"] is False)
+    check("empty selection rejected", b.bulk_action([], "favorite")["ok"] is False)
+    check("unknown ids rejected",
+          b.bulk_action(["avtr_00000000-0000-0000-0000-000000000000"], "favorite")["ok"] is False)
+
+    res = b.bulk_action(ids, "delete")
+    check("bulk delete ok", res["changed"] == 4, str(res))
+    check("entries removed", len(b.entries) == 0)
+    check("index cleared", len(b._index) == 0)
+
+
+def test_restore_entry_for_undo() -> None:
+    b = _isolated_backend()
+    avatar_id = "avtr_12341234-1234-1234-1234-123412341234"
+    b.add_by_id(avatar_id)
+    entry = b._entry(avatar_id)
+    entry["name"] = "Keeper"
+    entry["notes"] = "important note"
+    entry["tags"] = ["a", "b"]
+    entry["platforms"] = ["Quest"]
+    entry["favorite"] = True
+
+    b.delete(avatar_id)
+    check("entry deleted", b._entry(avatar_id) is None)
+
+    res = b.restore_entry(entry)
+    check("restore ok", res["ok"] is True, str(res))
+    back = b._entry(avatar_id)
+    check("entry is back", back is not None)
+    check("name restored", back["name"] == "Keeper")
+    check("notes restored", back["notes"] == "important note")
+    check("tags restored", back["tags"] == ["a", "b"])
+    check("platforms restored", back["platforms"] == ["Quest"])
+    check("favorite restored", back["favorite"] is True)
+    check("index rebuilt", len(b._index) == 1)
+
+    check("restoring twice is refused", b.restore_entry(entry)["ok"] is False)
+    check("restoring junk is refused", b.restore_entry({"nope": 1})["ok"] is False)
+    check("restoring a non-dict is refused", b.restore_entry("nope")["ok"] is False)
+
+
+def test_start_metadata_job_requires_login() -> None:
+    b = _isolated_backend()
+    res = b.start_metadata_job(["avtr_00000000-1111-2222-3333-444444444444"])
+    check("metadata job needs login", res["ok"] is False and res["title"] == "Not logged in")
+
+
+def test_tray_icon() -> None:
+    """The tray icon is native, so exercise it for real when possible."""
+    from tray import TrayIcon, available
+
+    if not available():
+        return
+
+    icon = TrayIcon("Test", tip="tip")
+    commands: list[int] = []
+    icon.on_command = commands.append
+    started = icon.start()
+    check("tray icon starts", started is True)
+
+    if started:
+        check("tray window created", icon._hwnd is not None)
+        check("tray menu built", icon._menu is not None)
+        check("notify data prepared", icon._nid is not None)
+        icon.notify("Hi", "there")
+        check("notify does not raise", True)
+        icon.set_tip("new tip")
+        check("tip updated", icon.current_tip() == "new tip", icon.current_tip())
+
+        # Commands are delivered through the callback.
+        icon._fire(TrayIcon.OPEN)
+        icon._fire(TrayIcon.WEAR_LAST)
+        check("commands dispatched", commands == [TrayIcon.OPEN, TrayIcon.WEAR_LAST],
+              str(commands))
+
+        # A raising handler must not take the message loop down with it.
+        icon.on_command = lambda command: 1 / 0
+        icon._fire(TrayIcon.QUIT)
+        check("raising handler is contained", True)
+
+    icon.stop()
+    check("tray stops cleanly", icon._added is False)
+    icon.notify("x", "y")
+    check("notify after stop is a no-op", True)
+
+
+def test_wear_last() -> None:
+    """The tray menu's "Wear last avatar" needs something to pick."""
+    from tray import TrayIcon  # noqa: F401  (import guard for Windows-only path)
+
+    b = _isolated_backend()
+    check("nothing to wear yet", b.wear_last()["ok"] is False)
+
+    first = "avtr_11111111-1111-1111-1111-111111111111"
+    second = "avtr_22222222-2222-2222-2222-222222222222"
+    b.add_by_id(first)
+    b.add_by_id(second)
+
+    # Only log entries count, and the most recent one wins.
+    b._record_log(first, when="2026-01-01T00:00:00+00:00")
+    b._record_log(second, when="2026-01-02T00:00:00+00:00")
+    b.osc.listening = True
+    b.osc.error = None
+    sent: list[str] = []
+
+    def record(avatar_id):
+        sent.append(avatar_id)
+        return True
+
+    b.osc.change_avatar = record
+
+    res = b.wear_last()
+    check("wear_last picks the newest", sent == [second], str(sent))
+    check("wear_last reports ok", res["ok"] is True)
+
+
+def test_exit_on_close_setting() -> None:
+    b = _isolated_backend()
+    check("exit_on_close defaults on", b.get_settings()["exit_on_close"] is True)
+
+    res = b.save_settings(9000, 9001, exit_on_close=False)
+    check("settings saved with the flag", res["ok"] is True, str(res))
+    check("flag persisted", b.settings["exit_on_close"] is False)
+    check("flag reported back", b.get_settings()["exit_on_close"] is False)
+
+    res = b.save_settings(9000, 9001, exit_on_close=True)
+    check("flag toggled back", b.settings["exit_on_close"] is True)
+
+    # The two-argument form used by older callers must not clear the flag.
+    b.settings["exit_on_close"] = False
+    b.save_settings(9000, 9001)
+    check("omitted flag is left alone", b.settings["exit_on_close"] is False)
+
+
+def test_tray_state_reported() -> None:
+    b = _isolated_backend()
+    check("no tray by default", b.get_state()["tray"] is False)
+
+    class FakeTray:
+        def __init__(self):
+            self.shown = []
+
+        def notify(self, title, message):
+            self.shown.append((title, message))
+
+    tray = FakeTray()
+    b.set_tray(tray)
+    check("tray reported once attached", b.get_state()["tray"] is True)
+    b._notify_tray("Title", "Message")
+    check("notify reaches the tray", tray.shown == [("Title", "Message")], str(tray.shown))
+
+
 def main() -> int:
     tests = [
         test_storage,
@@ -1053,6 +1314,15 @@ def main() -> int:
         test_entry_index_stays_consistent,
         test_save_all_logs_is_not_quadratic,
         test_api_rate_limit_backoff,
+        test_job_progress,
+        test_job_counts_failures,
+        test_bulk_actions,
+        test_restore_entry_for_undo,
+        test_start_metadata_job_requires_login,
+        test_tray_icon,
+        test_wear_last,
+        test_exit_on_close_setting,
+        test_tray_state_reported,
         test_thumbnail_pruning,
         test_delete_removes_thumbnail,
     ]

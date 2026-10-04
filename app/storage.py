@@ -30,6 +30,8 @@ DEFAULT_SETTINGS = {
     "osc_receive_port": 9001,
     "auth_token": "",
     "auth_username": "",
+    # When false, closing the window hides to the notification area instead.
+    "exit_on_close": True,
 }
 
 
@@ -308,6 +310,8 @@ def sanitize_settings(raw) -> dict:
     for key in ("auth_token", "auth_username"):
         value = settings.get(key)
         settings[key] = value if isinstance(value, str) else ""
+
+    settings["exit_on_close"] = bool(settings.get("exit_on_close", True))
 
     return settings
 

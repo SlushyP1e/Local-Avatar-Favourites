@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 from http.cookiejar import Cookie, CookieJar
+from urllib.parse import quote
 from urllib.request import HTTPCookieProcessor, build_opener
 
 try:
@@ -190,17 +191,58 @@ class VRCApi:
 
     def login(self, username: str, password: str) -> dict:
         """Log in with username/password. Returns user dict. Raises
-        TwoFactorRequired (with the available methods) if 2FA is needed."""
-        status, raw = self._request("GET", "/auth/user", basic=(username, password))
-        payload = self._json(raw)
-        if status == 200:
+        TwoFactorRequired (with the available methods) if 2FA is needed.
+
+        GET /auth/user is VRChat's documented combined login-and-whoami endpoint:
+        with no cookie it authenticates the Basic header, and the response sets
+        the auth cookie.
+
+        Two details from the docs matter here:
+
+        * The credential is ``base64(urlencode(user):urlencode(password))``, so
+          an email login has its ``@`` percent-encoded. Raw is kept as a fallback
+          because the doc describes what VRChat's own web client sends and a
+          direct Basic header arguably should not encode.
+        * **Each credentialed request consumes one of a limited number of
+          simultaneous sessions.** So the encoded form is tried first and the
+          raw form only on failure, rather than always sending two.
+        """
+        attempts = [
+            (quote(username, safe=""), quote(password, safe="")),
+            (username, password),
+        ]
+        seen: set[tuple[str, str]] = set()
+        last_status = 0
+        last_raw = b""
+
+        for user, secret in attempts:
+            key = (user, secret)
+            if key in seen:
+                continue
+            seen.add(key)
+            status, raw = self._request("GET", "/auth/user", basic=(user, secret))
+            last_status, last_raw = status, raw
+            if status != 200:
+                continue
+            payload = self._json(raw)
             required = payload.get("requiresTwoFactorAuth")
             if required:
                 methods = required if isinstance(required, list) else [required]
                 raise TwoFactorRequired([str(m) for m in methods])
+            self._adopt_token(payload.get("authToken"))
             return payload
-        self._raise_api_error(raw, status)
+
+        self._raise_api_error(last_raw, last_status)
         return {}  # pragma: no cover
+
+    def _adopt_token(self, token) -> None:
+        """Fall back to the token in the response body if no cookie arrived."""
+        if not token or self.token:
+            return
+        try:
+            self._jar.set_cookie(_auth_cookie(str(token)))
+        except Exception:
+            pass
 
     def verify_2fa(self, code: str, method: str = "totp") -> dict:
         """Verify a 2FA code. ``method`` is one of totp / emailotp / otp."""

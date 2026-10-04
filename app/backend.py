@@ -23,6 +23,7 @@ import webview
 
 import storage
 from api import ApiError, AuthError, TwoFactorRequired, VRCApi
+from jobs import JobRegistry, JobRunner
 from osc import OSCBridge
 from version import __version__
 from versions import is_newer
@@ -112,6 +113,8 @@ class Backend:
         self.session_expired = False
         # (avatar_id, monotonic timestamp) of an unconfirmed wear request.
         self._pending_wear: tuple[str, float] | None = None
+        self._jobs = JobRegistry()
+        self._runner = JobRunner(self._jobs)
 
         self.entries: list[dict] = storage.load_favourites()
         self._index: dict[str, dict] = {}
@@ -337,7 +340,9 @@ class Backend:
                 "username": self.settings.get("auth_username", ""),
                 "pending_2fa": self._pending_api is not None,
                 "revs": dict(self._revs),
-                "discovery": self.discovery_state(),
+"discovery": self.discovery_state(),
+                "job": self._jobs.active(),
+                "tray": bool(getattr(self, "_tray", None)),
                 "osc": {
                     "listening": self.osc.listening,
                     "error": self.osc.error,
@@ -361,6 +366,8 @@ class Backend:
             "twofa_methods": list(self._pending_2fa_methods),
             "twofa_method": self._pending_2fa_method,
             "discovery": self.discovery_state(),
+            "exit_on_close": bool(self.settings.get("exit_on_close", True)),
+            "tray": bool(getattr(self, "_tray", None)),
         }
 
     def discovery_state(self) -> dict:
@@ -671,7 +678,41 @@ class Backend:
             "VRChat session expired - log in again in Settings to fetch names and thumbnails."
         )
 
+    def wear_last(self) -> dict:
+        """Wear the most recently worn favourite. Used by the tray menu."""
+        with self._lock:
+            ordered = sorted(
+                (e for e in self.log if e.get("id")),
+                key=lambda e: e.get("last_seen", ""),
+                reverse=True,
+            )
+            candidate = None
+            for entry in ordered:
+                found = self._entry(entry["id"])
+                if found:
+                    candidate = found
+                    break
+            if candidate is None and self.entries:
+                candidate = max(self.entries, key=lambda e: e.get("added", ""))
+        if candidate is None:
+            return {"ok": False}
+        return self.wear(candidate["id"])
+
+    def set_tray(self, tray) -> None:
+        """Attach the tray icon so status updates can raise a balloon."""
+        self._tray = tray
+
+    def _notify_tray(self, title: str, message: str) -> None:
+        tray = getattr(self, "_tray", None)
+        if tray is None:
+            return
+        try:
+            tray.notify(title, message)
+        except Exception:
+            pass
+
     def _bulk_metadata(self, ids: list[str]) -> None:
+        """Sequential metadata fetch. Used where no progress UI is wanted."""
         for avatar_id in ids:
             if self._stopped or self.session_expired:
                 return
@@ -686,6 +727,133 @@ class Backend:
             # Be a good API citizen: VRChat terminates accounts for abuse, and
             # the README's own advice is to keep request rates low.
             time.sleep(0.6)
+
+    # -------------------------------------------------------------------- jobs
+    def get_job(self, job_id: str = "") -> dict | None:
+        """Progress for one job, or the most recent running one."""
+        if job_id:
+            return self._jobs.get(job_id)
+        return self._jobs.active()
+
+    def cancel_job(self, job_id: str) -> dict:
+        if not self._jobs.cancel(job_id):
+            return {"ok": False, "message": "That job is not running."}
+        return {"ok": True}
+
+    def start_metadata_job(self, ids) -> dict:
+        """Fetch metadata for many avatars as a cancellable, visible job."""
+        if not self.api.is_logged_in():
+            return {"ok": False, "title": "Not logged in",
+                    "message": "Log in first to look up names and thumbnails."}
+        wanted = []
+        seen: set[str] = set()
+        for value in ids or []:
+            avatar_id = self._norm_id(value)
+            if avatar_id and avatar_id not in seen and self._entry(avatar_id):
+                seen.add(avatar_id)
+                wanted.append(avatar_id)
+        if not wanted:
+            return {"ok": False, "message": "Nothing selected."}
+
+        job_id = self._runner.start(
+            "metadata", wanted, self._metadata_worker,
+            message=f"Fetching metadata for {len(wanted)} avatar(s)...",
+        )
+        self._set_status(f"Fetching metadata for {len(wanted)} avatar(s)...")
+        return {"ok": True, "job": job_id, "total": len(wanted)}
+
+    def bulk_action(self, ids, action: str, value: str = "") -> dict:
+        """Apply one action to several favourites.
+
+        Supported: favorite, unfavorite, tag, untag, wear, refresh, delete.
+        """
+        targets = []
+        seen: set[str] = set()
+        for raw in ids or []:
+            avatar_id = self._norm_id(raw)
+            if avatar_id and avatar_id not in seen and self._entry(avatar_id):
+                seen.add(avatar_id)
+                targets.append(avatar_id)
+        if not targets:
+            return {"ok": False, "message": "Nothing selected."}
+
+        action = (action or "").strip().lower()
+        value = (value or "").strip()
+
+        if action == "delete":
+            removed = 0
+            for avatar_id in targets:
+                if self.delete(avatar_id).get("ok"):
+                    removed += 1
+            self._set_status(f"Removed {removed} avatar(s).")
+            return {"ok": True, "changed": removed, "action": action}
+
+        if action == "wear":
+            # One switch only: the request is for a single avatar.
+            self.wear(targets[0])
+            return {"ok": True, "changed": 1, "action": action}
+
+        if action == "refresh":
+            job = self.start_metadata_job(targets)
+            return {**job, "action": action}
+
+        if action in ("favorite", "unfavorite", "tag", "untag"):
+            if action == "tag" and not value:
+                return {"ok": False, "message": "Enter a tag first."}
+            with self._lock:
+                changed = 0
+                for avatar_id in targets:
+                    entry = self._entry(avatar_id)
+                    if entry is None:
+                        continue
+                    if action == "favorite":
+                        entry["favorite"] = True
+                    elif action == "unfavorite":
+                        entry["favorite"] = False
+                    elif action == "tag":
+                        tags = [str(t) for t in entry.get("tags") or []]
+                        if value not in tags:
+                            tags.append(value)
+                        entry["tags"] = tags
+                    else:
+                        entry["tags"] = [t for t in entry.get("tags") or [] if t != value]
+                    changed += 1
+                if changed:
+                    storage.save_favourites(self.entries)
+                    self._touch("entries")
+            verb = {"favorite": "Favourited", "unfavorite": "Unfavourited",
+                    "tag": "Tagged", "untag": "Untagged"}[action]
+            self._set_status(f"{verb} {changed} avatar(s).")
+            return {"ok": True, "changed": changed, "action": action}
+
+        return {"ok": False, "message": f"Unknown action: {action}"}
+
+    def restore_entry(self, entry: dict) -> dict:
+        """Re-insert a deleted favourite, notes and tags intact. For undo."""
+        if not isinstance(entry, dict):
+            return {"ok": False}
+        avatar_id = self._norm_id(entry.get("id"))
+        if not avatar_id:
+            return {"ok": False}
+        with self._lock:
+            if self._entry(avatar_id):
+                return {"ok": False, "message": "Already in favourites."}
+            restored = storage.new_entry(avatar_id)
+            for key in ("name", "notes", "author", "release_status", "thumb",
+                        "thumb_url", "added"):
+                if entry.get(key):
+                    restored[key] = entry[key]
+            for key in ("tags", "platforms"):
+                if isinstance(entry.get(key), list):
+                    restored[key] = [str(v) for v in entry[key]]
+            if isinstance(entry.get("favorite"), bool):
+                restored["favorite"] = entry["favorite"]
+            self.entries.append(restored)
+            self._index_add(restored)
+            storage.save_favourites(self.entries)
+            self._touch("entries")
+        self._set_status(f"Restored {restored.get('name') or avatar_id}.")
+        return {"ok": True, "id": avatar_id}
 
     def clear_changes(self) -> dict:
         with self._lock:
@@ -726,9 +894,7 @@ class Backend:
             ids = [e["id"] for e in self.entries]
         if not ids:
             return {"ok": True}
-        self._set_status(f"Fetching metadata for {len(ids)} avatar(s)...")
-        threading.Thread(target=self._bulk_metadata, args=(ids,), daemon=True).start()
-        return {"ok": True}
+        return self.start_metadata_job(ids)
 
     def open_data_folder(self) -> dict:
         storage.ensure_dirs()
@@ -882,43 +1048,35 @@ class Backend:
             if not username or not password:
                 return {"status": "error", "message": "Enter your username and password."}
 
-            # Try the password as entered, then again with surrounding
-            # whitespace stripped (pasting often adds a trailing space/newline).
-            candidates = [password]
-            stripped = password.strip()
-            if stripped and stripped != password:
-                candidates.append(stripped)
+            # Normalise once, up front. The old code retried the whole
+            # authenticated request with a stripped password, but every
+            # credentialed request burns one of a limited number of
+            # simultaneous VRChat sessions, so a pasted trailing space could
+            # cost two.
+            username = username.strip()
+            password = password.strip()
 
             last_error: Exception | None = None
             api = None
-            for candidate in candidates:
+            try:
                 api = VRCApi()
-                try:
-                    api.login(username, candidate)
-                except TwoFactorRequired as exc:
-                    self._pending_api = api
-                    self._pending_2fa_methods = exc.methods or ["totp"]
-                    self._pending_2fa_method = self._pick_method(exc.methods)
-                    return {
-                        "status": "2fa",
-                        "methods": self._pending_2fa_methods,
-                        "method": self._pending_2fa_method,
-                        "message": "2FA required - enter your code.",
-                    }
-                except AuthError as exc:
-                    last_error = exc
-                    continue
-                except ApiError as exc:
-                    last_error = exc
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    break
-                else:
-                    last_error = None
-                    break
+                api.login(username, password)
+            except TwoFactorRequired as exc:
+                self._pending_api = api
+                self._pending_2fa_methods = exc.methods or ["totp"]
+                self._pending_2fa_method = self._pick_method(exc.methods)
+                return {
+                    "status": "2fa",
+                    "methods": self._pending_2fa_methods,
+                    "method": self._pending_2fa_method,
+                    "message": "2FA required - enter your code.",
+                }
+            except AuthError as exc:
+                last_error = exc
+            except Exception as exc:
+                last_error = exc
 
-            if last_error is not None:
+        if last_error is not None:
                 self._pending_api = None
                 self._pending_2fa_methods = []
                 return {"status": "error", "message": str(last_error)}
@@ -953,7 +1111,7 @@ class Backend:
         return {"ok": True}
 
     # ------------------------------------------------------------------ settings
-    def save_settings(self, send_port, recv_port) -> dict:
+    def save_settings(self, send_port, recv_port, exit_on_close=None) -> dict:
         try:
             send_port = int(send_port)
             recv_port = int(recv_port)
@@ -964,6 +1122,12 @@ class Backend:
         if send_port == recv_port:
             return {"ok": False,
                     "message": "The send and receive ports must be different."}
+
+        # Closing behaviour lives here too: the shell reads it when the window
+        # is asked to close. Only overwrite when explicitly supplied, so the
+        # older two-argument call from the self-test still works.
+        if exit_on_close is not None:
+            self.settings["exit_on_close"] = bool(exit_on_close)
 
         # Bind before persisting. The old order wrote the settings first and only
         # then discovered the port was unavailable, so a single conflict left

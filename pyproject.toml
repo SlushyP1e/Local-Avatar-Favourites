@@ -66,4 +66,4 @@ check_untyped_defs = true
 # module globals and methods in order to redirect storage into a temp directory.
 module = "selftest"
 allow_untyped_defs = true
-disable_error_code = ["arg-type", "assignment", "method-assign", "return-value"]
+disable_error_code = ["arg-type", "assignment", "index", "method-assign", "return-value"]
