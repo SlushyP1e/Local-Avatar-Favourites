@@ -760,8 +760,17 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   font-weight: 700;
 }
 
+/* Reduced motion.
+   Two independent switches, because Windows exposes "Show animations in
+   Windows" as a system-wide toggle and WebView2 turns that into
+   prefers-reduced-motion: reduce. That suppresses all of the motion above even
+   when the user has explicitly asked for it in the app, so the media query is
+   scoped to skip when data-motion="full" is set on <html>.
+   data-motion="none" always applies, overriding a system that allows motion. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  :root:not([data-motion="full"]) *,
+  :root:not([data-motion="full"]) *::before,
+  :root:not([data-motion="full"]) *::after {
     animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
     /* Without this the stagger delays would survive, so a long list would still
@@ -770,6 +779,16 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
     transition-duration: 0.001ms !important;
     transition-delay: 0ms !important;
   }
+}
+
+:root[data-motion="none"] *,
+:root[data-motion="none"] *::before,
+:root[data-motion="none"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  animation-delay: 0ms !important;
+  transition-duration: 0.001ms !important;
+  transition-delay: 0ms !important;
 }
 
 /* ---------------------------------------------------------------- drawer */

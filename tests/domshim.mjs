@@ -59,11 +59,17 @@ export function makeElement(id = "el") {
   };
 }
 
-export function makeEnvironment(apiImpl = {}) {
+export function makeEnvironment(apiImpl = {}, options = {}) {
+  const env = options;
   const elements = new Map();
+  const root = makeElement("html");
+  root.setAttribute = (k, v) => { root.attributes[k] = v; };
+  root.attributes = {};
   const docListeners = new Map();
   const document = {
     activeElement: null,
+    documentElement: root,
+    getAttribute: () => null,
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, makeElement(id));
       return elements.get(id);
@@ -97,10 +103,17 @@ export function makeEnvironment(apiImpl = {}) {
     addEventListener: () => {},
     innerWidth: 1280,
     innerHeight: 800,
+    // Overridable so the reduced-motion path can be exercised.
+    matchMedia: (query) => ({
+      media: query,
+      matches: !!env.systemReducesMotion,
+      addEventListener() {},
+      removeEventListener() {},
+    }),
   };
 
   const CSS = { escape: (s) => String(s) };
-  return { document, window, CSS, elements };
+  return { document, window, CSS, elements, root, systemReducesMotion: !!options.systemReducesMotion };
 }
 
 // Load app.js and hand back its internals. app.js is a plain script with
@@ -116,7 +129,8 @@ export function loadApp(env) {
   scheduleSave, flushDraft, captureDraft, openDrawer, closeDrawer, call,
   thumbCache, thumbKey, thumbPending, thumbOrder, visibleEntries, cardSub, escapeHtml,
   setView, animateView, applyStagger, revealOnce, replayAnimation,
-  clearAnimationWhenDone, VIEW_ORDER, STAGGER_CAP,
+  clearAnimationWhenDone, applyMotionPreference, systemPrefersReducedMotion,
+  renderMotionNote, VIEW_ORDER, STAGGER_CAP,
   get currentView() { return currentView; },
   set currentView(v) { currentView = v; },
   get pendingConfirm() { return pendingConfirm; },

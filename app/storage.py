@@ -25,6 +25,10 @@ THUMBS_DIR = DATA_DIR / "thumbs"
 
 _MIGRATED = False
 
+# Animation preference. "system" respects the OS accessibility setting,
+# "full" overrides it, "none" disables motion outright.
+MOTION_MODES = ("system", "full", "none")
+
 DEFAULT_SETTINGS = {
     "osc_send_ip": "127.0.0.1",
     "osc_send_port": 9000,
@@ -33,6 +37,7 @@ DEFAULT_SETTINGS = {
     "auth_username": "",
     # When false, closing the window hides to the notification area instead.
     "exit_on_close": True,
+    "motion": "system",
 }
 
 
@@ -313,6 +318,11 @@ def sanitize_settings(raw) -> dict:
         settings[key] = value if isinstance(value, str) else ""
 
     settings["exit_on_close"] = bool(settings.get("exit_on_close", True))
+
+    # Accept surrounding whitespace and any casing, so a hand-edited
+    # "FULL" behaves the same as one saved through the UI.
+    motion = str(settings.get("motion") or "system").strip().lower()
+    settings["motion"] = motion if motion in MOTION_MODES else "system"
 
     return settings
 

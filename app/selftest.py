@@ -1475,6 +1475,46 @@ def test_tray_icon_asset_is_bundled() -> None:
           (Path(__file__).resolve().parent.parent / "assets" / "icon.ico").exists())
 
 
+def test_motion_setting() -> None:
+    """Animation preference must survive a round trip and reject junk."""
+    b = _isolated_backend()
+
+    check("motion defaults to system", b.settings.get("motion") == "system",
+          str(b.settings.get("motion")))
+    check("motion reported in settings", b.get_settings()["motion"] == "system")
+    check("motion reported in state", b.get_state()["motion"] == "system")
+
+    for mode in ("full", "none", "system"):
+        b.save_settings(9000, 9001, motion=mode)
+        check(f"motion accepts {mode}", b.settings["motion"] == mode, str(b.settings["motion"]))
+        check(f"motion {mode} persists",
+              storage.load_settings()["motion"] == mode,
+              str(storage.load_settings()["motion"]))
+
+    # Junk must not be stored verbatim; it would end up as an unknown attribute
+    # on <html> and silently disable the override.
+    for junk in ("fullish", "", "reduced", None, 5, ["full"]):
+        b.save_settings(9000, 9001, motion=junk)
+        check(f"motion rejects {junk!r}", b.settings["motion"] == "system",
+              str(b.settings["motion"]))
+
+    # Casing and padding are accepted rather than treated as junk, so the two
+    # entry points (UI save and hand-edited file) behave the same.
+    for variant in ("FULL", "  Full  ", "NoNe"):
+        b.save_settings(9000, 9001, motion=variant)
+        check(f"motion normalises {variant!r}",
+              b.settings["motion"] == variant.strip().lower(), str(b.settings["motion"]))
+        storage.save_settings({"motion": variant})
+        check(f"file normalises {variant!r}",
+              storage.load_settings()["motion"] == variant.strip().lower(),
+              str(storage.load_settings()["motion"]))
+
+    # Omitted means untouched, like exit_on_close.
+    b.settings["motion"] = "none"
+    b.save_settings(9000, 9001)
+    check("omitted motion is left alone", b.settings["motion"] == "none")
+
+
 def main() -> int:
     tests = [
         test_storage,
@@ -1520,6 +1560,7 @@ def main() -> int:
         test_tray_icon_asset_is_bundled,
         test_wear_last,
         test_exit_on_close_setting,
+        test_motion_setting,
         test_settings_save_unchanged_ports,
         test_undo_keeps_the_thumbnail,
         test_prune_respects_undo_grace,

@@ -341,6 +341,67 @@ test("revealOnce only animates on the hidden edge", () => {
     "becoming visible should animate once");
 });
 
+// -------------------------------------------------------------- motion mode
+
+test("applyMotionPreference writes the preference onto <html>", () => {
+  const { env, app } = setup();
+  app.state.motion = "full";
+  app.applyMotionPreference();
+  assert.equal(env.root.attributes["data-motion"], "full");
+
+  app.state.motion = "none";
+  app.applyMotionPreference();
+  assert.equal(env.root.attributes["data-motion"], "none");
+
+  app.state.motion = "system";
+  app.applyMotionPreference();
+  assert.equal(env.root.attributes["data-motion"], "system");
+});
+
+test("a system that reduces motion is detected", () => {
+  // Windows "Show animations" off reaches WebView2 as prefers-reduced-motion.
+  const off = makeEnvironment({}, { systemReducesMotion: true });
+  const on = makeEnvironment({}, { systemReducesMotion: false });
+
+  assert.equal(loadApp(off).systemPrefersReducedMotion(), true);
+  assert.equal(loadApp(on).systemPrefersReducedMotion(), false);
+});
+
+test("system-reduced motion is flagged only in system mode", () => {
+  // This is the exact case that made the animations look broken: Windows
+  // suppresses motion, and "Follow Windows" then does nothing at all.
+  const env = makeEnvironment({}, { systemReducesMotion: true });
+  const app = loadApp(env);
+
+  app.state.motion = "system";
+  assert.equal(app.applyMotionPreference(), true,
+    "system mode should report that motion is being suppressed");
+
+  app.state.motion = "full";
+  assert.equal(app.applyMotionPreference(), false,
+    "an explicit override must not report suppression");
+});
+
+test("the motion note explains the cause", () => {
+  const env = makeEnvironment({}, { systemReducesMotion: true });
+  const app = loadApp(env);
+  const note = env.document.getElementById("set-motion-note");
+  const select = env.document.getElementById("set-motion");
+
+  select.value = "system";
+  app.state.motion = "system";
+  app.renderMotionNote();
+  assert.match(note.textContent, /Show animations/i,
+    "the note must name the actual Windows setting");
+  assert.match(note.textContent, /Always animate/i,
+    "and say how to override it");
+
+  select.value = "full";
+  app.renderMotionNote();
+  assert.match(note.textContent, /always play/i);
+  assert.ok(!note.classList.contains("warn-text"));
+});
+
 test("escapeHtml escapes angle brackets and quotes", () => {
   const { app } = setup();
   assert.equal(app.escapeHtml('<img src=x onerror="a">'),

@@ -14,6 +14,7 @@ let state = {
   username: "",
   pending_2fa: false,
   version: "",
+  motion: "system",
   discovery: { sources: {}, backlog: 0, db_path: "" },
   osc: { listening: false, error: null, seen_traffic: false },
 };
@@ -217,12 +218,12 @@ function cardSub(entry) {
 }
 
 /* ------------------------------------------------------------------ toast */
-function toast(msg) {
+function toast(msg, duration) {
   const el = $("toast");
   el.textContent = msg;
   el.classList.add("show");
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => el.classList.remove("show"), 3200);
+  toast._t = setTimeout(() => el.classList.remove("show"), duration || 3200);
 }
 
 /* ------------------------------------------------------------------ modals */
@@ -1001,6 +1002,8 @@ async function openSettings() {
   $("set-send").value = s.osc_send_port;
   $("set-recv").value = s.osc_receive_port;
   $("set-exit-on-close").checked = s.exit_on_close !== false;
+  $("set-motion").value = s.motion || "system";
+  renderMotionNote();
   $("set-tray-note").textContent = s.tray
     ? "With this off, closing the window keeps the app in the notification area. " +
       "Right-click the tray icon for Open, Wear last avatar and Quit."
@@ -1087,14 +1090,50 @@ async function doLogout() {
 
 async function saveSettings() {
   const res = await call("save_settings", $("set-send").value, $("set-recv").value,
-                         $("set-exit-on-close").checked);
+                         $("set-exit-on-close").checked, $("set-motion").value);
   if (!res.ok) { showAlert("Invalid settings", res.message || "Could not save settings."); return; }
   closeModal("modal-settings");
   toast("Settings saved.");
   await refreshState();
 }
 
+/* Spells out *why* nothing is moving. "Follow Windows" silently doing nothing
+   reads as a broken app, so name the actual cause and the fix. */
+function renderMotionNote() {
+  const el = $("set-motion-note");
+  if (!el) return;
+  const pref = $("set-motion").value;
+  if (pref === "full") {
+    el.textContent = "Animations always play, even if Windows has them turned off.";
+    el.classList.remove("warn-text");
+    return;
+  }
+  if (pref === "none") {
+    el.textContent = "Transitions and hover motion are disabled.";
+    el.classList.remove("warn-text");
+    return;
+  }
+  if (systemPrefersReducedMotion()) {
+    el.textContent =
+      "Windows has \"Show animations\" turned off, so nothing moves. " +
+      "Choose \"Always animate\" to override that, or turn animations back on in " +
+      "Windows Settings > Accessibility > Visual effects.";
+    el.classList.add("warn-text");
+    return;
+  }
+  el.textContent = "Follows your Windows animation setting.";
+  el.classList.remove("warn-text");
+}
+
 /* ------------------------------------------------------------------ files & updates */
+function previewMotion() {
+  // Preview live so the choice can be seen before saving.
+  state.motion = $("set-motion").value;
+  applyMotionPreference();
+  renderMotionNote();
+  animateView(1);
+}
+
 async function importVrchatFavourites() {
   const res = await call("import_vrchat_favourites", 100);
   if (!res || !res.ok) {
@@ -1155,6 +1194,9 @@ async function refreshState() {
   state.osc = next.osc || state.osc;
   state.discovery = next.discovery || state.discovery;
   state.version = next.version || state.version;
+  if (next.motion && next.motion !== state.motion) state.motion = next.motion;
+  // Re-apply every poll so a change made outside the app is picked up.
+  applyMotionPreference();
   renderJob(next.job);
   if (next.entries != null) state.entries = next.entries;
   if (next.logs != null) state.logs = next.logs;
@@ -1165,9 +1207,15 @@ async function refreshState() {
 }
 
 function startPolling() {
+  // Set before the first paint so the correct motion rules apply immediately.
+  applyMotionPreference();
   refreshState().then(() => {
     // Give the opening view the same entrance as any navigation into it.
     animateView(1);
+    if (motionSuppressedBySystem) {
+      toast("Windows has animations turned off — nothing will move. "
+          + "Change this in Settings > Appearance.", 6000);
+    }
   });
   setInterval(refreshState, 700);
 }
@@ -1176,6 +1224,32 @@ function startPolling() {
 /* ------------------------------------------------------------ view motion */
 const VIEW_ORDER = ["home", "logs"];
 const STAGGER_CAP = 14;
+
+// Windows has a system-wide "Show animations in Windows" toggle, which WebView2
+// reports as prefers-reduced-motion: reduce. That silently kills every animation
+// in the app, which looks like a broken build rather than a setting. So the
+// effective preference is resolved here and written onto <html>, and the
+// stylesheet keys off that attribute instead of the media query alone.
+const REDUCE_QUERY = "(prefers-reduced-motion: reduce)";
+
+function systemPrefersReducedMotion() {
+  try {
+    return !!window.matchMedia && window.matchMedia(REDUCE_QUERY).matches;
+  } catch (err) {
+    return false;
+  }
+}
+
+function applyMotionPreference() {
+  const pref = state.motion || "system";
+  const root = document.documentElement;
+  root.setAttribute("data-motion", pref);
+  const suppressed = pref === "system" && systemPrefersReducedMotion();
+  motionSuppressedBySystem = suppressed;
+  return suppressed;
+}
+
+let motionSuppressedBySystem = false;
 
 // Restart a CSS animation that may already have run on this element.
 function replayAnimation(el, className) {
@@ -1338,6 +1412,7 @@ function wire() {
 
   $("set-login").addEventListener("click", doLogin);
   $("set-logout").addEventListener("click", doLogout);
+  $("set-motion").addEventListener("change", previewMotion);
   $("set-method").addEventListener("change", updateTwoFactorLabel);
   $("set-save").addEventListener("click", saveSettings);
   $("set-open-folder").addEventListener("click", () => call("open_data_folder"));

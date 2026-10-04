@@ -342,6 +342,7 @@ class Backend:
                 "revs": dict(self._revs),
 "discovery": self.discovery_state(),
                 "job": self._jobs.active(),
+                "motion": self.settings.get("motion", "system"),
                 "tray": bool(getattr(self, "_tray", None)),
                 "osc": {
                     "listening": self.osc.listening,
@@ -367,6 +368,7 @@ class Backend:
             "twofa_method": self._pending_2fa_method,
             "discovery": self.discovery_state(),
             "exit_on_close": bool(self.settings.get("exit_on_close", True)),
+            "motion": self.settings.get("motion", "system"),
             "tray": bool(getattr(self, "_tray", None)),
         }
 
@@ -1112,7 +1114,7 @@ class Backend:
         return {"ok": True}
 
     # ------------------------------------------------------------------ settings
-    def save_settings(self, send_port, recv_port, exit_on_close=None) -> dict:
+    def save_settings(self, send_port, recv_port, exit_on_close=None, motion=None) -> dict:
         try:
             send_port = int(send_port)
             recv_port = int(recv_port)
@@ -1129,6 +1131,12 @@ class Backend:
         # older two-argument call from the self-test still works.
         if exit_on_close is not None:
             self.settings["exit_on_close"] = bool(exit_on_close)
+
+        # Animation preference. "full" overrides a Windows accessibility setting
+        # that would otherwise silently suppress every transition.
+        if motion is not None:
+            mode = str(motion).strip().lower()
+            self.settings["motion"] = mode if mode in storage.MOTION_MODES else "system"
 
         # Only the receive port is actually bound. If it has not changed there is
         # nothing to rebind -- and attempting one would fail against our own
