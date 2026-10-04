@@ -47,19 +47,22 @@ Thumbnails are cached in `%APPDATA%\LocalAvatarFavourites\thumbs\`.
 
 ---
 
-## Important: how avatar switching works (read this!)
+## Important: how avatar switching works
 
 The tool talks to VRChat over **OSC** using the `/avatar/change` message.
 
 - To know what you're wearing, VRChat **broadcasts** the current avatar ID whenever an avatar loads.
 - To **wear** an avatar, the tool sends that avatar ID back to VRChat.
 
-**VRChat-side rule:** OSC can only switch to avatars that are in your in-game **Favorites**, your **Recents**, or **your own uploads**. This is a VRChat limitation — no tool can bypass it.
+**Anything can be added to this list.** An avatar ID does not have to be in your
+VRChat Favourites, and you do not have to own it — **Wear Avatar** is the only
+step.
 
-Practical advice:
-
-- Add the avatars you want to hot-swap to your in-game favourites too.
-- Use this tool for the parts VRChat is bad at: **unlimited** lists, notes, tags, search, and thumbnails.
+VRChat does refuse a small number of avatars, namely the ones your account
+cannot use: private avatars, and paid avatars you have not bought. It refuses
+them *silently* — no error comes back, the avatar just never loads. So the tool
+watches for VRChat to broadcast the new ID after a switch, and if nothing arrives
+within a few seconds it says the change was probably refused, and why.
 
 ---
 
@@ -119,7 +122,7 @@ Without login, everything still works — new favourites just show a placeholder
 - **Local avatar discovery** — real IDs read from VRChat's own cache (see above)
 - **Add Current** — one-click save of the avatar you're wearing
 - **Add by ID** — paste any `avtr_...` ID
-- **Wear / switch** via OSC (see limitation above)
+- **Wear / switch** via OSC, with a clear message if VRChat refuses one
 - **Live tracking** — the avatar you're currently wearing is highlighted in the list
 - **Notes & tags** per avatar
 - **Search** across names, notes, tags, and IDs (works in both views)
@@ -201,7 +204,7 @@ Edit the files in `app/web/` and re-run to see changes.
 
 - **"OSC: waiting for VRChat..."** — VRChat isn't sending OSC traffic. Make sure OSC is enabled (Action Menu → OSC → Enabled) and that you're inside a world.
 - **"Could not listen on UDP port 9001"** — another app is using the port (e.g. a second copy of this tool, or another OSC receiver). Change the receive port in Settings and restart.
-- **Wear does nothing** — the avatar must be in your VRChat Favorites / Recents / own uploads (see above).
+- **Wear does nothing** — VRChat refuses avatars your account cannot use: private ones, and paid ones you have not bought. The tool reports this a few seconds after the click. Everything else applies.
 - **No thumbnails** — log in via Settings; private avatars may still refuse and will show a placeholder.
 - **Session expired** — your VRChat token stopped working. Open Settings and log in again.
 - **"local cache unavailable"** in the log view — VRChat encrypted or moved `avatars.sqlite`. The live feed and text log still work; only the all-time backlog is lost.

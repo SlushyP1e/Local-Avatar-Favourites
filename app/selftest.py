@@ -754,56 +754,69 @@ def test_auth_token_encryption() -> None:
               storage.load_settings()["auth_token"] == "legacy-plain")
 
 
-def test_favourite_in_vrchat() -> None:
-    """A discovered id is useless until VRChat can switch to it."""
-    from api import ApiError, AuthError, VRCApi
+def test_wear_confirms_or_reports_failure() -> None:
+    """VRChat never acknowledges /avatar/change, so we infer the outcome."""
+    import backend
 
     b = _isolated_backend()
-    avatar_id = "avtr_0f0f0f0f-1e1e-2d2d-3c3c-4b4b4b4b4b4b"
+    avatar_id = "avtr_4d4d4d4d-1111-2222-3333-444444444444"
+    other = "avtr_5e5e5e5e-1111-2222-3333-444444444444"
+    # Give it a name so the confirmation message can use it.
     b.add_by_id(avatar_id)
+    entry = b._entry(avatar_id)
+    entry["name"] = "Test Avatar"
 
-    # Not logged in: refuse rather than silently doing nothing.
-    res = b.favourite_in_vrchat(avatar_id)
-    check("favourite requires login", res["ok"] is False and res["title"] == "Not logged in")
+    # No OSC socket in the isolated backend: sending fails and nothing is pending.
+    res = b.wear(avatar_id)
+    check("wear reports the OSC problem", res["ok"] is False, str(res))
+    check("failed send leaves nothing pending", b._pending_wear is None)
 
-    calls = []
+    # Simulate a successful send so the confirmation path can be exercised.
+    b.osc.listening = True
+    b.osc.error = None
+    sent = []
 
-    class FakeApi(VRCApi):
-        def __init__(self, mode="ok"):
-            super().__init__("token")
-            self.mode = mode
+    def fake_change(avatar_id):
+        sent.append(avatar_id)
+        return True
 
-        def is_logged_in(self):
-            return True
+    b.osc.change_avatar = fake_change
 
-        def add_favorite(self, aid, group="avatars1"):
-            calls.append((aid, group))
-            if self.mode == "auth":
-                raise AuthError("expired")
-            if self.mode == "duplicate":
-                raise ApiError("You already have that friend favorited")
-            if self.mode == "boom":
-                raise ApiError("something else went wrong")
-            return {"ok": True}
+    res = b.wear(avatar_id)
+    check("wear accepted", res["ok"] is True and sent == [avatar_id], str(res))
+    check("wear is pending confirmation", b._pending_wear is not None)
 
-    b.api = FakeApi()
-    res = b.favourite_in_vrchat(avatar_id)
-    check("favourite succeeds", res["ok"] is True, str(res))
-    check("favourite used the avatars1 group", calls == [(avatar_id, "avatars1")], str(calls))
+    # Not yet due: nothing should be reported.
+    b._expire_pending_wear()
+    check("pending wear is not expired early", b._pending_wear is not None)
+    check("no failure status yet", "did not switch" not in b.status.lower(), b.status)
 
-    b.api = FakeApi("duplicate")
-    res = b.favourite_in_vrchat(avatar_id)
-    check("duplicate reported as already", res["ok"] is True and res.get("already") is True, str(res))
+    # VRChat echoes the id back -> confirmed, no failure message.
+    b.osc.current_avatar_id = avatar_id
+    b._on_avatar_change(avatar_id)
+    check("confirmation clears the pending wear", b._pending_wear is None)
+    check("confirmation is reported", "now wearing" in b.status.lower(), b.status)
+    check("confirmation uses the name when known", "Test Avatar" in b.status, b.status)
 
-    b.api = FakeApi("boom")
-    res = b.favourite_in_vrchat(avatar_id)
-    check("other api errors surface", res["ok"] is False and res["title"], str(res))
+    # Time passes with no echo -> VRChat refused it.
+    b.status = ""
+    b.osc.current_avatar_id = other
+    b.wear(avatar_id)
+    b._pending_wear = (avatar_id, time.monotonic() - (backend.WEAR_CONFIRM_TIMEOUT + 1))
+    b._expire_pending_wear()
+    check("stale wear is cleared", b._pending_wear is None)
+    check("refusal is reported", "did not switch" in b.status.lower(), b.status)
+    check("refusal explains why", "private" in b.status.lower(), b.status)
 
-    b.api = FakeApi("auth")
-    res = b.favourite_in_vrchat(avatar_id)
-    check("auth error flagged as expired", res["ok"] is False
-          and res["title"] == "Session expired", str(res))
-    check("auth error sets the session flag", b.session_expired is True)
+    # An unrelated avatar change must not confirm or expire the request.
+    b.status = ""
+    b.wear(avatar_id)
+    b._pending_wear = (avatar_id, time.monotonic() - (backend.WEAR_CONFIRM_TIMEOUT + 1))
+    b._on_avatar_change(other)
+    check("wrong avatar does not confirm", b._pending_wear is not None)
+    b._expire_pending_wear()
+    check("wrong avatar still expires as a refusal",
+          "did not switch" in b.status.lower(), b.status)
 
 
 def test_import_vrchat_favourites() -> None:
@@ -835,8 +848,6 @@ def test_import_vrchat_favourites() -> None:
     check("import kept the author", by_id["avtr_aaaaaaaa-1111-2222-3333-444444444444"]["author"] == "Ann")
     check("import derived platforms",
           by_id["avtr_aaaaaaaa-1111-2222-3333-444444444444"]["platforms"] == ["Quest", "PC"])
-    check("import marks them wearable",
-          all(e.get("vrchat_favorite") for e in b.entries))
 
     # Second run must not duplicate.
     res = b.import_vrchat_favourites()
@@ -1036,7 +1047,7 @@ def main() -> int:
         test_expired_token_is_not_private,
         test_osc_settings_not_persisted_on_failure,
         test_discovery_state_reported,
-        test_favourite_in_vrchat,
+        test_wear_confirms_or_reports_failure,
         test_import_vrchat_favourites,
         test_import_vrchat_requires_login,
         test_entry_index_stays_consistent,

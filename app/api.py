@@ -228,28 +228,6 @@ class VRCApi:
         return {}  # pragma: no cover
 
     # ---------------------------------------------------------------- favorites
-    def add_favorite(self, avatar_id: str, group: str = "avatars1") -> dict:
-        """Add an avatar to your VRChat favourites via POST /favorites.
-
-        This is what makes a discovered id useful: OSC can only switch to
-        avatars in your VRChat Favourites, Recents or your own uploads, so an
-        id found in the local cache is not wearable until it is favourited.
-        """
-        status, raw = self._request(
-            "POST", "/favorites",
-            data={"type": "avatar", "favoriteId": avatar_id, "tags": [group]},
-        )
-        if status == 200:
-            return self._json(raw)
-        self._raise_api_error(raw, status)
-        return {}  # pragma: no cover
-
-    def remove_favorite(self, avatar_id: str, group: str = "avatars1") -> bool:
-        status, _raw = self._request(
-            "DELETE", f"/favorites/{avatar_id}", data={"tags": [group]}
-        )
-        return status == 200
-
     def list_favorite_avatars(self, limit: int = 100, offset: int = 0) -> list[dict]:
         """A page of your VRChat favourites. These are real, wearable ids."""
         status, raw = self._request(

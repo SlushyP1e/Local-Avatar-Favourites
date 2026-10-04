@@ -41,6 +41,10 @@ MAX_LOG_ENTRIES = 800
 MAX_CHANGE_ENTRIES = 1000
 DISCOVERY_FEED_MAX = 300
 
+# How long to wait for VRChat to broadcast the avatar back before assuming the
+# change was refused. Large avatars can take a while to download.
+WEAR_CONFIRM_TIMEOUT = 6.0
+
 # Where a logged avatar id came from. Surfaced in the UI so it is obvious which
 # source is actually producing discoveries.
 SOURCE_OSC = "osc"
@@ -106,6 +110,8 @@ class Backend:
         # Set when the stored token stops working, so the UI can ask for a fresh
         # login instead of silently reporting every avatar as private.
         self.session_expired = False
+        # (avatar_id, monotonic timestamp) of an unconfirmed wear request.
+        self._pending_wear: tuple[str, float] | None = None
 
         self.entries: list[dict] = storage.load_favourites()
         self._index: dict[str, dict] = {}
@@ -163,6 +169,10 @@ class Backend:
                     self._record_log(avatar_id, source=SOURCE_CACHE)
             except Exception:
                 pass
+            try:
+                self._expire_pending_wear()
+            except Exception:
+                pass
             time.sleep(1.0)
 
     def _ingest_log_events(self, events: list[dict]) -> None:
@@ -216,8 +226,16 @@ class Backend:
         self.status = text
 
     def _on_avatar_change(self, avatar_id: str) -> None:
+        with self._lock:
+            pending = self._pending_wear
+            # VRChat echoing the id back is the only confirmation of a wear.
+            if pending and pending[0] == avatar_id:
+                self._pending_wear = None
         self._record_log(avatar_id, source=SOURCE_OSC)
-        self._set_status(f"VRChat is wearing {avatar_id}.")
+        entry = self._entry(avatar_id)
+        name = f"Now wearing {entry['name']}." if entry and entry.get("name") \
+            else f"Now wearing {avatar_id}."
+        self._set_status(name)
 
     def _record_log(self, avatar_id: str, when: str = "", save: bool = True,
                      source: str = SOURCE_OSC) -> bool:
@@ -445,11 +463,42 @@ class Backend:
         if not self.osc.listening:
             return {"ok": False, "title": "OSC not running",
                     "message": "The OSC connection is not active."}
+        # VRChat does not acknowledge /avatar/change. It broadcasts the new id
+        # back once the avatar actually loads, which is the only confirmation we
+        # get, so remember what we asked for and check it later.
+        with self._lock:
+            self._pending_wear = (avatar_id, time.monotonic())
         if self.osc.change_avatar(avatar_id):
             self._set_status("Requested avatar change over OSC.")
-            return {"ok": True}
+            return {"ok": True, "pending": avatar_id}
+        with self._lock:
+            self._pending_wear = None
         return {"ok": False, "title": "Wear failed",
                 "message": "Could not send the avatar change over OSC."}
+
+    def _expire_pending_wear(self) -> None:
+        """Report a wear that VRChat never confirmed.
+
+        Most avatars load fine. VRChat refuses ones the account cannot use --
+        private avatars, or paid avatars it does not own -- and it does that
+        silently, so without this the click just appears to do nothing.
+        """
+        with self._lock:
+            pending = self._pending_wear
+            if pending is None:
+                return
+            avatar_id, requested_at = pending
+            if time.monotonic() - requested_at < WEAR_CONFIRM_TIMEOUT:
+                return
+            self._pending_wear = None
+            if self.osc.current_avatar_id == avatar_id:
+                return
+        entry = self._entry(avatar_id)
+        name = f'"{entry["name"]}"' if entry and entry.get("name") else avatar_id
+        self._set_status(
+            f"VRChat did not switch to {name}. It may be private, or a paid "
+            "avatar your account does not own."
+        )
 
     def delete(self, avatar_id: str) -> dict:
         avatar_id = self._norm_id(avatar_id)
@@ -503,51 +552,12 @@ class Backend:
             return {"ok": True, "favorite": entry["favorite"]}
 
     # ---------------------------------------------------------------- discovery
-    def favourite_in_vrchat(self, avatar_id: str) -> dict:
-        """Add an avatar to your VRChat favourites so OSC can switch to it."""
-        avatar_id = self._norm_id(avatar_id)
-        if not avatar_id:
-            return {"ok": False, "title": "Nothing selected", "message": "No avatar selected."}
-        if not self.api.is_logged_in():
-            return {"ok": False, "title": "Not logged in",
-                    "message": "Log in via Settings first."}
-        self._set_status("Adding to your VRChat favourites...")
-        try:
-            self.api.add_favorite(avatar_id)
-        except AuthError as exc:
-            self._handle_session_expired(exc)
-            return {"ok": False, "title": "Session expired",
-                    "message": "Log in again in Settings, then retry."}
-        except ApiError as exc:
-            message = str(exc)
-            if "already" in message.lower():
-                self._set_status("Already in your VRChat favourites.")
-                return {"ok": True, "already": True}
-            return {"ok": False, "title": "Could not add favourite", "message": message}
-        self._set_status("Added to your VRChat favourites - you can wear it now.")
-        return {"ok": True}
-
-    def unfavourite_in_vrchat(self, avatar_id: str) -> dict:
-        avatar_id = self._norm_id(avatar_id)
-        if not self.api.is_logged_in():
-            return {"ok": False, "title": "Not logged in",
-                    "message": "Log in via Settings first."}
-        try:
-            self.api.remove_favorite(avatar_id)
-        except AuthError as exc:
-            self._handle_session_expired(exc)
-            return {"ok": False, "title": "Session expired",
-                    "message": "Log in again in Settings, then retry."}
-        except ApiError as exc:
-            return {"ok": False, "title": "Could not remove favourite", "message": str(exc)}
-        self._set_status("Removed from your VRChat favourites.")
-        return {"ok": True}
-
     def import_vrchat_favourites(self, limit: int = 100) -> dict:
         """Pull your VRChat favourites into the local list.
 
-        These are exactly the avatars OSC is able to switch to, so this is the
-        fastest way to get a working list without typing ids by hand.
+        A convenience for bootstrapping: these are avatars you already have, so
+        they come with working names, authors, platforms and thumbnails. Nothing
+        about them is special -- any avatar id can be added with Add by ID.
         """
         if not self.api.is_logged_in():
             return {"ok": False, "title": "Not logged in",
@@ -574,7 +584,6 @@ class Backend:
                 entry["release_status"] = (avatar.get("releaseStatus") or "").lower()
                 entry["platforms"] = self._platforms(avatar)
                 entry["thumb_url"] = avatar.get("thumbnailImageUrl") or ""
-                entry["vrchat_favorite"] = True
                 self.entries.append(entry)
                 self._index_add(entry)
                 added += 1
