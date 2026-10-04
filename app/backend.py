@@ -1083,6 +1083,17 @@ class Backend:
         username = (username or "").strip()
         code = (code or "").strip()
         method = (method or "").strip().lower()
+
+        # Both locals are declared here, before the branch, on purpose.
+        #
+        # They used to be initialised inside the username/password branch, and
+        # the shared error check at the bottom reads them. The 2FA branch never
+        # touches that initialisation -- it verifies the code on the pending
+        # client and falls straight through -- so a successful second-factor
+        # verification reached `if last_error is not None` with the name never
+        # bound, and raised UnboundLocalError. Every account with 2FA enabled
+        # was therefore unable to log in at all.
+        last_error: Exception | None = None
         api = self._pending_api
 
         if api is not None and code:
@@ -1113,8 +1124,6 @@ class Backend:
             username = username.strip()
             password = password.strip()
 
-            last_error: Exception | None = None
-            api = None
             try:
                 api = VRCApi()
                 api.login(username, password)
@@ -1134,9 +1143,9 @@ class Backend:
                 last_error = exc
 
         if last_error is not None:
-                self._pending_api = None
-                self._pending_2fa_methods = []
-                return {"status": "error", "message": str(last_error)}
+            self._pending_api = None
+            self._pending_2fa_methods = []
+            return {"status": "error", "message": str(last_error)}
 
         if api is None:
             # Unreachable in practice: both branches above either populate `api`

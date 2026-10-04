@@ -1107,6 +1107,125 @@ def test_import_vrchat_requires_login() -> None:
     check("import requires login", res["ok"] is False and res["title"] == "Not logged in")
 
 
+def test_login_with_two_factor() -> None:
+    """The whole 2FA round trip, which is how most accounts actually log in.
+
+    Regression: `last_error` and `api` were first assigned inside the
+    username/password branch, but the shared error check below reads them. The
+    second call -- the one that submits the code -- never goes through that
+    branch, so a successful verification reached `if last_error is not None`
+    with the name unbound and raised UnboundLocalError. Every account with 2FA
+    enabled was unable to log in, and nothing tested it.
+
+    VRCApi is replaced outright so no network call can happen here; the point
+    is the branch structure of Backend.login, not VRChat's API.
+    """
+    from api import TwoFactorRequired
+
+    b = _isolated_backend()
+
+    class FakeApi:
+        def __init__(self) -> None:
+            self.token = ""
+            self.verified = ""
+            self.method = ""
+
+        def login(self, username: str, password: str) -> dict:
+            raise TwoFactorRequired(["totp", "emailotp"])
+
+        def verify_2fa(self, code: str, method: str = "totp") -> dict:
+            self.verified = code
+            self.method = method
+            self.token = "authCookie_2fa"
+            return {"verified": True}
+
+    fake = FakeApi()
+
+    # setattr rather than `backend.VRCApi = ...`: assigning to an imported
+    # class name reads as assigning to a type, and mypy is right to object.
+    import backend as backend_module
+    original = backend_module.VRCApi
+    setattr(backend_module, "VRCApi", lambda *a, **k: fake)
+    try:
+        # Step 1: credentials are accepted but VRChat demands a second factor.
+        first = b.login("someone", "hunter2")
+        check("first step asks for 2FA", first["status"] == "2fa", str(first))
+        check("methods reported", first.get("methods") == ["totp", "emailotp"], str(first))
+        check("a method is pre-selected", first.get("method") == "totp", str(first))
+        check("pending client stored", b._pending_api is fake)
+
+        # Step 2: the code is submitted. This is the call that used to raise.
+        second = b.login("someone", "hunter2", "123456", "totp")
+        check("second step logs in", second["status"] == "ok", str(second))
+        check("code submitted", fake.verified == "123456", fake.verified)
+        check("method submitted", fake.method == "totp", fake.method)
+        check("token adopted", b.api is fake and fake.token == "authCookie_2fa")
+        check("token persisted", b.settings.get("auth_token") == "authCookie_2fa",
+              str(b.settings.get("auth_token")))
+        check("username persisted", b.settings.get("auth_username") == "someone")
+        check("pending state cleared",
+              b._pending_api is None and b._pending_2fa_methods == []
+              and b._pending_2fa_method == "",
+              f"{b._pending_api} {b._pending_2fa_methods} {b._pending_2fa_method}")
+    finally:
+        setattr(backend_module, "VRCApi", original)
+
+
+def test_login_reports_bad_credentials() -> None:
+    """The non-2FA failure path still works, and leaves no pending client."""
+    from api import AuthError
+
+    b = _isolated_backend()
+
+    class FailingApi:
+        token = ""
+
+        def login(self, username: str, password: str) -> dict:
+            raise AuthError("Username or password is incorrect")
+
+    import backend as backend_module
+    original = backend_module.VRCApi
+    setattr(backend_module, "VRCApi", lambda *a, **k: FailingApi())
+    try:
+        res = b.login("someone", "wrong")
+        check("bad credentials reported", res["status"] == "error", str(res))
+        check("message surfaced", "incorrect" in res["message"], res["message"])
+        check("no pending client left", b._pending_api is None)
+        check("still not logged in", not b.api.is_logged_in())
+    finally:
+        setattr(backend_module, "VRCApi", original)
+
+
+def test_login_rejects_a_wrong_2fa_code() -> None:
+    """A rejected code reports cleanly instead of stranding the pending client."""
+    from api import ApiError
+
+    b = _isolated_backend()
+
+    class PendingApi:
+        token = ""
+
+        def verify_2fa(self, code: str, method: str = "totp") -> dict:
+            raise ApiError("Invalid two-factor code")
+
+    b._pending_api = PendingApi()
+    b._pending_2fa_methods = ["totp"]
+    b._pending_2fa_method = "totp"
+
+    res = b.login("someone", "hunter2", "000000", "totp")
+    check("wrong code reported", res["status"] == "error", str(res))
+    check("message surfaced", "Invalid" in res["message"], res["message"])
+    check("pending client cleared", b._pending_api is None)
+    check("still not logged in", not b.api.is_logged_in())
+
+
+def test_login_requires_credentials() -> None:
+    b = _isolated_backend()
+    check("empty form rejected",
+          b.login("", "")["status"] == "error", str(b.login("", "")))
+    check("no credentials stored", not b.api.is_logged_in())
+
+
 def test_entry_index_stays_consistent() -> None:
     """The id index must never go stale, or lookups silently miss entries."""
     b = _isolated_backend()
@@ -1817,6 +1936,10 @@ def main() -> int:
         test_wear_confirms_or_reports_failure,
         test_import_vrchat_favourites,
         test_import_vrchat_requires_login,
+        test_login_with_two_factor,
+        test_login_reports_bad_credentials,
+        test_login_rejects_a_wrong_2fa_code,
+        test_login_requires_credentials,
         test_entry_index_stays_consistent,
         test_save_all_logs_is_not_quadratic,
         test_api_rate_limit_backoff,

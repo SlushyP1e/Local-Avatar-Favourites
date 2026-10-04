@@ -443,7 +443,13 @@ def prune_thumbs(keep: set[str], max_files: int = 2000,
             survivors.append(path)
             continue
         try:
-            if now - path.stat().st_mtime < grace_seconds:
+            # `now` is captured once above, before any stat() call, so for a
+            # file written moments ago the subtraction comes out negative -- and
+            # a negative age is always "< grace_seconds", which would spare the
+            # file even when the caller asked for no grace at all. Testing the
+            # grace itself makes 0 mean 0. A genuinely future mtime is still
+            # spared, because that only happens for a file being written now.
+            if grace_seconds > 0 and now - path.stat().st_mtime < grace_seconds:
                 survivors.append(path)
                 continue
         except OSError:
