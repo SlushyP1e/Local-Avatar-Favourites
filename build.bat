@@ -70,7 +70,11 @@ if errorlevel 1 goto :err
 
 echo.
 echo Smoke-testing the executable...
-"%PYTHON%" app\main.py --selftest
+REM The built exe, not the source. This is a GUI-subsystem binary (console=False),
+REM so batch would not wait on it and errorlevel would belong to the launch, not
+REM to the self-test. Go through Python's subprocess, which waits and captures
+REM output, so a stale bundle fails the build instead of shipping.
+"%PYTHON%" -c "import pathlib,subprocess,sys; p=subprocess.run([str(pathlib.Path('dist')/'LocalAvatarFavourites.exe'),'--selftest'],capture_output=True,text=True); sys.stdout.write(p.stdout or ''); sys.stderr.write(p.stderr or ''); sys.exit(p.returncode)"
 if errorlevel 1 goto :stale
 
 echo.
@@ -80,8 +84,10 @@ exit /b 0
 
 :stale
 echo.
-echo The executable failed its self-test. If it reports a stale stylesheet,
-echo delete the build\ directory and run this script again.
+echo The executable failed its self-test.
+echo If it reports a stale stylesheet, delete the build\ directory and run again.
+echo If it reports a missing module, the spec's datas or hiddenimports are out
+echo of date relative to the code.
 pause
 exit /b 1
 

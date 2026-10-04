@@ -28,6 +28,7 @@ from osc import OSCBridge
 from version import __version__
 from versions import is_newer
 from vrcache import VRCacheWatcher
+from vrcdetails import DEFAULT_AVATAR_IDS, is_default_avatar, is_default_avatar_name
 from vrclog import VRCLogWatcher
 
 RELEASES_API = "https://api.github.com/repos/SlushyP1e/Local-Avatar-Favourites/releases/latest"
@@ -122,6 +123,10 @@ class Backend:
         self.log: list[dict] = storage.load_log()
         self.changes: list[dict] = storage.load_changes()
         self.settings: dict = storage.load_settings()
+        # Runs regardless of start_services: it is pure data hygiene over
+        # already-loaded state, and doing it here rather than on the background
+        # prune thread means the UI never renders a default avatar at all.
+        self.prune_defaults()
         self.api = VRCApi(self.settings.get("auth_token", ""))
         self.osc = OSCBridge(
             send_ip=self.settings.get("osc_send_ip", "127.0.0.1"),
@@ -249,9 +254,16 @@ class Backend:
         avatar change arrives twice in normal operation, once over OSC and once
         via the log file, with different timestamps, so the old exact comparison
         counted every change twice.
+
+        VRChat's built-in default avatars are dropped before anything else
+        touches them. Robot and Unity-chan are wearable, so the moment anyone in
+        an instance wears one it lands in VRChat's cache and reaches us like any
+        other discovery. There is no way to clone a default and no metadata
+        worth fetching, so they were pure noise -- but worse than noise, because
+        they looked like real findings and could be saved by mistake.
         """
         avatar_id = (avatar_id or "").strip().lower()
-        if not avatar_id:
+        if not avatar_id or is_default_avatar(avatar_id):
             return False
         stamp = when or storage.now_iso()
         bucket = stamp[:16]
@@ -289,6 +301,11 @@ class Backend:
         avatar = (avatar or "").strip()
         if not player or not avatar:
             return False
+        # These rows carry a name and no id -- VRChat only logs the name for
+        # remote players -- so the name is the sole thing available to match.
+        # Exact match, so a community avatar called "Robot Deluxe" survives.
+        if is_default_avatar_name(avatar):
+            return False
         stamp = when or storage.now_iso()
         with self._lock:
             entry = next((e for e in self.changes
@@ -324,6 +341,38 @@ class Backend:
         with self._lock:
             return [dict(entry) for entry in self.entries]
 
+    def prune_defaults(self) -> tuple[int, int]:
+        """Drop VRChat's built-in default avatars from the stored logs.
+
+        Called once at start-up, because the filter in :meth:`_record_log` and
+        :meth:`_record_change` only stops *new* rows. Without this, an install
+        that has been running for a while keeps every default it already
+        collected -- on one real install, 11 avatar rows and 12 player-change
+        rows -- and the user has no way to tell which are stale without
+        deleting the whole log by hand.
+
+        Returns (avatars removed, player changes removed).
+        """
+        removed_logs = 0
+        removed_changes = 0
+        with self._lock:
+            if self.log:
+                kept = [e for e in self.log if not is_default_avatar(e.get("id"))]
+                removed_logs = len(self.log) - len(kept)
+                if removed_logs:
+                    self.log = kept
+                    storage.save_log(self.log)
+                    self._touch("logs")
+            if self.changes:
+                kept_changes = [c for c in self.changes
+                                if not is_default_avatar_name(c.get("avatar"))]
+                removed_changes = len(self.changes) - len(kept_changes)
+                if removed_changes:
+                    self.changes = kept_changes
+                    storage.save_changes(self.changes)
+                    self._touch("changes")
+        return removed_logs, removed_changes
+
     # ------------------------------------------------------------------ state
     def get_state(self, revs: dict | None = None) -> dict:
         revs = revs if isinstance(revs, dict) else None
@@ -340,7 +389,7 @@ class Backend:
                 "username": self.settings.get("auth_username", ""),
                 "pending_2fa": self._pending_api is not None,
                 "revs": dict(self._revs),
-"discovery": self.discovery_state(),
+                "discovery": self.discovery_state(),
                 "job": self._jobs.active(),
                 "motion": self.settings.get("motion", storage.DEFAULT_MOTION),
                 "tray": bool(getattr(self, "_tray", None)),
@@ -385,6 +434,10 @@ class Backend:
             "sources": status,
             "backlog": self._cache.backlog_size(),
             "db_path": str(self._cache.db_path),
+            # Reported so the filter is visible rather than mysterious. A log
+            # that quietly omits rows reads as broken; one that says what it
+            # ignored reads as working.
+            "defaults": len(DEFAULT_AVATAR_IDS),
         }
 
     def get_backlog(self, limit: int = 60, offset: int = 0) -> dict:
@@ -653,7 +706,8 @@ class Backend:
         with self._lock:
             for log_entry in list(self.log):
                 avatar_id = log_entry.get("id")
-                if not avatar_id or log_entry.get("private") or self._entry(avatar_id):
+                if (not avatar_id or log_entry.get("private") or self._entry(avatar_id)
+                        or is_default_avatar(avatar_id)):
                     continue
                 entry = storage.new_entry(avatar_id)
                 if log_entry.get("name"):

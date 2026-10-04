@@ -126,11 +126,129 @@ def test_vrclog_parse() -> None:
     check("vrclog switch parse", len(events) == 1 and events[0]["type"] == "avatar-change"
           and events[0]["player"] == "Bob" and events[0]["avatar"] == "Cool Avatar")
 
-    id_events: list[dict] = []
+    # Regression: the id test used to be a bare "avtr_... loaded" line, which
+    # passed only because every id on every line was harvested. The parser now
+    # matches an allowlist of real discovery lines, so the fixture has to name
+    # one -- otherwise this test would keep passing against a parser that
+    # returns nothing at all.
+    for label, line in (
+        ("saving", "2024.01.02 03:04:05 Debug - Saving Avatar Data:"
+                   "avtr_12345678-1234-1234-1234-123456789abc"),
+        ("loading", "2024.01.02 03:04:05 Debug - Loading Avatar Data:"
+                    "avtr_12345678-1234-1234-1234-123456789abc"),
+        ("login dump", "2024.01.02 03:04:05 Debug - User Authenticated: Someone\n"
+                       "- avatar: avtr_12345678-1234-1234-1234-123456789abc"),
+    ):
+        id_events: list[dict] = []
+        vrclog.VRCLogWatcher._parse_line(line, id_events)
+        check(f"vrclog id parse ({label})", len(id_events) == 1
+              and id_events[0]["type"] == "avatar-id"
+              and id_events[0]["id"] == "avtr_12345678-1234-1234-1234-123456789abc",
+              str(id_events))
+
+
+def test_vrclog_ignores_noise_lines() -> None:
+    """Lines that name an avatar id without the avatar being available.
+
+    Measured on a real 145k-line log set, these four shapes accounted for 625 of
+    the 808 id-bearing lines. The 404s alone outnumbered real discoveries 2.7:1
+    and were the highest-count rows in the log. They are reproduced here
+    verbatim in shape, because the whole point is that the parser recognises
+    them as noise rather than as findings.
+    """
+    import vrclog
+
+    aid = "avtr_0fc33a74-b8ff-4e27-9b7d-c15b03d3d07e"
+    noise = {
+        "api 404": (f"2026.10.04 16:20:24 Error      -  [API] [202, 404, Get, -1 "
+                    f"https://api.vrchat.cloud/api/1/avatars/{aid}]       Abandoning "
+                    f"request, because - Avatar Not Found"),
+        "thumbnail url": ("2026.10.05 01:07:34 Debug      -  [Image Download] Attempting to "
+                          f"load image from URL 'https://assets.vrchat.com/content-home-upload"
+                          f"/Home/{aid}.png'"),
+        "missing image": (f"2026.10.05 01:07:34 Error      -  Target is empty: "
+                          f"KeyDoesNotExist https://assets.vrchat.com/content-home-upload"
+                          f"/Home/{aid}.png"),
+        "failed download": (f"2026.10.04 16:20:37 Error      -  "
+                            f"[AssetBundleDownloadManager] Avatar '{aid}' did not pass "
+                            f"initial checks and won't be downloaded: "
+                            f"AssetBundleFailedServerSideChecks"),
+    }
+    for label, line in noise.items():
+        events: list[dict] = []
+        vrclog.VRCLogWatcher._parse_line(line, events)
+        check(f"vrclog ignores {label}", events == [], str(events))
+
+    # And the neighbouring real shape must still parse, or the test above would
+    # pass for the wrong reason.
+    events = []
     vrclog.VRCLogWatcher._parse_line(
-        "2024.01.02 03:04:05 Log - avtr_12345678-1234-1234-1234-123456789abc loaded", id_events)
-    check("vrclog id parse", len(id_events) == 1 and id_events[0]["type"] == "avatar-id"
-          and id_events[0]["id"].startswith("avtr_"))
+        f"2026.10.04 16:20:24 Debug      -  Saving Avatar Data:{aid}", events)
+    check("vrclog still accepts a real line", len(events) == 1, str(events))
+
+
+def test_default_avatar_list() -> None:
+    """The curated default-avatar data has to stay well-formed.
+
+    This cannot check that the ids are the *right* ones -- a wrong-but-valid
+    UUID would pass every assertion here and silently fail to filter. What it
+    can do is pin the format and a few sentinels, so a bad edit to the generated
+    file is caught rather than shipped.
+    """
+    import re
+
+    import vrcdetails
+
+    pattern = re.compile(
+        r"avtr_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    check("default ids are non-empty", len(vrcdetails.DEFAULT_AVATAR_IDS) > 200,
+          str(len(vrcdetails.DEFAULT_AVATAR_IDS)))
+    malformed = [i for i in vrcdetails.DEFAULT_AVATAR_IDS
+                 if not pattern.fullmatch(i)]
+    check("every default id is well formed", not malformed, str(malformed[:5]))
+    check("default ids are lowercase",
+          all(i == i.lower() for i in vrcdetails.DEFAULT_AVATAR_IDS))
+    check("default names are case folded",
+          all(n == n.casefold() for n in vrcdetails.DEFAULT_AVATAR_NAMES))
+
+    # Sentinels spanning every source table, including the community-authored
+    # defaults that an authorName == "VRChat" check would have missed.
+    for label, avatar_id in (
+        ("Robot", "avtr_c38a1615-5bf5-42b4-84eb-a8b6c37cbd11"),
+        ("Unity-chan", "avtr_712e5c3c-2deb-4cae-a414-79b2a814a90b"),
+        ("Papyrus", "avtr_c0d0b0ac-3a29-4f5a-a6d4-3ef3c24c6d75"),
+        ("Alien Rabbit", "avtr_8c2625bb-9234-40d8-92f2-e7da98fb556b"),
+        ("Protogen Kuro", "avtr_faf40a9f-ce39-4ff2-a069-223797ba11af"),
+        ("Sand sculpture protogen", "avtr_41357a9c-b1c8-43ef-a34f-5a5ddaaa29c8"),
+        ("VRRat", "avtr_26187637-0c30-4a09-86e1-bc928c07309e"),
+    ):
+        check(f"default list contains {label}",
+              vrcdetails.is_default_avatar(avatar_id), avatar_id)
+
+    check("an ordinary id is not a default",
+          not vrcdetails.is_default_avatar("avtr_32611e23-2508-4cbf-accb-b8625e37f546"))
+    check("default id match ignores case and padding",
+          vrcdetails.is_default_avatar("  AVTR_C38A1615-5BF5-42B4-84EB-A8B6C37CBD11  "))
+    check("default id match rejects non-strings",
+          not vrcdetails.is_default_avatar(123) and not vrcdetails.is_default_avatar(None))
+
+
+def test_default_avatar_name_matching() -> None:
+    """Name matching on the player-changes tab is exact, never substring."""
+    import vrcdetails
+
+    for name in ("Robot", "Unity-chan", "Papyrus", "VRRat", "［Protogen］Kuro"):
+        check(f"default name matches {name}", vrcdetails.is_default_avatar_name(name))
+    check("default name match ignores case and padding",
+          vrcdetails.is_default_avatar_name("  rObOt  "))
+
+    # The false-positive risk of matching on names alone. "Fallback" is a real
+    # user avatar by Nolando that players pick as their Quest fallback -- it is
+    # not a VRChat default and must survive.
+    for name in ("Fallback", "FallBack", "Robot Deluxe", "Papyrus Mark II",
+                 "X-Bot 3000", "", None, 42):
+        check(f"not a default name: {name!r}",
+              not vrcdetails.is_default_avatar_name(name))
 
 
 def test_update_compare() -> None:
@@ -636,6 +754,134 @@ def test_log_dedupe_persisted() -> None:
     check("legacy entry has no bucket", "seen_bucket" not in b.log[0])
     check("legacy entry is counted again", b._record_log(avatar_id) is True)
     check("legacy count incremented", b.log[0]["count"] == 5, str(b.log[0]))
+
+
+DEFAULT_ROBOT = "avtr_c38a1615-5bf5-42b4-84eb-a8b6c37cbd11"
+DEFAULT_KURO = "avtr_faf40a9f-ce39-4ff2-a069-223797ba11af"
+ORDINARY_ID = "avtr_32611e23-2508-4cbf-accb-b8625e37f546"
+
+
+def test_defaults_are_never_recorded() -> None:
+    """A built-in default must not become a log entry at all.
+
+    Not "recorded but hidden": dropped before anything is written, so it never
+    reaches avatar_log.json, never consumes one of the 800 capped slots, and
+    never appears to be a finding the user could save.
+    """
+    b = _isolated_backend()
+
+    check("default avatar id rejected", b._record_log(DEFAULT_ROBOT, source="cache-db") is False)
+    check("default avatar id rejected (community-authored)",
+          b._record_log(DEFAULT_KURO, source="log") is False)
+    check("nothing written to the log", b.log == [], str(b.log))
+    check("nothing persisted", storage.load_log() == [], str(storage.load_log()))
+
+    check("ordinary avatar still recorded",
+          b._record_log(ORDINARY_ID, source="cache-db") is True)
+    check("exactly one entry", len(b.log) == 1, str(b.log))
+
+    # An existing entry for a default must not have its count inflated either.
+    # The early return sits above the de-duplication scan specifically so that a
+    # default worn repeatedly cannot grow a row that should not exist.
+    b._record_log(DEFAULT_ROBOT, when="2026-01-01 00:00:00+00:00")
+    b._record_log(DEFAULT_ROBOT, when="2026-06-01 12:00:00+00:00")
+    check("no default row appeared", len(b.log) == 1, str(b.log))
+    check("ordinary row untouched", b.log[0]["id"] == ORDINARY_ID and b.log[0]["count"] == 1,
+          str(b.log[0]))
+
+
+def test_defaults_are_not_recorded_as_player_changes() -> None:
+    """The player-changes tab only has a name, so it matches on the name."""
+    b = _isolated_backend()
+
+    check("default name rejected", b._record_change("SomePlayer", "Robot") is False)
+    check("default name rejected, cased differently",
+          b._record_change("SomePlayer", "robot") is False)
+    check("no change rows", b.changes == [], str(b.changes))
+
+    # Regression guard for the substring-matching failure mode. "Fallback" is a
+    # real uploaded avatar that players select as their Quest fallback; treating
+    # it as a default because it looks default-ish would silently hide it.
+    check("Fallback is kept", b._record_change("Mrblok 75a0", "Fallback") is True)
+    check("a longer name is kept", b._record_change("Someone", "Robot Deluxe") is True)
+    check("two change rows kept", len(b.changes) == 2, str(b.changes))
+
+
+def test_defaults_are_pruned_on_start() -> None:
+    """The filter only stops new rows; a log written before it must be cleaned.
+
+    Without this an install that has run for a while keeps every default it
+    already collected, with no way to tell them from real findings short of
+    deleting the entire log.
+    """
+    stamp = "2026-10-05T01:07:34+11:00"
+
+    # Seed into the isolated directory this backend owns. _isolated_backend()
+    # repoints the storage module at a fresh temp dir on every call, so writing
+    # before constructing it would land in the *previous* test's directory.
+    from backend import Backend
+
+    b = _isolated_backend()
+    storage.save_log([
+        {"id": DEFAULT_ROBOT, "name": "Robot", "first_seen": stamp, "last_seen": stamp,
+         "count": 3, "private": False, "source": "log"},
+        {"id": ORDINARY_ID, "name": "Keep Me", "first_seen": stamp, "last_seen": stamp,
+         "count": 1, "private": False, "source": "cache-db"},
+        {"id": DEFAULT_KURO, "name": "", "first_seen": stamp, "last_seen": stamp,
+         "count": 1, "private": False, "source": "log"},
+    ])
+    storage.save_changes([
+        {"player": "bray201333 eb31", "avatar": "Robot", "first_seen": stamp,
+         "last_seen": stamp, "count": 4},
+        {"player": "CoHayOh", "avatar": "256PolyKikyo", "first_seen": stamp,
+         "last_seen": stamp, "count": 30},
+    ])
+
+    # A second Backend over the same on-disk state: exactly what a relaunch
+    # does, and the only way to observe the prune that __init__ performs.
+    b2 = Backend(start_services=False, cache=b._cache)
+    check("defaults removed from the log", len(b2.log) == 1, str(b2.log))
+    check("the ordinary avatar survived", b2.log[0]["id"] == ORDINARY_ID, str(b2.log[0]))
+    check("default change rows removed", len(b2.changes) == 1, str(b2.changes))
+    check("the ordinary change survived",
+          b2.changes[0]["avatar"] == "256PolyKikyo", str(b2.changes[0]))
+
+    # Pruned on disk too, not just in memory, or the next launch re-prunes and
+    # reports it again.
+    check("prune persisted", len(storage.load_log()) == 1, str(storage.load_log()))
+    check("change prune persisted", len(storage.load_changes()) == 1,
+          str(storage.load_changes()))
+
+    # Idempotent: a second pass must not remove anything or bump revs.
+    logs_rev, changes_rev = b2._revs["logs"], b2._revs["changes"]
+    removed = b2.prune_defaults()
+    check("second prune is a no-op", removed == (0, 0), str(removed))
+    check("second prune does not touch revs",
+          (b2._revs["logs"], b2._revs["changes"]) == (logs_rev, changes_rev))
+
+
+def test_save_all_skips_defaults() -> None:
+    """Defence in depth: a default must not be promoted even if one is present.
+
+    _record_log cannot create a default row and the start-up prune removes any
+    that exist, so this path is only reachable by hand-editing avatar_log.json.
+    It is still worth pinning, because save_all_logs is the one action that
+    writes to the favourites list without asking per row.
+    """
+    b = _isolated_backend()
+    stamp = "2026-10-05T01:07:34+11:00"
+    # Assign directly, bypassing the filter, to simulate a log written by an
+    # older version of the app.
+    b.log = [
+        {"id": DEFAULT_ROBOT, "name": "Robot", "first_seen": stamp, "last_seen": stamp,
+         "count": 1, "private": False, "source": "log"},
+        {"id": ORDINARY_ID, "name": "", "first_seen": stamp, "last_seen": stamp,
+         "count": 1, "private": False, "source": "log"},
+    ]
+    result = b.save_all_logs()
+    check("only the ordinary avatar saved", result.get("added") == 1, str(result))
+    check("favourites hold the ordinary id",
+          [e["id"] for e in b.entries] == [ORDINARY_ID], str(b.entries))
 
 
 def test_expired_token_is_not_private() -> None:
@@ -1531,6 +1777,9 @@ def main() -> int:
         test_api_helpers,
         test_api_image_download_guards,
         test_vrclog_parse,
+        test_vrclog_ignores_noise_lines,
+        test_default_avatar_list,
+        test_default_avatar_name_matching,
         test_update_compare,
         test_vrcache_pattern,
         test_vrcache_db_path,
@@ -1543,6 +1792,10 @@ def main() -> int:
         test_vrcache_locked_database,
         test_log_dedupe_across_sources,
         test_log_dedupe_persisted,
+        test_defaults_are_never_recorded,
+        test_defaults_are_not_recorded_as_player_changes,
+        test_defaults_are_pruned_on_start,
+        test_save_all_skips_defaults,
         test_expired_token_is_not_private,
         test_osc_settings_not_persisted_on_failure,
         test_discovery_state_reported,

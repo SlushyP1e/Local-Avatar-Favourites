@@ -728,6 +728,13 @@ function renderDiscovery() {
   }
   let text = parts.join(" · ");
   if (backlog) text += "  ·  " + backlog.toLocaleString() + " ids seen all-time";
+  // Name what is being suppressed. VRChat's built-in defaults are wearable, so
+  // they reach the log scanner like any other finding; saying they are filtered
+  // is the difference between "working" and "quietly broken".
+  const defaults = (state.discovery && state.discovery.defaults) || 0;
+  if (defaults) {
+    text += "  ·  " + defaults.toLocaleString() + " default avatars ignored";
+  }
   el.textContent = text;
   const down = SOURCE_ORDER.some((k) => ["missing", "unsupported", "unreadable"].includes(sources[k]));
   el.classList.toggle("warn-text", down);

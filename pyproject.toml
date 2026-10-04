@@ -35,6 +35,11 @@ src = ["app"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "C4"]
+# VRChat avatars are named by their creators, including in fullwidth punctuation.
+# ［Protogen］Kuro is that avatar's real name, not a typo, and it has to match the
+# name VRChat prints in its log or the player-change filter silently stops working
+# for it. These are data, not prose, so they stay as-is.
+allowed-confusables = ["［", "］"]
 ignore = [
     "E501",    # line length is handled by the formatter
     "RUF012",  # mutable class attrs need ClassVar annotations we do not use
@@ -47,7 +52,7 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["api", "backend", "osc", "storage", "version", "versions",
-                     "vrcache", "vrclog"]
+                     "vrcache", "vrcdetails", "vrclog"]
 
 [tool.mypy]
 python_version = "3.11"

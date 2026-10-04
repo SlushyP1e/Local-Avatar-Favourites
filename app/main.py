@@ -23,6 +23,12 @@ from backend import Backend
 from tray import TrayIcon
 from tray import available as tray_available
 from version import __version__
+from vrcdetails import (
+    DEFAULT_AVATAR_IDS,
+    DEFAULT_AVATAR_NAMES,
+    is_default_avatar,
+    is_default_avatar_name,
+)
 
 APP_TITLE = "Local Avatar Favourites"
 TRAY_IDLE = 0.0
@@ -174,11 +180,39 @@ def main() -> int:
             print(f"  css            : {len(css)} bytes, "
                   f"{'all markers present' if not missing else 'MISSING ' + ', '.join(missing)}")
 
+        # The curated default-avatar list ships inside the frozen bytecode
+        # archive, so it cannot be probed for like a data file. Import it and
+        # assert the sentinels are actually filterable: a bundle that somehow
+        # lost or truncated the module would silently stop filtering defaults
+        # and look exactly like the feature being broken.
+        filter_ok = (
+            len(DEFAULT_AVATAR_IDS) > 200
+            and is_default_avatar("avtr_c38a1615-5bf5-42b4-84eb-a8b6c37cbd11")
+            and is_default_avatar_name("robot")
+            and not is_default_avatar_name("Fallback")
+        )
+        print(f"  default filter : {len(DEFAULT_AVATAR_IDS)} ids, "
+              f"{len(DEFAULT_AVATAR_NAMES)} names, "
+              f"{'operational' if filter_ok else 'BROKEN'}")
+
+        # Backend.__init__ already pruned, so this reports what survived rather
+        # than re-pruning. Non-zero here would mean a default got through.
+        remaining = sum(1 for e in backend.log if is_default_avatar(e.get("id")))
+        remaining += sum(1 for c in backend.changes
+                         if is_default_avatar_name(c.get("avatar")))
+        print(f"  defaults in log: {remaining} (0 expected)")
+
         if icon and not os.path.exists(icon):
             print("  tray icon file : MISSING")
             return 1
         if missing:
             print("  ERROR: bundled stylesheet is stale -- rebuild with --clean")
+            return 1
+        if not filter_ok:
+            print("  ERROR: curated default-avatar list missing or unusable in this bundle")
+            return 1
+        if remaining:
+            print(f"  ERROR: {remaining} default avatars survived the filter")
             return 1
         return 0
 

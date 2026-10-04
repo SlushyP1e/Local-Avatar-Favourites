@@ -431,3 +431,71 @@ test("cardSub prefers author, then platforms, then tags, then id", () => {
   assert.equal(app.cardSub({ id: "x", tags: ["a", "b"] }), "#a  #b");
   assert.equal(app.cardSub({ id: "avtr_x" }), "avtr_x");
 });
+
+// ---------------------------------------------------------------------------
+// discovery line
+// ---------------------------------------------------------------------------
+
+test("discovery states how many default avatars are ignored", () => {
+  // Robot, Unity-chan and the rest are filtered out silently, which is
+  // indistinguishable from a broken source unless the UI says so.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const el = env.document.getElementById("discovery-state");
+
+  app.state = {
+    ...app.state,
+    discovery: {
+      sources: { "cache-db": "ok", amplitude: "empty", log: "ok" },
+      backlog: 22670,
+      db_path: "C:/somewhere/avatars.sqlite",
+      defaults: 257,
+    },
+  };
+  app.renderDiscovery();
+
+  assert.match(el.textContent, /local cache/);
+  assert.match(el.textContent, /ids seen all-time/);
+  assert.match(el.textContent, /257 default avatars ignored/);
+  // A healthy source must not be painted as a warning.
+  assert.ok(!el.classList.contains("warn-text"));
+});
+
+test("discovery omits the defaults count when the backend sends none", () => {
+  // Guards against a stale build: an older backend has no `defaults` key, and
+  // rendering "undefined default avatars ignored" would look like a bug.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const el = env.document.getElementById("discovery-state");
+
+  app.state = {
+    ...app.state,
+    discovery: { sources: { "cache-db": "ok" }, backlog: 0, db_path: "" },
+  };
+  app.renderDiscovery();
+
+  assert.match(el.textContent, /local cache/);
+  assert.ok(!/default avatars/.test(el.textContent), el.textContent);
+});
+
+test("discovery still flags a source that is unavailable", () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const el = env.document.getElementById("discovery-state");
+
+  app.state = {
+    ...app.state,
+    discovery: {
+      sources: { "cache-db": "ok", amplitude: "missing", log: "ok" },
+      backlog: 0,
+      db_path: "",
+      defaults: 257,
+    },
+  };
+  app.renderDiscovery();
+
+  assert.match(el.textContent, /live feed unavailable/);
+  assert.match(el.textContent, /257 default avatars ignored/);
+  assert.ok(el.classList.contains("warn-text"),
+    "an unavailable source must still be highlighted");
+});

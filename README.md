@@ -91,8 +91,56 @@ and a **Save** button that promotes one into your favourites. The current source
 status is always shown next to the log count, so a degraded source is visible
 rather than looking like "nothing new".
 
+The text log is scanned for IDs, but only from the handful of lines that mean an
+avatar is genuinely available to you. VRChat mentions avatar IDs in a lot of
+places that have nothing to do with that, and harvesting all of them was the
+single largest source of clutter: across a real 145,000-line log set, 625 of the
+808 ID-bearing lines were noise.
+
+| Line | Ignored because |
+| --- | --- |
+| `[API] … Avatar Not Found` | The avatar does not exist. 442 lines, and the highest-count rows in the log. |
+| `[Image Download] … /Home/avtr_….png` | A thumbnail URL for VRChat's own shop page, not a download. 120 lines. |
+| `Target is empty: KeyDoesNotExist` | A failed image fetch. 60 lines. |
+| `Avatar '<id>' did not pass initial checks` | The download was rejected. 3 lines. |
+
+Only `Saving Avatar Data:`, `Loading Avatar Data:` and your own login dump's
+avatar field are treated as discoveries. This also removed every built-in default
+avatar from the log on its own — they were arriving on thumbnail URL lines, not
+being downloaded.
+
 > The cache database starts empty. It is populated over time as you play, and it
 > is also where other avatar-tracking tools record what they have seen.
+
+### Default avatars are ignored
+
+VRChat ships ~257 built-in default avatars — Robot, Unity-chan, Alien Rabbit,
+Papyrus, ［Protogen］Kuro, Sand sculpture protogen — in the Public and Legacy
+rows of its avatar shop. They are real, wearable avatars, so the moment anyone
+in an instance wears one it reaches the log scanner exactly like a genuine
+discovery. They cannot be cloned and there is no metadata worth fetching, so
+they are filtered out before anything is written to disk. The count of ignored
+avatars is always shown on the log toolbar.
+
+There is no API flag for this. `get_avatar` reports an author, but filtering on
+`authorName == "VRChat"` catches only 76 of the 257 and misses the
+community-authored ones, which are most of the noise. The list in
+`app/vrcdetails.py` is therefore curated from the
+[VRChat wiki](https://wiki.vrchat.com/wiki/Public_Avatars) and matched offline.
+VRChat adds defaults over time, so it needs refreshing when the wiki gains rows
+— it will never filter something that is not a default, only fail to filter a
+new one.
+
+Two things are matched on **name** rather than ID, because the Player changes
+tab is fed by VRChat's `[Behaviour] Switching <player> to avatar <name>` lines,
+which carry no ID at all. Matching there is exact and case-insensitive, so a
+community avatar called *Robot Deluxe* survives while *Robot* does not. Note
+that *Fallback* is **not** a default — it is an uploaded avatar that players
+select as their Quest fallback.
+
+Two entries on that wiki page are deliberately missing from the list because
+they carry no avatar ID to match on: *Neri* links to a user page rather than an
+avatar page, and *Simple Fox* is marked `[AVATAR DELETED]`.
 
 ### Privacy
 
@@ -217,6 +265,7 @@ app/
   jobs.py       progress and cancellation for long bulk operations
   tray.py       Windows notification-area icon
   vrcache.py    layered local avatar-ID discovery (read-only)
+  vrcdetails.py curated list of VRChat's built-in default avatars
   vrclog.py     VRChat text-log tailer
   versions.py   semantic version comparison for the update check
   selftest.py   headless Python tests
