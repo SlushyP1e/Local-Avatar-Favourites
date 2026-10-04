@@ -153,6 +153,9 @@ python -m mypy
 rem run the app from source
 python app\main.py
 
+rem smoke-test a built executable (catches a broken bundle)
+dist\LocalAvatarFavourites.exe --selftest
+
 rem build a single-file exe (output: dist\LocalAvatarFavourites.exe)
 build.bat
 ```

@@ -33,6 +33,11 @@ let saveTimer = null;
 const thumbCache = {};    // id -> data URI
 const thumbKey = {};      // id -> thumb filename currently cached
 const thumbPending = {};  // id -> true
+// Base64 thumbnails are held in the webview for the session. With hundreds of
+// avatars that is tens of megabytes, so the cache is capped and the oldest
+// entries evicted once it is full.
+const THUMB_CACHE_MAX = 200;
+const thumbOrder = [];
 
 const VIEW_TITLES = {
   home: "Avatars",
@@ -223,9 +228,28 @@ function placeholderDataUri(name) {
   return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
 }
 
+function cacheThumb(id, key, src) {
+  if (!(id in thumbCache)) thumbOrder.push(id);
+  thumbCache[id] = src;
+  thumbKey[id] = key;
+  while (thumbOrder.length > THUMB_CACHE_MAX) {
+    const evicted = thumbOrder.shift();
+    delete thumbCache[evicted];
+    delete thumbKey[evicted];
+  }
+}
+
 function ensureThumb(entry) {
   const id = entry.id;
-  if (entry.thumb && thumbKey[id] === entry.thumb && thumbCache[id]) return thumbCache[id];
+  if (entry.thumb && thumbKey[id] === entry.thumb && thumbCache[id]) {
+    // Refresh recency so the cards you are looking at are not the ones evicted.
+    const at = thumbOrder.indexOf(id);
+    if (at > 0) {
+      thumbOrder.splice(at, 1);
+      thumbOrder.push(id);
+    }
+    return thumbCache[id];
+  }
   if (entry.thumb && !thumbPending[id]) {
     thumbPending[id] = true;
     call("get_thumbnail", id).then((data) => {
@@ -235,8 +259,7 @@ function ensureThumb(entry) {
       // cached against the thumb name, the broken image never recovered.
       if (typeof data !== "string" || !data) return;
       if (data === thumbCache[id]) return;
-      thumbCache[id] = data;
-      thumbKey[id] = entry.thumb;
+      cacheThumb(id, entry.thumb, data);
       applyThumb(id);
     });
   }
@@ -1106,6 +1129,14 @@ function wire() {
   $("set-refresh-all").addEventListener("click", async () => {
     const res = await call("refresh_all_metadata");
     if (!res.ok && res.title) showAlert(res.title, res.message);
+  });
+  $("set-clean-thumbs").addEventListener("click", async () => {
+    const yes = await showConfirm("Clean thumbnails",
+      "Delete cached thumbnails that no longer belong to a favourite? " +
+      "Anything still in use is kept.");
+    if (!yes) return;
+    const res = await call("prune_thumbnails");
+    if (res && res.ok) toast(`${res.removed} thumbnail(s) removed.`);
   });
 
   document.querySelectorAll("[data-close]").forEach((btn) => {

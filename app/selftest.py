@@ -943,6 +943,70 @@ def test_api_rate_limit_backoff() -> None:
     check("throttle spaces requests", elapsed >= 0.14, f"{elapsed:.3f}s")
 
 
+def test_thumbnail_pruning() -> None:
+    """Cached images must not accumulate for ever."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        storage.THUMBS_DIR = root / "thumbs"
+        storage.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+
+        keep = "keep.png"
+        (storage.THUMBS_DIR / keep).write_bytes(b"x")
+        (storage.THUMBS_DIR / "orphan.png").write_bytes(b"x")
+        (storage.THUMBS_DIR / "nested").mkdir()
+
+        orphans, trimmed = storage.prune_thumbs({keep})
+        check("orphan removed", orphans == 1, str(orphans))
+        check("kept file survives", (storage.THUMBS_DIR / keep).exists())
+        check("orphan is gone", not (storage.THUMBS_DIR / "orphan.png").exists())
+        check("directories are left alone", (storage.THUMBS_DIR / "nested").is_dir())
+
+        # Ageing referenced files so mtime ordering is deterministic. These are all in
+# `keep`, so they survive the orphan pass and are only removed by the cap.
+        referenced = {keep} | {f"old{i}.png" for i in range(10)}
+        for index in range(10):
+            path = storage.THUMBS_DIR / f"old{index}.png"
+            path.write_bytes(b"x")
+            os.utime(path, (1_000_000 + index, 1_000_000 + index))
+
+        orphans, trimmed = storage.prune_thumbs(referenced, max_files=5)
+        check("referenced files are not orphans", orphans == 0, f"orphans={orphans}")
+        check("over-cap files trimmed", trimmed == 6, f"trimmed={trimmed}")
+        check("newest survivors kept", (storage.THUMBS_DIR / "old9.png").exists())
+        check("oldest trimmed away", not (storage.THUMBS_DIR / "old0.png").exists())
+        check("explicit keep survives trimming", (storage.THUMBS_DIR / keep).exists())
+        check("five files remain",
+              len([p for p in storage.THUMBS_DIR.iterdir() if p.is_file()]) == 5)
+
+        # delete_thumb refuses traversal and removes a real file.
+        check("delete_thumb rejects traversal", storage.delete_thumb("../escape.png") is False)
+        check("delete_thumb rejects absolute paths",
+              storage.delete_thumb(r"C:\Windows\win.ini") is False)
+        check("delete_thumb removes a real file", storage.delete_thumb(keep) is True)
+        check("file is gone", not (storage.THUMBS_DIR / keep).exists())
+        check("delete_thumb on a missing file", storage.delete_thumb(keep) is False)
+
+        remaining = storage.clear_thumbs()
+        check("clear_thumbs removes the rest", remaining == 4, str(remaining))
+        check("no thumbnail files remain",
+              not [p for p in storage.THUMBS_DIR.iterdir() if p.is_file()])
+        check("clear_thumbs on empty dir", storage.clear_thumbs() == 0)
+
+
+def test_delete_removes_thumbnail() -> None:
+    b = _isolated_backend()
+    avatar_id = "avtr_7a7a7a7a-1111-2222-3333-444444444444"
+    b.add_by_id(avatar_id)
+    entry = b._entry(avatar_id)
+    entry["thumb"] = "orphan-me.png"
+    storage.thumb_file_path(avatar_id).parent.mkdir(parents=True, exist_ok=True)
+    (storage.THUMBS_DIR / "orphan-me.png").write_bytes(b"x")
+
+    check("delete succeeds", b.delete(avatar_id)["ok"] is True)
+    check("thumbnail deleted with the favourite",
+          not (storage.THUMBS_DIR / "orphan-me.png").exists())
+
+
 def main() -> int:
     tests = [
         test_storage,
@@ -978,6 +1042,8 @@ def main() -> int:
         test_entry_index_stays_consistent,
         test_save_all_logs_is_not_quadratic,
         test_api_rate_limit_backoff,
+        test_thumbnail_pruning,
+        test_delete_removes_thumbnail,
     ]
     failed = 0
     for test in tests:

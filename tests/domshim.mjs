@@ -110,7 +110,7 @@ export function loadApp(env) {
 ; return {
   showConfirm, showAlert, openModal, closeModal, ensureThumb,
   scheduleSave, flushDraft, captureDraft, openDrawer, closeDrawer, call,
-  thumbCache, thumbKey, thumbPending, visibleEntries, cardSub, escapeHtml,
+  thumbCache, thumbKey, thumbPending, thumbOrder, visibleEntries, cardSub, escapeHtml,
   get pendingConfirm() { return pendingConfirm; },
   get draft() { return draft; },
   get selectedId() { return selectedId; },

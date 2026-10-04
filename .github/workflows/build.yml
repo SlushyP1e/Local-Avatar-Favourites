@@ -78,6 +78,19 @@ jobs:
       - name: Build executable
         run: python -m PyInstaller --noconfirm LocalAvatarFavourites.spec
 
+      # The spec excludes a long list of modules, so a bundle can build
+      # successfully and still be broken. This proved it: excluding 'bottle'
+      # produced an exe that died on startup at webview.http.
+      - name: Smoke-test the frozen bundle
+        run: |
+          .\dist\LocalAvatarFavourites.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "frozen bundle self-test failed" }
+
+      - name: Report size
+        run: |
+          $mb = [math]::Round((Get-Item dist\LocalAvatarFavourites.exe).Length / 1MB, 1)
+          "LocalAvatarFavourites.exe: $mb MB" | Tee-Object -FilePath dist/SIZE.txt
+
       - name: Checksum
         run: |
           python -c "import hashlib,pathlib;p=pathlib.Path('dist/LocalAvatarFavourites.exe');print(hashlib.sha256(p.read_bytes()).hexdigest(),p.name)" > dist/SHA256SUMS.txt

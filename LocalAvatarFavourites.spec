@@ -1,23 +1,67 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+"""PyInstaller spec for the single-file Windows executable.
 
-datas = [('app\\web', 'web')]
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('webview')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+The previous version called ``collect_all('webview')``, which walks every
+submodule and dependency of pywebview. That pulled in all of its platform
+backends (gtk, qt, cocoa, cef, android, mshtml) along with numpy, pygments,
+setuptools and bottle -- none of which can ever be used on Windows. pywebview
+already ships its own ``hook-webview`` hook, so the collection was both
+redundant and responsible for most of the 38 MB output.
 
+pythonnet / clr_loader / cryptography / cffi are deliberately NOT excluded:
+webview.platforms.winforms genuinely needs them.
+
+bottle is not excluded either: webview/__init__.py imports webview.http, which
+imports bottle. Excluding it produced an exe that failed at startup, which is
+what the --selftest flag below exists to catch.
+"""
+
+# Only the Windows backends are reachable.
+hiddenimports = [
+    'webview.platforms.winforms',
+    'webview.platforms.edgechromium',
+]
+
+excludes = [
+    # Bundled by the old collect_all, unreachable on Windows.
+    'numpy',
+    'pygments',
+    'setuptools',
+    'distutils',
+    'pytest',
+    'IPython',
+    'pyreadline3',
+    # Non-Windows webview backends, plus the GUI toolkits they need.
+    'webview.platforms.gtk',
+    'webview.platforms.qt',
+    'webview.platforms.cocoa',
+    'webview.platforms.cef',
+    'webview.platforms.android',
+    'webview.platforms.mshtml',
+    'gi',
+    'objc',
+    'AppKit',
+    'Foundation',
+    'WebKit',
+    'cefpython3',
+    'PyQt5',
+    'PyQt6',
+    'PySide2',
+    'PySide6',
+    'qtpy',
+    'tkinter',
+]
 
 a = Analysis(
     ['app\\main.py'],
     pathex=[],
-    binaries=binaries,
-    datas=datas,
+    binaries=[],
+    datas=[('app\\web', 'web')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excludes,
     noarchive=False,
     optimize=0,
 )
@@ -33,9 +77,9 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    # UPEX compression is a well-known source of antivirus false positives on
+    # freshly built unsigned executables. Measured cost is a few MB.
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,

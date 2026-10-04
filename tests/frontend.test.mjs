@@ -151,6 +151,42 @@ test("ensureThumb does nothing without a thumb name", async () => {
   assert.equal(calls, 0);
 });
 
+test("thumbnail cache is capped and evicts oldest first", async () => {
+  const total = 260;
+  const api = { get_thumbnail: async (id) => "data:image/png;base64," + id };
+  const { app } = setup(api);
+  for (let i = 0; i < total; i++) {
+    app.ensureThumb({ id: "avtr_" + i, thumb: "t" + i + ".png" });
+  }
+  await tick();
+
+  const cached = Object.keys(app.thumbCache).filter((k) => app.thumbCache[k]);
+  assert.ok(cached.length <= 200, `cache held ${cached.length}, expected <= 200`);
+  assert.equal(app.thumbOrder.length, cached.length,
+    "eviction order and cache must not drift apart");
+  assert.ok(app.thumbCache["avtr_" + (total - 1)], "newest thumbnail was evicted");
+  assert.equal(app.thumbCache["avtr_0"], undefined, "oldest thumbnail was not evicted");
+  // Everything evicted must also have dropped its key, or it can never reload.
+  assert.equal(app.thumbKey["avtr_0"], undefined, "evicted entry kept a stale thumbKey");
+});
+
+test("a cached thumbnail refreshes its recency", async () => {
+  const api = { get_thumbnail: async (id) => "src-" + id };
+  const { app } = setup(api);
+  // Fill past the cap so the early entries are gone.
+  for (let i = 0; i < 210; i++) app.ensureThumb({ id: "a" + i, thumb: "t" + i });
+  await tick();
+
+  // 210 insertions against a 200 cap evicts the first ten (a0..a9).
+  assert.equal(app.thumbCache["a9"], undefined, "precondition: a9 should be evicted");
+  assert.ok(app.thumbCache["a150"], "precondition: a150 should be cached");
+
+  const survivor = "a150";
+  for (let i = 0; i < 40; i++) app.ensureThumb({ id: survivor, thumb: "t150" });
+  assert.equal(app.thumbOrder[app.thumbOrder.length - 1], survivor,
+    "the touched entry should become most recent");
+});
+
 // ------------------------------------------------------------------- autosave
 
 test("closing the drawer flushes a pending edit", async () => {

@@ -381,3 +381,69 @@ def resolve_thumb(name) -> Path | None:
 
 def thumb_file_path(avatar_id: str, ext: str = "png") -> Path:
     return THUMBS_DIR / f"{sanitize_filename(avatar_id)}.{ext}"
+
+
+def delete_thumb(name) -> bool:
+    """Remove one cached thumbnail. Returns True when a file went away."""
+    path = resolve_thumb(name)
+    if path is None:
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def prune_thumbs(keep: set[str], max_files: int = 2000) -> tuple[int, int]:
+    """Drop thumbnails no longer referenced by a favourite.
+
+    Deletes orphaned files outright, then trims the cache by oldest-first so it
+    cannot grow without bound. Returns (orphans_removed, trimmed).
+    """
+    removed = 0
+    trimmed = 0
+    try:
+        files = [p for p in THUMBS_DIR.iterdir() if p.is_file()]
+    except OSError:
+        return 0, 0
+
+    survivors: list[Path] = []
+    for path in files:
+        if path.name in keep:
+            survivors.append(path)
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            survivors.append(path)
+
+    if len(survivors) > max_files:
+        try:
+            survivors.sort(key=lambda p: p.stat().st_mtime)
+        except OSError:
+            pass
+        for path in survivors[: len(survivors) - max_files]:
+            try:
+                path.unlink()
+                trimmed += 1
+            except OSError:
+                pass
+    return removed, trimmed
+
+
+def clear_thumbs() -> int:
+    """Delete every cached thumbnail. Returns how many were removed."""
+    removed = 0
+    try:
+        files = [p for p in THUMBS_DIR.iterdir() if p.is_file()]
+    except OSError:
+        return 0
+    for path in files:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed

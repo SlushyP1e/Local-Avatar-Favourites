@@ -134,7 +134,15 @@ class Backend:
                 pass
         self._stopped = False
         if start_services:
+            threading.Thread(target=self._prune_loop, daemon=True).start()
             threading.Thread(target=self._log_loop, daemon=True).start()
+
+    def _prune_loop(self) -> None:
+        # Give the UI a moment to come up before touching the thumbnail cache.
+        if self._stopped:
+            return
+        time.sleep(5.0)
+        self.prune_orphans_on_start()
 
     def stop(self) -> None:
         self._stopped = True
@@ -446,6 +454,7 @@ class Backend:
     def delete(self, avatar_id: str) -> dict:
         avatar_id = self._norm_id(avatar_id)
         with self._lock:
+            entry = self._entry(avatar_id)
             before = len(self.entries)
             self.entries = [e for e in self.entries if self._norm_id(e.get("id")) != avatar_id]
             self._reindex()
@@ -453,6 +462,9 @@ class Backend:
                 return {"ok": False}
             storage.save_favourites(self.entries)
             self._touch("entries")
+        # Reclaim the cached image too, rather than leaving it to accumulate.
+        if entry and entry.get("thumb"):
+            storage.delete_thumb(entry["thumb"])
         self._set_status("Removed from favourites.")
         return {"ok": True}
 
@@ -716,6 +728,30 @@ class Backend:
             return {"ok": True}
         except OSError:
             return {"ok": False, "message": str(storage.DATA_DIR)}
+
+    def prune_thumbnails(self) -> dict:
+        """Drop cached thumbnails that no longer belong to a favourite."""
+        storage.ensure_dirs()
+        with self._lock:
+            keep = {e["thumb"] for e in self.entries if isinstance(e.get("thumb"), str)}
+        orphans, trimmed = storage.prune_thumbs(keep)
+        total = orphans + trimmed
+        message = (
+            f"Removed {total} unused thumbnail{'s' if total != 1 else ''}."
+            if total else "Nothing to clean up."
+        )
+        self._set_status(message)
+        return {"ok": True, "removed": total, "orphans": orphans, "trimmed": trimmed}
+
+    def prune_orphans_on_start(self) -> None:
+        """Best-effort cleanup at start-up. Never fatal."""
+        try:
+            storage.ensure_dirs()
+            with self._lock:
+                keep = {e["thumb"] for e in self.entries if isinstance(e.get("thumb"), str)}
+            storage.prune_thumbs(keep)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ files
     def _dialog(self, kind, **kwargs) -> str | None:
