@@ -3,6 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # Tag pushes must be listed explicitly. With only `branches` here, GitHub
+    # ignores tag pushes entirely, so the release job never runs and tagging
+    # silently produces nothing.
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
