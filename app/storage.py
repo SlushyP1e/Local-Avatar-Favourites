@@ -37,6 +37,16 @@ _MIGRATED = False
 MOTION_MODES = ("system", "full", "none")
 DEFAULT_MOTION = "full"
 
+# Log list caps. The values match what the app enforced unconditionally before
+# they became settings, so an upgrade changes nothing about existing behaviour.
+DEFAULT_MAX_AVATAR_LOG = 800
+DEFAULT_MAX_PLAYER_CHANGES = 1000
+# Bounds for those caps. One row is a legal floor -- someone may genuinely want
+# only the newest sighting -- and the ceiling is far above any real need, but it
+# exists so a typo cannot ask for a list of ten billion rows.
+MIN_LOG_LIMIT = 1
+MAX_LOG_LIMIT = 10000
+
 DEFAULT_SETTINGS = {
     "osc_send_ip": "127.0.0.1",
     "osc_send_port": 9000,
@@ -46,6 +56,12 @@ DEFAULT_SETTINGS = {
     # When false, closing the window hides to the notification area instead.
     "exit_on_close": True,
     "motion": DEFAULT_MOTION,
+    # Caps for the two log lists, kept separate because they fill at completely
+    # different rates: one row per avatar seen, against one row per player who
+    # changed avatar. A single shared cap means whichever list grows faster
+    # silently consumes the other one's budget.
+    "max_avatar_log": DEFAULT_MAX_AVATAR_LOG,
+    "max_player_changes": DEFAULT_MAX_PLAYER_CHANGES,
 }
 
 
@@ -331,6 +347,23 @@ def sanitize_settings(raw) -> dict:
     # "FULL" behaves the same as one saved through the UI.
     motion = str(settings.get("motion") or "system").strip().lower()
     settings["motion"] = motion if motion in MOTION_MODES else DEFAULT_MOTION
+
+    # Log caps. A hand-edited file can hold a float, a string, or nothing at
+    # all, and an out-of-range value here would either grow the list without
+    # bound or wipe it on the next write.
+    for key, default in (("max_avatar_log", DEFAULT_MAX_AVATAR_LOG),
+                         ("max_player_changes", DEFAULT_MAX_PLAYER_CHANGES)):
+        raw_limit = settings.get(key, default)
+        try:
+            # Via str() because settings.json is hand-editable: a value may be a
+            # float, a string or None, and none of those are worth special-casing
+            # beyond "use it if it is a usable whole number".
+            limit = int(str(raw_limit).strip())
+        except (TypeError, ValueError):
+            limit = default
+        if not (MIN_LOG_LIMIT <= limit <= MAX_LOG_LIMIT):
+            limit = default
+        settings[key] = limit
 
     return settings
 

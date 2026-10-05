@@ -107,6 +107,14 @@
             clone it later. VRChat's own built-in avatars — Robot, Unity-chan and the
             rest of the Public and Legacy rows — are ignored, as they cannot be
             cloned.</p>
+          <p class="muted small">Your own avatar changes arrive over OSC, and other
+            players' avatars are read from VRChat's log the next time VRChat switches
+            world — so this list fills as you play. Seeing other players' avatars as
+            they load needs the local cache database, which
+            <b>VRChat does not create</b>: it appears only once an avatar tracker such
+            as <a href="https://github.com/WhatisaRyker/VRC-LOG" target="_blank"
+            rel="noreferrer noopener">VRC-LOG</a> has written to it. The line above
+            this list says which sources are currently producing IDs.</p>
         </div>
         <div class="logs hidden" id="changes"></div>
         <div id="changes-empty" class="empty hidden">
@@ -252,6 +260,17 @@
         </select>
       </div>
       <p id="set-motion-note" class="muted small"></p>
+
+      <h3 class="section-title">Log limits</h3>
+      <div class="form-grid">
+        <label class="field-label" for="set-max-avatar-log">Max avatar log size</label>
+        <input id="set-max-avatar-log" class="text-input" type="number"
+               min="1" max="10000" step="1" inputmode="numeric" />
+        <label class="field-label" for="set-max-player-changes">Max player changes</label>
+        <input id="set-max-player-changes" class="text-input" type="number"
+               min="1" max="10000" step="1" inputmode="numeric" />
+      </div>
+      <p id="set-limits-note" class="muted small"></p>
 
       <h3 class="section-title">Running in VRChat</h3>
       <div class="form-grid">

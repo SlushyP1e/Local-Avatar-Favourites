@@ -81,6 +81,32 @@ cache avatars. This tool reads them, in priority order:
 | Live feed | `%TEMP%\VRChat\VRChat\amplitude.cache` | Avatars seen in the last few minutes |
 | Text log | `%LOCALAPPDATA%..\LocalLow\VRChat\VRChat\output_log_*.txt` | Mostly your own avatar |
 
+### The local cache database needs VRC-LOG
+
+**VRChat does not create `avatars.sqlite`.** It is absent from
+[VRChat's own list of LocalLow contents](https://docs.vrchat.com/docs/local-vrchat-storage),
+and it appears on a machine only after a third-party avatar tracker such as
+[VRC-LOG](https://github.com/WhatisaRyker/VRC-LOG) has written to it. If you have
+never run one, this source has nothing to read and the toolbar will say so:
+
+> local cache unavailable · no database yet — install an avatar tracker such as
+> VRC-LOG to enable this
+
+That is expected, and **the app still works without it.** Your own avatar
+changes arrive over OSC, and other players' avatars are read from VRChat's own
+log when VRChat next switches world. You will just see fewer discoveries, and
+none at all from other players until the database exists.
+
+VRChat's asset cache cannot be used instead. `Cache-WindowsPlayer\` holds hashed
+directories whose `__info` files contain only a timestamp and a filename, so a
+downloaded avatar's ID is not recoverable from it — which is why trackers
+maintain a database in the first place.
+
+If you have relocated VRChat's cache, the relocated paths are probed too, but
+**the default location is preferred**: trackers overwhelmingly hardcode it, so
+that is where the file will be even when `cache_directory` is set. The database
+is a sibling of `Cache-WindowsPlayer\`, never inside it.
+
 The database is opened **read-only** through a SQLite URI, and nothing is ever
 written to VRChat's directory. The live feed is the interesting one: VRChat
 rewrites, uploads and then clears that file on every world switch, so it has to
@@ -90,6 +116,20 @@ New IDs appear in **Avatar Logs** with a badge showing which source found them,
 and a **Save** button that promotes one into your favourites. The current source
 status is always shown next to the log count, so a degraded source is visible
 rather than looking like "nothing new".
+
+### Log limits
+
+**Settings → Log limits** caps each log list separately: *Max avatar log size*
+for the Avatars tab, *Max player changes* for the Player changes tab. They are
+independent because the two fill at very different rates — one row per avatar
+seen, against one row per player who changed avatar — so a single shared cap
+would let the faster list quietly eat the slower one's budget.
+
+Lowering a cap takes effect immediately, keeping the **newest** rows and
+discarding the oldest. Settings says how many rows that would drop before you
+save, and the status bar confirms afterwards, because silently discarding rows
+you can currently see is the one outcome worth avoiding. The defaults, 800 and
+1000, are what the app enforced before these became settings.
 
 The text log is scanned for IDs, but only from the handful of lines that mean an
 avatar is genuinely available to you. VRChat mentions avatar IDs in a lot of
@@ -109,8 +149,7 @@ avatar field are treated as discoveries. This also removed every built-in defaul
 avatar from the log on its own — they were arriving on thumbnail URL lines, not
 being downloaded.
 
-> The cache database starts empty. It is populated over time as you play, and it
-> is also where other avatar-tracking tools record what they have seen.
+> Once the database exists it starts empty and fills over time as you play.
 
 ### Default avatars are ignored
 

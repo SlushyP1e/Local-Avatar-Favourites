@@ -499,3 +499,158 @@ test("discovery still flags a source that is unavailable", () => {
   assert.ok(el.classList.contains("warn-text"),
     "an unavailable source must still be highlighted");
 });
+
+test("a caught-up source is not labelled 'idle'", () => {
+  // Regression: both of these statuses are the healthy steady state. The cache
+  // database is simply caught up, and the live feed is empty because VRChat
+  // uploads and clears it on every world switch. Calling that "idle" made a
+  // working source look like a fault.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const el = env.document.getElementById("discovery-state");
+
+  app.state = {
+    ...app.state,
+    discovery: {
+      sources: { "cache-db": "empty", amplitude: "empty", log: "ok" },
+      backlog: 22673,
+      db_path: "C:/x/avatars.sqlite",
+      defaults: 257,
+    },
+  };
+  app.renderDiscovery();
+
+  assert.ok(!/idle/i.test(el.textContent), el.textContent);
+  assert.match(el.textContent, /local cache \(up to date\)/);
+  assert.match(el.textContent, /live feed \(waiting for a world switch\)/);
+  assert.match(el.textContent, /VRChat log/);
+  assert.ok(!el.classList.contains("warn-text"),
+    "a caught-up source is not a fault, so no warning styling");
+  assert.match(el.title, /no avatar has[\s\S]*been cached/i,
+    "the tooltip must explain what 'up to date' means");
+});
+
+test("a working source carries no parenthetical", () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const el = env.document.getElementById("discovery-state");
+
+  app.state = {
+    ...app.state,
+    discovery: { sources: { "cache-db": "ok", log: "ok" }, backlog: 5, db_path: "", defaults: 0 },
+  };
+  app.renderDiscovery();
+  assert.match(el.textContent, /local cache · VRChat log/);
+  assert.ok(!/\(/.test(el.textContent), el.textContent);
+});
+
+test("a missing local-cache database says VRC-LOG is the prerequisite", () => {
+  // avatars.sqlite is not created by VRChat, so "unavailable" with no
+  // explanation sends people hunting through folders for a file that was never
+  // written. The fix has to be named.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const el = env.document.getElementById("discovery-state");
+
+  app.state = {
+    ...app.state,
+    discovery: {
+      sources: { "cache-db": "missing", amplitude: "missing", log: "ok" },
+      backlog: 0,
+      db_path: "C:/nowhere/avatars.sqlite",
+      defaults: 257,
+    },
+  };
+  app.renderDiscovery();
+
+  assert.match(el.textContent, /local cache unavailable/);
+  assert.match(el.textContent, /VRC-LOG/, "must name the prerequisite");
+  assert.match(el.title, /VRChat does not create this file/);
+  assert.match(el.title, /C:\/nowhere\/avatars\.sqlite/,
+    "the tooltip must still name the path that was checked");
+  // Not every failure means "not installed".
+  assert.ok(!/locked/.test(el.textContent));
+});
+
+test("other local-cache failures get their own remedy", () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const el = env.document.getElementById("discovery-state");
+
+  const cases = [
+    ["locked", /close VRChat/],
+    ["unreadable", /permissions/],
+    ["unsupported", /not a readable SQLite/],
+  ];
+  for (const [status, pattern] of cases) {
+    app.state = {
+      ...app.state,
+      discovery: { sources: { "cache-db": status }, backlog: 0, db_path: "", defaults: 0 },
+    };
+    app.renderDiscovery();
+    assert.match(el.textContent, pattern, `for ${status}`);
+    assert.ok(!/VRC-LOG/.test(el.textContent),
+      `a locked database is not a missing one, so ${status} must not suggest installing`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// log caps
+// ---------------------------------------------------------------------------
+
+test("the log-limit note warns before rows are dropped", () => {
+  // Silently discarding rows the user can currently see is the one outcome they
+  // would not expect, so the cost is spelled out before they commit to it.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const note = env.document.getElementById("set-limits-note");
+  const avatarCap = env.document.getElementById("set-max-avatar-log");
+  const changeCap = env.document.getElementById("set-max-player-changes");
+
+  app.state = { ...app.state, logs: new Array(500), changes: new Array(340) };
+
+  avatarCap.value = "100";
+  changeCap.value = "300";
+  app.renderLimitsNote();
+  assert.match(note.textContent, /trimming 400 of 500 logged avatars/);
+  assert.match(note.textContent, /trimming 40 of 340 player changes/);
+  assert.ok(note.classList.contains("warn-text"));
+
+  // Raising one cap must not keep warning about the other.
+  changeCap.value = "400";
+  app.renderLimitsNote();
+  assert.match(note.textContent, /trimming 400 of 500 logged avatars/);
+  assert.ok(!/player changes/.test(note.textContent), note.textContent);
+});
+
+test("the log-limit note stays quiet when nothing would be dropped", () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const note = env.document.getElementById("set-limits-note");
+
+  app.state = { ...app.state, logs: new Array(12), changes: new Array(4) };
+  env.document.getElementById("set-max-avatar-log").value = "800";
+  env.document.getElementById("set-max-player-changes").value = "1000";
+  app.renderLimitsNote();
+
+  assert.match(note.textContent, /keeps its newest rows/i);
+  assert.ok(!note.classList.contains("warn-text"));
+});
+
+test("the log-limit note rejects unusable numbers", () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const note = env.document.getElementById("set-limits-note");
+  const avatarCap = env.document.getElementById("set-max-avatar-log");
+  const changeCap = env.document.getElementById("set-max-player-changes");
+
+  app.state = { ...app.state, logs: [], changes: [] };
+  changeCap.value = "1000";
+
+  for (const bad of ["0", "-1", "abc", "10001", ""]) {
+    avatarCap.value = bad;
+    app.renderLimitsNote();
+    assert.match(note.textContent, /whole number between 1 and 10000/, `for ${bad}`);
+    assert.ok(note.classList.contains("warn-text"), `for ${bad}`);
+  }
+});

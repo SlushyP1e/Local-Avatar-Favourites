@@ -85,27 +85,87 @@ def amplitude_path() -> Path:
     return Path(temp) / "VRChat" / "VRChat" / "amplitude.cache"
 
 
+def _cache_root(low: Path) -> Path | None:
+    """The relocated cache root from ``config.json``, if VRChat has one.
+
+    VRChat's ``cache_directory`` replaces the whole cache root -- the folder
+    that normally holds ``Cache-WindowsPlayer\\``, ``Avatars\\``, ``Worlds\\``,
+    ``avatars.sqlite`` and the rest. See
+    https://docs.vrchat.com/docs/configuration-file.
+    """
+    try:
+        raw = json.loads((low / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    configured = str(raw.get("cache_directory") or "").strip()
+    if not configured:
+        return None
+    # A hand-edited config may well use %USERPROFILE% or a ~ shortcut.
+    return Path(os.path.expandvars(os.path.expanduser(configured)))
+
+
+def avatar_db_candidates(low_dir: Path | None = None) -> list[Path]:
+    """Every path worth trying for the avatar-id database, best first.
+
+    The default location comes first deliberately. ``avatars.sqlite`` is not
+    created by VRChat -- it is absent from VRChat's own documentation of
+    AppData/LocalLow, and it appears on a machine only once some third-party
+    avatar tracker such as VRC-LOG has written to it. Those tools overwhelmingly
+    hardcode the default path, because it is the location they have always
+    used, so that is where the file will actually be even on a VRChat install
+    whose *asset* cache has been relocated.
+
+    The relocated paths are still probed. If the default does not exist -- a
+    clean profile, or a tool that does follow the relocation -- one of them is
+    the right answer, and preferring whichever exists beats reporting a source
+    as unavailable while a working database sits elsewhere.
+
+    VRChat's own asset cache cannot substitute. ``Cache-WindowsPlayer\\``
+    holds hashed directories whose ``__info`` files carry only a timestamp and a
+    filename, so a downloaded avatar's ID is not recoverable from it.
+    """
+    low = Path(low_dir) if low_dir else vrchat_low_dir()
+    default = low / "avatars.sqlite"
+    candidates = [default]
+
+    root = _cache_root(low)
+    if root is not None:
+        candidates.append(root / default.name)
+        candidates.append(root / "Cache-WindowsPlayer" / default.name)
+    return candidates
+
+
 def avatar_db_path(low_dir: Path | None = None) -> Path:
-    """Locate the avatar cache database, honouring a relocated cache directory."""
+    """Locate the avatar-id database, or the path worth telling the user about.
+
+    This used to append ``Cache-WindowsPlayer`` unconditionally, which pointed
+    at a path nothing ever writes to: the database is not inside that folder.
+    A user whose cache was relocated therefore saw "local cache unavailable"
+    with a path in it that could never exist.
+    """
     low = Path(low_dir) if low_dir else vrchat_low_dir()
     default = low / "avatars.sqlite"
 
-    cache_dir = ""
-    try:
-        raw = json.loads((low / "config.json").read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            cache_dir = str(raw.get("cache_directory") or "").strip()
-    except (OSError, json.JSONDecodeError):
-        cache_dir = ""
+    # Where a third-party tracker will have written it when it follows VRChat's
+    # relocated cache. This is also the path worth quoting to the user, so it is
+    # named rather than picked out of a list by index.
+    documented = default
+    probes = [default]
 
-    if not cache_dir:
-        return default
+    root = _cache_root(low)
+    if root is not None:
+        documented = root / default.name
+        probes.append(documented)
+        # Legacy fallback, probed last and never quoted: nothing is documented
+        # as living here, it is only here in case it turns out to be.
+        probes.append(root / "Cache-WindowsPlayer" / default.name)
 
-    # VRChat stores the cache *parent* here and appends the folder itself.
-    relocated = Path(os.path.expandvars(cache_dir)) / "Cache-WindowsPlayer" / default.name
-    if relocated.exists() or not default.exists():
-        return relocated
-    return default
+    for candidate in probes:
+        if candidate.exists():
+            return candidate
+    return documented
 
 
 # -------------------------------------------------------------------- watcher
@@ -316,6 +376,6 @@ class VRCacheWatcher:
 __all__ = [
     "AVATAR_ID_RE", "EMPTY", "LOCKED", "MISSING", "OK", "SOURCE_AMPLITUDE",
     "SOURCE_SQLITE", "UNREADABLE", "UNSUPPORTED", "VRCacheWatcher",
-    "amplitude_path", "avatar_db_path", "is_avatar_id", "normalize_avatar_id",
-    "scan_ids", "vrchat_low_dir",
+    "amplitude_path", "avatar_db_candidates", "avatar_db_path", "is_avatar_id",
+    "normalize_avatar_id", "scan_ids", "vrchat_low_dir",
 ]

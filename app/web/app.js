@@ -709,21 +709,45 @@ const SOURCE_LABELS = {
 
 const SOURCE_ORDER = ["cache-db", "amplitude", "log"];
 
-// One line saying which local source is actually producing ids, so a degraded
-// source is visible rather than looking like "no new avatars".
+// Why the local-cache source is not producing ids, per failure kind.
+// avatars.sqlite is not created by VRChat -- it is absent from VRChat's own
+// documentation of AppData/LocalLow -- so on a clean install there is nothing
+// to read, and no amount of looking in the folder will help. Naming that is the
+// difference between a user who fixes it and one who gives up.
+const CACHE_HINTS = {
+  missing: "no database yet - install an avatar tracker such as VRC-LOG to enable this",
+  locked: "database is locked - close VRChat and any avatar tracker, then restart",
+  unreadable: "could not read the database - check permissions",
+  unsupported: "the file is not a readable SQLite database",
+};
+
+// What "empty" means, per source. Deliberately not the word "idle": both of
+// these are the *healthy* steady state, and a source that is working perfectly
+// must not be labelled in a way that reads like a fault. The cache database is
+// simply caught up, and the live feed is empty because VRChat uploads and
+// clears it on every world switch.
+const EMPTY_NOTES = {
+  "cache-db": "up to date",
+  amplitude: "waiting for a world switch",
+};
+
 function renderDiscovery() {
   const el = $("discovery-state");
   if (!el) return;
   const sources = (state.discovery && state.discovery.sources) || {};
   const backlog = (state.discovery && state.discovery.backlog) || 0;
   const parts = [];
+  let cacheStatus = "";
   for (const key of SOURCE_ORDER) {
     const status = sources[key];
     if (!status) continue;
-    if (status === "ok" || status === "empty") {
-      parts.push(SOURCE_LABELS[key] + (status === "empty" ? " (idle)" : ""));
+    if (status === "ok") {
+      parts.push(SOURCE_LABELS[key]);
+    } else if (status === "empty") {
+      parts.push(SOURCE_LABELS[key] + " (" + (EMPTY_NOTES[key] || "no new") + ")");
     } else {
       parts.push(SOURCE_LABELS[key] + " unavailable");
+      if (key === "cache-db") cacheStatus = status;
     }
   }
   let text = parts.join(" · ");
@@ -735,10 +759,25 @@ function renderDiscovery() {
   if (defaults) {
     text += "  ·  " + defaults.toLocaleString() + " default avatars ignored";
   }
+  // Say what to do about a dead source, not merely that it is dead.
+  const hint = cacheStatus ? CACHE_HINTS[cacheStatus] : "";
+  if (hint) text += "  ·  " + hint;
   el.textContent = text;
+  el.title = cacheStatus
+    ? "Checked: " + ((state.discovery && state.discovery.db_path) || "?")
+      + "\n\nVRChat does not create this file. It appears only once an avatar"
+      + "\ntracker such as VRC-LOG has written to it."
+      + "\n\nWithout it the other sources still work: your own avatar changes"
+      + "\narrive over OSC, and other players' avatars are read from VRChat's"
+      + "\nown log."
+    // Parenthesised on purpose: `path || "" + text` parses as
+    // `path || ("" + text)`, which silently drops the explanation whenever the
+    // path is non-empty -- which is the normal case.
+    : (((state.discovery && state.discovery.db_path) || "")
+        + "\n\n\"Up to date\" means the database is being read and no avatar has"
+        + "\nbeen cached since the last check - not that anything is wrong.");
   const down = SOURCE_ORDER.some((k) => ["missing", "unsupported", "unreadable"].includes(sources[k]));
   el.classList.toggle("warn-text", down);
-  el.title = (state.discovery && state.discovery.db_path) || "";
 }
 
 // Show an element with its entrance animation, but only on the hidden ->
@@ -1011,6 +1050,9 @@ async function openSettings() {
   $("set-exit-on-close").checked = s.exit_on_close !== false;
   $("set-motion").value = s.motion || "system";
   renderMotionNote();
+  $("set-max-avatar-log").value = s.max_avatar_log || 800;
+  $("set-max-player-changes").value = s.max_player_changes || 1000;
+  renderLimitsNote();
   $("set-tray-note").textContent = s.tray
     ? "With this off, closing the window keeps the app in the notification area. " +
       "Right-click the tray icon for Open, Wear last avatar and Quit."
@@ -1097,11 +1139,43 @@ async function doLogout() {
 
 async function saveSettings() {
   const res = await call("save_settings", $("set-send").value, $("set-recv").value,
-                         $("set-exit-on-close").checked, $("set-motion").value);
+                         $("set-exit-on-close").checked, $("set-motion").value,
+                         $("set-max-avatar-log").value, $("set-max-player-changes").value);
   if (!res.ok) { showAlert("Invalid settings", res.message || "Could not save settings."); return; }
   closeModal("modal-settings");
-  toast("Settings saved.");
+  // Say so when rows were discarded, rather than letting the list quietly be
+  // shorter than it was a moment ago.
+  const dropped = (res.dropped_logs || 0) + (res.dropped_changes || 0);
+  toast(dropped
+    ? `Settings saved. Dropped ${dropped} older row${dropped !== 1 ? "s" : ""} to fit.`
+    : "Settings saved.");
   await refreshState();
+}
+
+/* Explains what the two log caps will cost before the user commits to them. */
+function renderLimitsNote() {
+  const el = $("set-limits-note");
+  if (!el) return;
+  const avatars = Number($("set-max-avatar-log").value);
+  const changes = Number($("set-max-player-changes").value);
+  const bad = (n) => !Number.isInteger(n) || n < 1 || n > 10000;
+  if (bad(avatars) || bad(changes)) {
+    el.textContent = "Each limit must be a whole number between 1 and 10000.";
+    el.classList.add("warn-text");
+    return;
+  }
+  const rows = state.logs ? state.logs.length : 0;
+  const changesNow = state.changes ? state.changes.length : 0;
+  const bits = [];
+  if (rows > avatars) bits.push(`trimming ${rows - avatars} of ${rows} logged avatars`);
+  if (changesNow > changes) {
+    bits.push(`trimming ${changesNow - changes} of ${changesNow} player changes`);
+  }
+  el.textContent = bits.length
+    ? `Saving now will drop the oldest rows: ${bits.join(", ")}.`
+    : "Each list keeps its newest rows and discards the oldest past the limit. " +
+      "The two limits are independent.";
+  el.classList.toggle("warn-text", bits.length > 0);
 }
 
 /* Spells out *why* nothing is moving. "Follow Windows" silently doing nothing
@@ -1421,6 +1495,8 @@ function wire() {
   $("set-logout").addEventListener("click", doLogout);
   $("set-motion").addEventListener("change", previewMotion);
   $("set-method").addEventListener("change", updateTwoFactorLabel);
+  $("set-max-avatar-log").addEventListener("input", renderLimitsNote);
+  $("set-max-player-changes").addEventListener("input", renderLimitsNote);
   $("set-save").addEventListener("click", saveSettings);
   $("set-open-folder").addEventListener("click", () => call("open_data_folder"));
   $("set-export").addEventListener("click", exportFavourites);

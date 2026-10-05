@@ -39,8 +39,11 @@ IMAGE_MIME = {
     ".webp": "image/webp",
 }
 
-MAX_LOG_ENTRIES = 800
-MAX_CHANGE_ENTRIES = 1000
+# Caps on the two log lists. The defaults live in storage as settings so the
+# user can size them; these are only the fallbacks for when the setting is
+# absent or invalid.
+MAX_LOG_ENTRIES = storage.DEFAULT_MAX_AVATAR_LOG
+MAX_CHANGE_ENTRIES = storage.DEFAULT_MAX_PLAYER_CHANGES
 DISCOVERY_FEED_MAX = 300
 
 # How long to wait for VRChat to broadcast the avatar back before assuming the
@@ -127,6 +130,9 @@ class Backend:
         # already-loaded state, and doing it here rather than on the background
         # prune thread means the UI never renders a default avatar at all.
         self.prune_defaults()
+        # Same reasoning: a cap lowered since the last launch must take effect
+        # before the first poll, not whenever the list next overflows.
+        self.trim_logs_to_limits()
         self.api = VRCApi(self.settings.get("auth_token", ""))
         self.osc = OSCBridge(
             send_ip=self.settings.get("osc_send_ip", "127.0.0.1"),
@@ -210,6 +216,31 @@ class Backend:
     def _norm_id(avatar_id) -> str:
         return storage.normalize_id(avatar_id)
 
+    def _log_limit(self) -> int:
+        """Cap on the avatar log, from settings.
+
+        Read through sanitize_settings' bounds on every call rather than cached,
+        because the settings are the user's to change and a stale cap would
+        quietly disagree with the number shown in Settings.
+        """
+        try:
+            limit = int(self.settings.get("max_avatar_log", MAX_LOG_ENTRIES))
+        except (TypeError, ValueError):
+            return MAX_LOG_ENTRIES
+        if storage.MIN_LOG_LIMIT <= limit <= storage.MAX_LOG_LIMIT:
+            return limit
+        return MAX_LOG_ENTRIES
+
+    def _change_limit(self) -> int:
+        """Cap on the player-changes log, from settings. See :meth:`_log_limit`."""
+        try:
+            limit = int(self.settings.get("max_player_changes", MAX_CHANGE_ENTRIES))
+        except (TypeError, ValueError):
+            return MAX_CHANGE_ENTRIES
+        if storage.MIN_LOG_LIMIT <= limit <= storage.MAX_LOG_LIMIT:
+            return limit
+        return MAX_CHANGE_ENTRIES
+
     def _touch(self, section: str) -> None:
         self._revs[section] = self._revs.get(section, 0) + 1
 
@@ -288,9 +319,9 @@ class Backend:
                     "private": False,
                     "source": source,
                 })
-            if len(self.log) > MAX_LOG_ENTRIES:
+            if len(self.log) > self._log_limit():
                 self.log.sort(key=lambda e: e.get("last_seen", ""))
-                self.log = self.log[-MAX_LOG_ENTRIES:]
+                self.log = self.log[-self._log_limit():]
             if save:
                 storage.save_log(self.log)
             self._touch("logs")
@@ -323,9 +354,9 @@ class Backend:
                     "last_seen": stamp,
                     "count": 1,
                 })
-            if len(self.changes) > MAX_CHANGE_ENTRIES:
+            if len(self.changes) > self._change_limit():
                 self.changes.sort(key=lambda e: e.get("last_seen", ""))
-                self.changes = self.changes[-MAX_CHANGE_ENTRIES:]
+                self.changes = self.changes[-self._change_limit():]
             self._touch("changes")
         return True
 
@@ -373,6 +404,38 @@ class Backend:
                     self._touch("changes")
         return removed_logs, removed_changes
 
+    def trim_logs_to_limits(self) -> tuple[int, int]:
+        """Drop the oldest rows until both lists respect their caps.
+
+        Run at start-up and whenever the caps change. Recording already trims,
+        but a cap lowered from 800 to 100 would otherwise leave the list at its
+        current size until enough new rows arrived to cross the old limit --
+        so the number in Settings would not describe what is on screen.
+        """
+        with self._lock:
+            return self._trim_logs_locked()
+
+    def _trim_logs_locked(self) -> tuple[int, int]:
+        """Trim both lists to their caps. Caller must hold the lock."""
+        removed_logs = removed_changes = 0
+        log_limit = self._log_limit()
+        if len(self.log) > log_limit:
+            before = len(self.log)
+            self.log.sort(key=lambda e: e.get("last_seen", ""))
+            self.log = self.log[-log_limit:]
+            removed_logs = before - len(self.log)
+            storage.save_log(self.log)
+            self._touch("logs")
+        change_limit = self._change_limit()
+        if len(self.changes) > change_limit:
+            before = len(self.changes)
+            self.changes.sort(key=lambda e: e.get("last_seen", ""))
+            self.changes = self.changes[-change_limit:]
+            removed_changes = before - len(self.changes)
+            storage.save_changes(self.changes)
+            self._touch("changes")
+        return removed_logs, removed_changes
+
     # ------------------------------------------------------------------ state
     def get_state(self, revs: dict | None = None) -> dict:
         revs = revs if isinstance(revs, dict) else None
@@ -418,6 +481,8 @@ class Backend:
             "discovery": self.discovery_state(),
             "exit_on_close": bool(self.settings.get("exit_on_close", True)),
             "motion": self.settings.get("motion", storage.DEFAULT_MOTION),
+            "max_avatar_log": self._log_limit(),
+            "max_player_changes": self._change_limit(),
             "tray": bool(getattr(self, "_tray", None)),
         }
 
@@ -1177,7 +1242,8 @@ class Backend:
         return {"ok": True}
 
     # ------------------------------------------------------------------ settings
-    def save_settings(self, send_port, recv_port, exit_on_close=None, motion=None) -> dict:
+    def save_settings(self, send_port, recv_port, exit_on_close=None, motion=None,
+                       max_avatar_log=None, max_player_changes=None) -> dict:
         try:
             send_port = int(send_port)
             recv_port = int(recv_port)
@@ -1202,6 +1268,27 @@ class Backend:
             self.settings["motion"] = (
                 mode if mode in storage.MOTION_MODES else storage.DEFAULT_MOTION
             )
+
+        # Log caps, applied the same way: only when supplied, so the older
+        # narrower calls still work. Rejected outright rather than clamped --
+        # silently turning 0 into 800 while the user watches would be worse than
+        # telling them the number is unusable.
+        limits = (("max_avatar_log", max_avatar_log),
+                  ("max_player_changes", max_player_changes))
+        for key, value in limits:
+            if value is None:
+                continue
+            try:
+                limit = int(value)
+            except (TypeError, ValueError):
+                return {"ok": False, "message": "Log limits must be whole numbers."}
+            if not (storage.MIN_LOG_LIMIT <= limit <= storage.MAX_LOG_LIMIT):
+                return {
+                    "ok": False,
+                    "message": f"Log limits must be between {storage.MIN_LOG_LIMIT} "
+                               f"and {storage.MAX_LOG_LIMIT}.",
+                }
+            self.settings[key] = limit
 
         # Only the receive port is actually bound. If it has not changed there is
         # nothing to rebind -- and attempting one would fail against our own
@@ -1233,8 +1320,29 @@ class Backend:
         self.settings["osc_send_port"] = send_port
         self.settings["osc_receive_port"] = recv_port
         storage.save_settings(self.settings)
-        self._set_status("OSC settings applied.")
-        return {"ok": True}
+
+        # Enforce a lowered cap straight away, so the number in Settings
+        # describes the list on screen rather than the list plus a future
+        # overflow. Report what went, because silently discarding rows the user
+        # can still see is the one outcome they would not expect.
+        dropped_logs, dropped_changes = self.trim_logs_to_limits()
+        self._set_status(self._settings_applied_message(dropped_logs, dropped_changes))
+        return {"ok": True, "dropped_logs": dropped_logs,
+                "dropped_changes": dropped_changes}
+
+    @staticmethod
+    def _settings_applied_message(dropped_logs: int, dropped_changes: int) -> str:
+        parts = ["Settings saved."]
+        if dropped_logs or dropped_changes:
+            bits = []
+            if dropped_logs:
+                bits.append(f"{dropped_logs} older logged avatar"
+                            f"{'s' if dropped_logs != 1 else ''}")
+            if dropped_changes:
+                bits.append(f"{dropped_changes} older player change"
+                            f"{'s' if dropped_changes != 1 else ''}")
+            parts.append(f"Dropped {', '.join(bits)} to fit the new limit.")
+        return " ".join(parts)
 
     # ------------------------------------------------------------------ metadata
     @staticmethod

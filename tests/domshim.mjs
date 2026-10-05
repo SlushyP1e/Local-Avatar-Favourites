@@ -130,7 +130,7 @@ export function loadApp(env) {
   thumbCache, thumbKey, thumbPending, thumbOrder, visibleEntries, cardSub, escapeHtml,
   setView, animateView, applyStagger, revealOnce, replayAnimation,
   clearAnimationWhenDone, applyMotionPreference, systemPrefersReducedMotion,
-  renderMotionNote, renderDiscovery, VIEW_ORDER, STAGGER_CAP,
+  renderMotionNote, renderDiscovery, renderLimitsNote, VIEW_ORDER, STAGGER_CAP,
   get currentView() { return currentView; },
   set currentView(v) { currentView = v; },
   get pendingConfirm() { return pendingConfirm; },

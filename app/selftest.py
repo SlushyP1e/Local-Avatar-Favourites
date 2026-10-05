@@ -336,7 +336,7 @@ def test_vrcache_pattern() -> None:
 
 
 def test_vrcache_db_path() -> None:
-    from vrcache import avatar_db_path
+    from vrcache import avatar_db_candidates, avatar_db_path
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -348,19 +348,85 @@ def test_vrcache_db_path() -> None:
         # No config.json at all.
         check("vrcache missing config -> default", avatar_db_path(low).parent == low)
 
+        # A relocated cache. avatars.sqlite is not inside Cache-WindowsPlayer --
+        # that folder holds only hashed asset bundles whose __info files carry a
+        # timestamp and a filename and nothing else, so an avatar ID is not
+        # recoverable from them. The old code looked there unconditionally, so
+        # anyone whose cache was relocated was told the local cache was
+        # unavailable via a path that could never exist.
         relocated = root / "SomeOtherCache"
-        (relocated / "Cache-WindowsPlayer").mkdir(parents=True)
+        relocated.mkdir(parents=True)
         (low / "config.json").write_text(
             json.dumps({"cache_directory": str(relocated)}), encoding="utf-8")
-        check("vrcache honours cache_directory",
-              avatar_db_path(low) == relocated / "Cache-WindowsPlayer" / "avatars.sqlite",
+        check("relocated cache is probed at the cache root",
+              relocated / "avatars.sqlite" in avatar_db_candidates(low),
+              str(avatar_db_candidates(low)))
+        check("the default is still probed first",
+              avatar_db_candidates(low)[0] == low / "avatars.sqlite",
+              str(avatar_db_candidates(low)))
+        check("the relocated candidate is not nested under Cache-WindowsPlayer",
+              "Cache-WindowsPlayer" not in (relocated / "avatars.sqlite").parts)
+        # The nested path survives only as a last-resort fallback, so it must
+        # never be preferred over one that does not exist higher up.
+        nested_candidate = relocated / "Cache-WindowsPlayer" / "avatars.sqlite"
+        check("the nested fallback is probed last",
+              avatar_db_candidates(low)[-1] == nested_candidate,
+              str(avatar_db_candidates(low)))
+
+        # The default wins when it exists, because avatars.sqlite is written by
+        # third-party trackers that hardcode the default path even when VRChat's
+        # asset cache has been relocated.
+        (low / "avatars.sqlite").write_bytes(b"")
+        check("an existing default database wins",
+              avatar_db_path(low) == low / "avatars.sqlite",
               str(avatar_db_path(low)))
+
+        # With no default present, the relocated location is found instead.
+        (low / "avatars.sqlite").unlink()
+        (relocated / "avatars.sqlite").write_bytes(b"")
+        check("existing relocated database is used",
+              avatar_db_path(low) == relocated / "avatars.sqlite",
+              str(avatar_db_path(low)))
+
+        # A nested layout, if one ever appears, must still be found rather than
+        # reported missing: whichever candidate exists wins.
+        (relocated / "avatars.sqlite").unlink()
+        nested = relocated / "Cache-WindowsPlayer"
+        nested.mkdir(parents=True)
+        (nested / "avatars.sqlite").write_bytes(b"")
+        check("nested layout still resolves",
+              avatar_db_path(low) == nested / "avatars.sqlite",
+              str(avatar_db_path(low)))
+
+        # Configured, nothing written anywhere: report the documented relocated
+        # location, so the path shown to the user is worth checking.
+        (nested / "avatars.sqlite").unlink()
+        nested.rmdir()
+        check("configured and absent -> documented location",
+              avatar_db_path(low) == relocated / "avatars.sqlite",
+              str(avatar_db_path(low)))
+        check("absent and unconfigured -> default reported",
+              avatar_db_path(low.parent) == low.parent / "avatars.sqlite",
+              str(avatar_db_path(low.parent)))
+
+        # A hand-edited config may use env vars or ~ shortcuts.
+        (low / "config.json").write_text(
+            json.dumps({"cache_directory": "~/vrc-cache/"}), encoding="utf-8")
+        resolved = avatar_db_path(low)
+        check("~ in cache_directory is expanded",
+              resolved == Path.home() / "vrc-cache" / "avatars.sqlite",
+              str(resolved))
 
         # A corrupt config must not break resolution.
         (low / "config.json").write_text("{not json", encoding="utf-8")
         check("vrcache corrupt config -> default", avatar_db_path(low).parent == low)
-
-
+        # So must a blank one, or one with an unrelated shape.
+        (low / "config.json").write_text(
+            json.dumps({"cache_directory": "   "}), encoding="utf-8")
+        check("blank cache_directory -> default", avatar_db_path(low).parent == low)
+        (low / "config.json").write_text(json.dumps(["not", "a", "dict"]),
+                                         encoding="utf-8")
+        check("non-dict config -> default", avatar_db_path(low).parent == low)
 def test_vrcache_sqlite_watermark() -> None:
     from vrcache import EMPTY, OK, SOURCE_SQLITE, VRCacheWatcher
 
@@ -742,6 +808,187 @@ def test_log_dedupe_across_sources() -> None:
     check("two log entries", len(b.log) == 2)
 
 
+def test_log_size_limits() -> None:
+    """The two caps are separate, and the UI's number is the real one.
+
+    They are separate because the lists fill at completely different rates --
+    one row per avatar seen against one row per player who changed avatar -- so
+    a single shared cap would let the faster list silently eat the slower one's
+    budget.
+    """
+    import storage
+
+    b = _isolated_backend()
+
+    check("avatar cap default", b._log_limit() == storage.DEFAULT_MAX_AVATAR_LOG,
+          str(b._log_limit()))
+    check("changes cap default",
+          b._change_limit() == storage.DEFAULT_MAX_PLAYER_CHANGES, str(b._change_limit()))
+    check("defaults match the old hard-coded caps",
+          storage.DEFAULT_MAX_AVATAR_LOG == 800
+          and storage.DEFAULT_MAX_PLAYER_CHANGES == 1000,
+          f"{storage.DEFAULT_MAX_AVATAR_LOG} / {storage.DEFAULT_MAX_PLAYER_CHANGES}")
+
+    b.settings["max_avatar_log"] = 3
+    b.settings["max_player_changes"] = 2
+    check("caps read from settings",
+          b._log_limit() == 3 and b._change_limit() == 2,
+          f"{b._log_limit()} / {b._change_limit()}")
+
+    # A junk value must fall back rather than raise or go unbounded, because the
+    # limits are read on every single recorded row.
+    for bad in (0, -5, 10**9, "abc", None, [100]):
+        b.settings["max_avatar_log"] = bad
+        b.settings["max_player_changes"] = bad
+        check(f"junk cap {bad!r} falls back",
+              b._log_limit() == storage.DEFAULT_MAX_AVATAR_LOG
+              and b._change_limit() == storage.DEFAULT_MAX_PLAYER_CHANGES,
+              f"{b._log_limit()} / {b._change_limit()}")
+
+
+def test_log_size_limits_enforced() -> None:
+    """Recording must respect each cap independently, keeping the newest rows."""
+    b = _isolated_backend()
+    b.settings["max_avatar_log"] = 3
+    b.settings["max_player_changes"] = 2
+
+    for i in range(6):
+        b._record_log(_avtr_id(i),
+                      when=f"2026-01-0{i + 1}T00:00:00+00:00")
+        b._record_change(f"Player{i}", f"Avatar{i}",
+                         when=f"2026-01-0{i + 1}T00:00:00+00:00")
+
+    check("avatar log capped at 3", len(b.log) == 3, str(len(b.log)))
+    check("player changes capped at 2", len(b.changes) == 2, str(len(b.changes)))
+    # Oldest first, so the survivors are the tail. Written as indices rather
+    # than literals because the fixture id is hex-formatted, which makes a
+    # hand-computed "expected" string wrong in a way that looks like a bug.
+    check("the newest avatars are kept",
+          [e["id"] for e in b.log] == [_avtr_id(i) for i in (3, 4, 5)],
+          str([e["id"] for e in b.log]))
+    check("the oldest avatars are dropped",
+          all(_avtr_id(i) not in [e["id"] for e in b.log] for i in (0, 1, 2)))
+    check("the newest changes are kept",
+          [c["avatar"] for c in b.changes] == ["Avatar4", "Avatar5"],
+          str([c["avatar"] for c in b.changes]))
+    check("trim persisted", len(storage.load_log()) == 3, str(len(storage.load_log())))
+
+
+def test_lowering_the_cap_trims_immediately() -> None:
+    """Setting a smaller cap must shrink the list now, not at the next overflow."""
+    b = _isolated_backend()
+    for i in range(10):
+        b._record_log(_avtr_id(i),
+                      when=f"2026-01-{i + 1:02d}T00:00:00+00:00")
+        b._record_change(f"Player{i}", f"Avatar{i}",
+                         when=f"2026-01-{i + 1:02d}T00:00:00+00:00")
+    check("ten recorded", len(b.log) == 10 and len(b.changes) == 10)
+
+    res = b.save_settings(9000, 9001, max_avatar_log=4, max_player_changes=100)
+    check("save accepted", res["ok"] is True, str(res))
+    check("avatar log trimmed to the new cap", len(b.log) == 4, str(len(b.log)))
+    check("player changes left alone", len(b.changes) == 10, str(len(b.changes)))
+    check("the drop was reported", res.get("dropped_logs") == 6, str(res))
+    check("status mentions the drop", "Dropped 6" in b.status, b.status)
+    check("the newest four kept",
+          [e["id"] for e in b.log] == [_avtr_id(i) for i in (6, 7, 8, 9)],
+          str([e["id"] for e in b.log]))
+
+    # Raising the cap must not resurrect anything.
+    b.save_settings(9000, 9001, max_avatar_log=50)
+    check("raising the cap does not restore rows", len(b.log) == 4, str(len(b.log)))
+
+    # Trimming twice in a row is a no-op.
+    b.save_settings(9000, 9001, max_avatar_log=2)
+    again = b.save_settings(9000, 9001, max_avatar_log=2)
+    check("second trim drops nothing", again.get("dropped_logs") == 0, str(again))
+
+
+def test_log_size_caps_applied_at_startup() -> None:
+    """A cap lowered while the app was closed must still take effect on launch."""
+    b = _isolated_backend()
+    stamp = "2026-01-01T00:00:00+00:00"
+    storage.save_log([
+        {"id": _avtr_id(i), "name": "",
+         "first_seen": stamp, "last_seen": f"2026-01-{i + 1:02d}T00:00:00+00:00",
+         "count": 1, "private": False, "source": "log"}
+        for i in range(20)
+    ])
+    storage.save_changes([
+        {"player": f"P{i}", "avatar": f"A{i}", "first_seen": stamp,
+         "last_seen": f"2026-01-{i + 1:02d}T00:00:00+00:00", "count": 1}
+        for i in range(20)
+    ])
+    # Lower the caps on disk, as if from a previous session's Settings.
+    storage.save_settings({"max_avatar_log": 5, "max_player_changes": 3})
+
+    from backend import Backend
+    b2 = Backend(start_services=False, cache=b._cache)
+    check("avatar log trimmed on start", len(b2.log) == 5, str(len(b2.log)))
+    check("player changes trimmed on start", len(b2.changes) == 3, str(len(b2.changes)))
+    check("newest avatars kept",
+          b2.log[-1]["id"] == _avtr_id(19), b2.log[-1]["id"])
+    check("trim persisted to disk", len(storage.load_log()) == 5, str(len(storage.load_log())))
+
+
+def test_log_size_caps_reject_nonsense() -> None:
+    """A bad number is refused outright rather than quietly clamped."""
+    b = _isolated_backend()
+    for value in (0, -1, 10001, 10**9):
+        res = b.save_settings(9000, 9001, max_avatar_log=value)
+        check(f"avatar cap {value} refused", res["ok"] is False, str(res))
+        check(f"avatar cap {value} explains", "between" in res.get("message", ""), str(res))
+        check(f"avatar cap {value} not stored",
+              b._log_limit() == storage.DEFAULT_MAX_AVATAR_LOG, str(b._log_limit()))
+    for value in ("abc", [3], 1.5):
+        res = b.save_settings(9000, 9001, max_player_changes=value)
+        check(f"changes cap {value!r} refused or normalised",
+              res["ok"] is False or b._change_limit() == int(value), str(res))
+
+    # Bounds are inclusive.
+    check("1 accepted",
+          b.save_settings(9000, 9001, max_avatar_log=1, max_player_changes=1)["ok"])
+    check("10000 accepted",
+          b.save_settings(9000, 9001, max_avatar_log=10000, max_player_changes=10000)["ok"])
+
+    # Both caps reported to the UI.
+    reported = b.get_settings()
+    check("caps reported by get_settings",
+          reported["max_avatar_log"] == 10000 and reported["max_player_changes"] == 10000,
+          str({k: reported[k] for k in ("max_avatar_log", "max_player_changes")}))
+
+
+def test_log_size_caps_survive_a_hand_edited_file() -> None:
+    """A hand-edited settings.json must not break the log on the next row."""
+    import storage
+
+    check("string number accepted",
+          storage.sanitize_settings({"max_avatar_log": "250"})["max_avatar_log"] == 250)
+    check("padded string accepted",
+          storage.sanitize_settings({"max_avatar_log": " 250 "})["max_avatar_log"] == 250)
+    check("float string accepted",
+          storage.sanitize_settings({"max_player_changes": "120"})
+          ["max_player_changes"] == 120)
+    # A decimal string is rejected rather than truncated, because picking 120
+    # out of "120.5" is a guess. The UI only ever sends integers, so this only
+    # affects a hand-edited file, where the default is the safe answer.
+    check("decimal string falls back rather than truncating",
+          storage.sanitize_settings({"max_player_changes": "120.0"})
+          ["max_player_changes"] == storage.DEFAULT_MAX_PLAYER_CHANGES)
+    unusable: list[dict] = [
+        {"max_avatar_log": 0}, {"max_avatar_log": -3},
+        {"max_avatar_log": 99999}, {"max_avatar_log": "nope"},
+        {"max_avatar_log": None}, {"max_avatar_log": True},
+        {"max_player_changes": []}, {"max_player_changes": {}},
+    ]
+    for bad in unusable:
+        clean = storage.sanitize_settings(bad)
+        key = next(iter(bad))
+        check(f"{bad} falls back",
+              clean[key] == (storage.DEFAULT_MAX_AVATAR_LOG if "avatar" in key
+                             else storage.DEFAULT_MAX_PLAYER_CHANGES), str(clean[key]))
+
+
 def test_log_dedupe_persisted() -> None:
     """A saved log entry without a bucket must not be replayed forever."""
     b = _isolated_backend()
@@ -759,6 +1006,15 @@ def test_log_dedupe_persisted() -> None:
 DEFAULT_ROBOT = "avtr_c38a1615-5bf5-42b4-84eb-a8b6c37cbd11"
 DEFAULT_KURO = "avtr_faf40a9f-ce39-4ff2-a069-223797ba11af"
 ORDINARY_ID = "avtr_32611e23-2508-4cbf-accb-b8625e37f546"
+
+
+def _avtr_id(index: int) -> str:
+    """A distinct well-formed avatar id for fixtures.
+
+    Hex-formatted, so the digits run 0-9 then a-f: writing an expected id as a
+    decimal literal in a test just gets the wrong answer.
+    """
+    return f"avtr_{index:08x}-1111-2222-3333-444444444444"
 
 
 def test_defaults_are_never_recorded() -> None:
@@ -1926,6 +2182,12 @@ def main() -> int:
         test_vrcache_locked_database,
         test_log_dedupe_across_sources,
         test_log_dedupe_persisted,
+        test_log_size_limits,
+        test_log_size_limits_enforced,
+        test_lowering_the_cap_trims_immediately,
+        test_log_size_caps_applied_at_startup,
+        test_log_size_caps_reject_nonsense,
+        test_log_size_caps_survive_a_hand_edited_file,
         test_defaults_are_never_recorded,
         test_defaults_are_not_recorded_as_player_changes,
         test_defaults_are_pruned_on_start,
