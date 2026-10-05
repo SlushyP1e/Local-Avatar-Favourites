@@ -35,7 +35,9 @@ class ApiError(Exception):
 
 
 class AuthError(ApiError):
-    pass
+    def __init__(self, message: str, status: int | None = None) -> None:
+        self.status = status
+        super().__init__(message)
 
 
 class TwoFactorRequired(ApiError):
@@ -173,9 +175,9 @@ class VRCApi:
             message = None
         message = message or payload.get("message")
         if status == 401:
-            raise AuthError(message or "Invalid credentials.")
+            raise AuthError(message or "Invalid credentials.", status)
         if status == 403:
-            raise AuthError(message or "Access denied.")
+            raise AuthError(message or "Access denied.", status)
         if status == 404:
             raise ApiError(message or "Not found.")
         if status == 429:
@@ -296,6 +298,36 @@ class VRCApi:
             return None
         self._raise_api_error(raw, status)
         return None  # pragma: no cover
+
+    def current_avatar(self) -> str:
+        """The avatar the account currently has selected, per VRChat's API.
+
+        This is a read-only confirmation: after an OSC switch the client
+        reports its active avatar to the server, so a matching value is proof the
+        request landed without needing a second, mutating call. Raises
+        AuthError on 401/403; returns "" when the response omits the field.
+        """
+        status, raw = self._request("GET", "/auth/user")
+        if status == 200:
+            return str(self._json(raw).get("currentAvatar") or "")
+        self._raise_api_error(raw, status)
+        return ""  # pragma: no cover
+
+    def select_avatar(self, avatar_id: str) -> dict:
+        """Ask VRChat's authenticated API to switch the current avatar.
+
+        This is a fallback for an OSC request that could not be sent or was not
+        acknowledged by the client. VRChat documents this as
+        ``PUT /avatars/{avatarId}/select``; server-side permission checks still
+        apply, so a successful request is not a way to wear an inaccessible
+        avatar.
+        """
+        escaped_id = quote(str(avatar_id), safe="")
+        status, raw = self._request("PUT", f"/avatars/{escaped_id}/select")
+        if status == 200:
+            return self._json(raw)
+        self._raise_api_error(raw, status)
+        return {}  # pragma: no cover
 
     def download_image(self, url: str, dest_path: str, max_bytes: int = MAX_IMAGE_BYTES) -> bool:
         """Download an image to disk (auth cookie sent automatically).

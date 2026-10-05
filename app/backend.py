@@ -11,12 +11,14 @@ from __future__ import annotations
 import base64
 import ctypes
 import json
+import logging
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
 from ctypes import wintypes
+from datetime import datetime
 from pathlib import Path
 
 import webview
@@ -32,6 +34,7 @@ from vrcdetails import DEFAULT_AVATAR_IDS, is_default_avatar, is_default_avatar_
 from vrclog import VRCLogWatcher
 
 RELEASES_API = "https://api.github.com/repos/SlushyP1e/Local-Avatar-Favourites/releases/latest"
+LOGGER = logging.getLogger(__name__)
 IMAGE_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -119,14 +122,17 @@ class Backend:
         # Set when the stored token stops working, so the UI can ask for a fresh
         # login instead of silently reporting every avatar as private.
         self.session_expired = False
-        # (avatar_id, monotonic timestamp) of an unconfirmed wear request.
+        # (avatar_id, monotonic timestamp) of the active wear request. An OSC
+        # echo alone is not confirmation: VRChat may echo the requested id and
+        # then reject it, so keep this active through the refusal/API-fallback
+        # window.
         self._pending_wear: tuple[str, float] | None = None
-        # The last id we asked VRChat to wear, kept *after* _pending_wear is
-        # cleared. VRChat echoes the requested id over OSC before deciding
-        # whether it can honour the request, and that echo clears _pending_wear
-        # -- so the refusal arrives with nothing left to match against. Without
-        # this the one message that explains the failure can never be shown.
+        self._pending_wear_wall_time: datetime | None = None
+        # Diagnostic copy only. Matching always uses _pending_wear and this is
+        # cleared as soon as an OSC event, refusal, timeout, or API result is
+        # processed; it must never make an unrelated log line look current.
         self._last_request: tuple[str, float] | None = None
+        self._api_fallback_wear: tuple[str, float] | None = None
         self._jobs = JobRegistry()
         self._runner = JobRunner(self._jobs)
 
@@ -205,11 +211,12 @@ class Backend:
             changed_changes = False
             for event in events:
                 if event["type"] == "avatar-id":
+                    self._confirm_wear_from_log(event["id"], event.get("time", ""))
                     if self._record_log(event["id"], event.get("time", ""),
                                         save=False, source=SOURCE_LOG):
                         changed_log = True
                 elif event["type"] == "avatar-inaccessible":
-                    self._note_inaccessible(event["id"])
+                    self._note_inaccessible(event["id"], event.get("time", ""))
                 elif event["type"] == "avatar-change" and self._record_change(
                     event.get("player", ""),
                     event.get("avatar", ""),
@@ -276,59 +283,157 @@ class Backend:
     def _set_status(self, text: str) -> None:
         self.status = text
 
+    @staticmethod
+    def _debug_wear(source: str, avatar_id: str, reason: str, timestamp: str = "") -> None:
+        timestamp = timestamp or datetime.now().astimezone().isoformat(timespec="milliseconds")
+        LOGGER.debug(
+            "wear_event timestamp=%s source=%s avatar_id=%s reason=%s",
+            timestamp,
+            source,
+            avatar_id,
+            reason,
+        )
+
+    def _log_event_matches_pending(self, event_time: str) -> bool:
+        """Reject log events missing a timestamp or predating the active click."""
+        request_time = self._pending_wear_wall_time
+        if request_time is None or not event_time:
+            return False
+        try:
+            parsed = datetime.fromisoformat(event_time)
+        except (TypeError, ValueError):
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        # VRChat timestamps have one-second precision, so compare at that same
+        # precision rather than rejecting a line written during the request's
+        # timestamp second due to sub-second wall-clock differences.
+        return parsed.replace(microsecond=0) >= request_time.replace(microsecond=0)
+
     def _on_avatar_change(self, avatar_id: str) -> None:
+        avatar_id = self._norm_id(avatar_id)
         with self._lock:
             pending = self._pending_wear
-            # VRChat echoing the id back is the only confirmation of a wear.
-            if pending and pending[0] == avatar_id:
-                self._pending_wear = None
+            is_echo = bool(pending and pending[0] == avatar_id)
+            if is_echo:
+                # VRChat can echo /avatar/change before it decides whether the
+                # avatar can be loaded. Keep _pending_wear live so the matching
+                # refusal line can still be correlated; this echo alone is not
+                # proof that the client actually loaded the avatar.
+                self._last_request = None
+            elif pending is None:
+                self._last_request = None
+        self._debug_wear(
+            SOURCE_OSC,
+            avatar_id,
+            "requested id echoed; awaiting client load/refusal" if is_echo
+            else "avatar-change OSC event received",
+        )
         self._record_log(avatar_id, source=SOURCE_OSC)
         entry = self._entry(avatar_id)
-        name = f"Now wearing {entry['name']}." if entry and entry.get("name") \
-            else f"Now wearing {avatar_id}."
+        label = entry.get("name") if entry and entry.get("name") else avatar_id
+        if is_echo:
+            name = f"VRChat echoed the request for {label}; waiting for load confirmation."
+        else:
+            name = f"Now wearing {label}."
         self._set_status(name)
 
-    def _note_inaccessible(self, avatar_id: str) -> None:
+    def _confirm_wear_from_log(self, avatar_id: str, event_time: str = "") -> bool:
+        """Confirm a wear only from a fresh client log load/save event."""
+        avatar_id = self._norm_id(avatar_id)
+        with self._lock:
+            pending = self._pending_wear
+            if pending is None or pending[0] != avatar_id:
+                return False
+            age = time.monotonic() - pending[1]
+            if age > WEAR_REFUSAL_WINDOW:
+                return False
+            if not self._log_event_matches_pending(event_time):
+                self._debug_wear(SOURCE_LOG, avatar_id,
+                                 "ignored load event: timestamp missing or predates active request",
+                                 event_time)
+                return False
+            self._pending_wear = None
+            self._pending_wear_wall_time = None
+            self._last_request = None
+            self._api_fallback_wear = None
+            entry = self._entry(avatar_id)
+            if entry is not None and entry.pop("inaccessible", None) is not None:
+                storage.save_favourites(self.entries)
+                self._touch("entries")
+            label = entry.get("name") if entry and entry.get("name") else avatar_id
+        self._debug_wear(SOURCE_LOG, avatar_id, "client log confirmed avatar data loaded", event_time)
+        self._set_status(f"Now wearing {label} (confirmed by VRChat's client log).")
+        return True
+
+    def _note_inaccessible(self, avatar_id: str, event_time: str = "") -> None:
         """VRChat refused an avatar change; correct the optimistic success.
 
         VRChat broadcasts the requested id over OSC before it decides whether it
         can honour the request, so an inaccessible avatar arrives looking exactly
         like a successful switch. Nothing follows it in the log either -- no load,
-        no revert -- so the id stays current and the usual timeout never fires
-        with an explanation.
+        no revert -- so the active request must stay pending long enough for this
+        current-session log event to explain the refusal.
 
-        This is the only signal that says what actually went wrong, and it is
-        common: ids discovered by a tracker include avatars that are private,
-        deleted or region-locked, none of which can be worn or cloned.
+        The log reports that this request was refused, but does not give a
+        reason or establish that future requests will also fail. Keep that
+        distinction: a refusal is useful history, not an eligibility verdict.
         """
         avatar_id = self._norm_id(avatar_id)
+        request: tuple[str, float] | None
         with self._lock:
-            # Matched against the remembered request rather than _pending_wear:
-            # the optimistic broadcast already cleared that, and this line
-            # always follows it. Bounded, so a refusal hours later -- the user
-            # trying the same avatar from VRChat's own menu, say -- is not
-            # announced as though the app had asked for it.
-            request = self._last_request
-            if not request or request[0] != avatar_id:
+            # Only the currently active request can be refused. A timestamp
+            # left behind by an older click is never sufficient to attribute a
+            # later line from the client log.
+            request = self._pending_wear
+            if request is None:
+                self._debug_wear(SOURCE_LOG, avatar_id, "ignored refusal: no active wear request",
+                                 event_time)
                 return
-            if time.monotonic() - request[1] > WEAR_REFUSAL_WINDOW:
+            age = time.monotonic() - request[1]
+            if request[0] != avatar_id:
+                self._debug_wear(SOURCE_LOG, avatar_id,
+                                 f"ignored refusal: active request is for {request[0]}",
+                                 event_time)
                 return
-            if self._pending_wear and self._pending_wear[0] == avatar_id:
-                self._pending_wear = None
+            if age > WEAR_REFUSAL_WINDOW:
+                self._debug_wear(SOURCE_LOG, avatar_id,
+                                 f"ignored refusal: active request is {age:.2f}s old",
+                                 event_time)
+                return
+            if not self._log_event_matches_pending(event_time):
+                self._debug_wear(SOURCE_LOG, avatar_id,
+                                 "ignored refusal: timestamp missing or predates active request",
+                                 event_time)
+                return
+            self._last_request = None
             entry = self._entry(avatar_id)
             name = entry.get("name") if entry else None
-            # Remember it. VRChat gives no reason beyond the single log line, so
-            # re-deriving it means another silent failure and another puzzled
-            # click. Marking the card stops that happening a third time.
+            # Keep the last refusal as useful history, but do not treat it as a
+            # permanent property of the avatar. A refusal can be transient (for
+            # example, while VRChat is resolving an avatar it has not loaded
+            # before), and VRChat exposes no API field that makes this a reliable
+            # pre-flight eligibility check.
             if entry is not None and not entry.get("inaccessible"):
                 entry["inaccessible"] = True
                 storage.save_favourites(self.entries)
                 self._touch("entries")
+            logged_in = self.api.is_logged_in()
+            if not logged_in:
+                self._pending_wear = None
+                self._pending_wear_wall_time = None
+                self._api_fallback_wear = None
+        self._debug_wear(SOURCE_LOG, avatar_id,
+                         f"matched active request (age={age:.2f}s); client refusal",
+                         event_time)
         label = f'"{name}"' if name else avatar_id
+        if logged_in:
+            self._start_api_fallback(avatar_id, request[1], "VRChat client refusal")
+            return
         self._set_status(
-            f"VRChat refused {label}. It is private, deleted, or not available "
-            "to your account -- so it cannot be worn or cloned. "
-            "This is remembered; the card is now marked."
+            f"VRChat's client refused the OSC wear request for {label}. "
+            "The app is not logged in, so the API fallback was not available. "
+            "Log in in Settings and try again."
         )
 
     def _record_log(self, avatar_id: str, when: str = "", save: bool = True,
@@ -640,61 +745,161 @@ class Backend:
 
     def wear(self, avatar_id: str) -> dict:
         avatar_id = self._norm_id(avatar_id)
-        if self.osc.error:
-            return {"ok": False, "title": "OSC error", "message": self.osc.error}
-        if not self.osc.listening:
-            return {"ok": False, "title": "OSC not running",
-                    "message": "The OSC connection is not active."}
         with self._lock:
             entry = self._entry(avatar_id)
+            # A previous refusal is only the result of one request, not reliable
+            # evidence that this avatar can never be worn. In particular, do not
+            # let a stale/local flag prevent the user's next explicit OSC send.
             if entry is not None and entry.get("inaccessible"):
-                # Already known to be unwearable. Saying so up front is kinder
-                # than letting VRChat ignore the request in silence again.
-                name = f'"{entry.get("name") or avatar_id}"'
-                return {
-                    "ok": False,
-                    "title": "VRChat won't wear this avatar",
-                    "message": f"VRChat refused {name} the last time you tried, so "
-                               "it is not available to your account. It may be "
-                               "private, restricted, or removed since you found it.",
-                }
+                entry.pop("inaccessible", None)
+                storage.save_favourites(self.entries)
+                self._touch("entries")
             # VRChat does not acknowledge /avatar/change. It broadcasts the new id
-            # back once the avatar actually loads, which is the only confirmation we
-            # get, so remember what we asked for and check it later.
-            self._pending_wear = (avatar_id, time.monotonic())
+            # back before load/refusal is decided, so retain the request until a
+            # client log confirms load, VRChat refuses it, or it times out.
+            request = (avatar_id, time.monotonic())
+            self._pending_wear = request
+            self._pending_wear_wall_time = datetime.now().astimezone().replace(microsecond=0)
             self._last_request = self._pending_wear
-        if self.osc.change_avatar(avatar_id):
-            self._set_status("Requested avatar change over OSC.")
-            return {"ok": True, "pending": avatar_id}
+            self._api_fallback_wear = None
+
+        osc_reason = self.osc.error or "OSC listener is not running"
+        if not self.osc.error and self.osc.listening:
+            if self.osc.change_avatar(avatar_id):
+                self._set_status("Requested avatar change over OSC; waiting for VRChat confirmation.")
+                self._debug_wear(SOURCE_OSC, avatar_id, "OSC /avatar/change packet sent")
+                return {"ok": True, "pending": avatar_id}
+            osc_reason = "OSC /avatar/change packet could not be sent"
+
+        if self._start_api_fallback(avatar_id, request[1], f"OSC send unavailable: {osc_reason}"):
+            return {"ok": True, "pending": avatar_id, "fallback": "api"}
+
         with self._lock:
+            if self._pending_wear == request:
+                self._pending_wear = None
+                self._pending_wear_wall_time = None
+                self._last_request = None
+                self._api_fallback_wear = None
+        message = (
+            f"{osc_reason}. The VRChat API fallback was not attempted because the app "
+            "is not authenticated. Log in in Settings to use API avatar selection."
+        )
+        self._debug_wear(SOURCE_OSC, avatar_id, f"send failed; {message}")
+        self._set_status(message)
+        return {"ok": False, "title": "Avatar wear request failed", "message": message}
+
+    def _start_api_fallback(self, avatar_id: str, requested_at: float, reason: str) -> bool:
+        """Start one authenticated API selection for the active wear request."""
+        if not self.api.is_logged_in():
+            return False
+        request = (avatar_id, requested_at)
+        with self._lock:
+            if self._pending_wear != request:
+                return False
+            if self._api_fallback_wear == request:
+                return True
+            self._api_fallback_wear = request
+        self._debug_wear("vrchat-api", avatar_id, f"starting fallback: {reason}")
+        self._set_status(f"{reason}; trying authenticated VRChat API avatar selection...")
+        threading.Thread(
+            target=self._api_wear_worker,
+            args=(avatar_id, requested_at, reason),
+            daemon=True,
+        ).start()
+        return True
+
+    def _api_wear_worker(self, avatar_id: str, requested_at: float, reason: str) -> None:
+        """Run the API selection away from the UI and log-poll threads."""
+        request = (avatar_id, requested_at)
+        api_error = ""
+        auth_expired = False
+        outcome = ""
+        try:
+            # Read-only check first. The client reports its active avatar to
+            # VRChat, so a matching value proves the request landed and avoids a
+            # second, mutating switch on every successful wear.
+            if self._norm_id(self.api.current_avatar()) == avatar_id:
+                outcome = "confirmed"
+            else:
+                result = self.api.select_avatar(avatar_id)
+                selected_id = self._norm_id(result.get("currentAvatar"))
+                if selected_id and selected_id != avatar_id:
+                    api_error = (f"API returned currentAvatar={selected_id} "
+                                 f"instead of {avatar_id}")
+                else:
+                    outcome = "selected"
+        except AuthError as exc:
+            auth_expired = getattr(exc, "status", None) == 401
+            api_error = str(exc) or "VRChat denied API avatar selection"
+            if auth_expired:
+                self._handle_session_expired(exc)
+        except ApiError as exc:
+            api_error = str(exc)
+        except Exception as exc:  # pragma: no cover - defensive bridge boundary
+            api_error = f"Unexpected API error: {exc}"
+
+        with self._lock:
+            if self._pending_wear != request or self._api_fallback_wear != request:
+                self._debug_wear("vrchat-api", avatar_id,
+                                 "ignored result for a superseded wear request")
+                return
             self._pending_wear = None
-        return {"ok": False, "title": "Wear failed",
-                "message": "Could not send the avatar change over OSC."}
+            self._pending_wear_wall_time = None
+            self._last_request = None
+            self._api_fallback_wear = None
+            entry = self._entry(avatar_id)
+            if outcome and entry is not None and entry.pop("inaccessible", None) is not None:
+                storage.save_favourites(self.entries)
+                self._touch("entries")
+            label = entry.get("name") if entry and entry.get("name") else avatar_id
+
+        if outcome == "confirmed":
+            message = f"VRChat already reports {label} as your current avatar."
+            self._debug_wear("vrchat-api", avatar_id,
+                             f"confirmed server-side after {reason}")
+        elif outcome == "selected":
+            message = f"VRChat API selected {label} after {reason.lower()}."
+            self._debug_wear("vrchat-api", avatar_id, f"selection accepted after {reason}")
+        elif auth_expired:
+            message = (
+                f"{reason}; OSC was not confirmed and the VRChat API fallback failed because "
+                "the app session expired. Log in again in Settings."
+            )
+            self._debug_wear("vrchat-api", avatar_id, f"authentication failed: {api_error}")
+        else:
+            message = f"{reason}; VRChat API avatar selection failed: {api_error}"
+            self._debug_wear("vrchat-api", avatar_id, f"selection failed: {api_error}")
+        self._set_status(message)
 
     def _expire_pending_wear(self) -> None:
-        """Report a wear that VRChat never confirmed.
-
-        Most avatars load fine. VRChat refuses ones the account cannot use --
-        private avatars, or paid avatars it does not own -- and it does that
-        silently, so without this the click just appears to do nothing.
-        """
+        """Use the authenticated API if OSC receives no load/refusal confirmation."""
         with self._lock:
             pending = self._pending_wear
             if pending is None:
                 return
             avatar_id, requested_at = pending
-            if time.monotonic() - requested_at < WEAR_CONFIRM_TIMEOUT:
+            age = time.monotonic() - requested_at
+            if age < WEAR_CONFIRM_TIMEOUT or self._api_fallback_wear == pending:
+                return
+            entry = self._entry(avatar_id)
+            name = entry.get("name") if entry and entry.get("name") else avatar_id
+
+        reason = f"OSC request timed out after {age:.1f}s without client load confirmation"
+        self._debug_wear("osc-timeout", avatar_id,
+                         f"{reason}; current OSC avatar={self.osc.current_avatar_id or 'unknown'}")
+        if self._start_api_fallback(avatar_id, requested_at, reason):
+            return
+
+        with self._lock:
+            if self._pending_wear != pending:
                 return
             self._pending_wear = None
-            if self.osc.current_avatar_id == avatar_id:
-                return
-        entry = self._entry(avatar_id)
-        name = f'"{entry["name"]}"' if entry and entry.get("name") else avatar_id
+            self._pending_wear_wall_time = None
+            self._last_request = None
+            self._api_fallback_wear = None
         self._set_status(
-            f"VRChat did not switch to {name}. It may be private, deleted, or a "
-            "paid avatar your account does not own. IDs discovered by a tracker "
-            "often are -- they include avatars other players wore that you "
-            "cannot access."
+            f"OSC timed out without confirming {name}. The VRChat API fallback was skipped "
+            "because the app is not authenticated; log in in Settings and try again."
         )
 
     def delete(self, avatar_id: str) -> dict:
@@ -872,7 +1077,7 @@ class Backend:
                 return
             self.session_expired = True
         self._set_status(
-            "VRChat session expired - log in again in Settings to fetch names and thumbnails."
+            "VRChat session expired - log in again in Settings to fetch metadata and use API avatar selection."
         )
 
     def wear_last(self) -> dict:

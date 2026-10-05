@@ -101,10 +101,6 @@ IGNORED_ID_LINE_MARKERS = (
     "did not pass initial checks",
 )
 
-# VRChat's log grows without bound during a session. On a new session we start
-# this far from the end rather than at byte 0: re-parsing a few hundred
-# megabytes in one gulp blocks the poll loop and holds the GIL.
-TAIL_BYTES = 4 * 1024 * 1024
 # Upper bound on how much is consumed per poll, so a burst cannot stall the loop.
 MAX_CHUNK_BYTES = 2 * 1024 * 1024
 
@@ -132,6 +128,11 @@ class VRCLogWatcher:
     def __init__(self) -> None:
         self._path: Path | None = None
         self._offset = 0
+        self._file_identity: tuple[int, int] | None = None
+        self._partial_line = b""
+        # Log files can survive across app launches. Events with an older or
+        # missing timestamp are never treated as current-session activity.
+        self._session_started_at = datetime.now().astimezone().replace(microsecond=0)
 
     def latest_log(self) -> Path | None:
         directory = log_directory()
@@ -149,38 +150,71 @@ class VRCLogWatcher:
             return events
 
         try:
-            size = latest.stat().st_size
+            stat = latest.stat()
         except OSError:
             return events
+        identity = (stat.st_dev, stat.st_ino)
 
-        if self._path != latest:
-            # New session (or VRChat restarted). Start near the end of the file:
-            # anything older has already been reported by a previous run, and
-            # reading the whole file from byte 0 is slow enough to stall us.
-            self._path = latest
-            self._offset = max(0, size - TAIL_BYTES)
+        if self._path != latest or self._file_identity != identity:
+            # On startup, rotation, or replacement, explicitly seek to EOF.
+            # Never parse the tail of an old session as fresh refusal events for
+            # a wear request made in this process.
+            self._seek_to_end(latest)
+            return events
 
-        if size < self._offset:
-            # Truncated or replaced underneath us; start over from the tail.
-            self._offset = max(0, size - TAIL_BYTES)
-        if size == self._offset:
+        if stat.st_size < self._offset:
+            # A log truncated in place is a new stream too. Ignore its existing
+            # contents and observe only later appended lines.
+            self._seek_to_end(latest)
+            return events
+        if stat.st_size == self._offset:
             return events
 
         try:
-            with open(latest, encoding="utf-8", errors="ignore") as handle:
-                if self._offset:
-                    # A mid-file seek can land inside a line; drop the fragment.
-                    handle.seek(self._offset)
-                    handle.readline()
-                    handle.seek(handle.tell())
+            with open(latest, "rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if (opened.st_dev, opened.st_ino) != identity:
+                    self._seek_to_end(latest)
+                    return events
+                handle.seek(self._offset)
                 chunk = handle.read(MAX_CHUNK_BYTES)
                 self._offset = handle.tell()
         except OSError:
             return events
 
-        for line in chunk.splitlines():
-            self._parse_line(line, events)
+        lines = (self._partial_line + chunk).split(b"\n")
+        self._partial_line = lines.pop()
+        for raw_line in lines:
+            line = raw_line.rstrip(b"\r").decode("utf-8", errors="ignore")
+            parsed: list[dict] = []
+            self._parse_line(line, parsed)
+            events.extend(event for event in parsed if self._is_current_session(event))
         return events
+
+    def _seek_to_end(self, path: Path) -> bool:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                self._offset = handle.tell()
+                stat = os.fstat(handle.fileno())
+        except OSError:
+            return False
+        self._path = path
+        self._file_identity = (stat.st_dev, stat.st_ino)
+        self._partial_line = b""
+        return True
+
+    def _is_current_session(self, event: dict) -> bool:
+        timestamp = event.get("time")
+        if not timestamp:
+            return False
+        try:
+            event_time = datetime.fromisoformat(timestamp)
+        except (TypeError, ValueError):
+            return False
+        if event_time.tzinfo is None:
+            event_time = event_time.astimezone()
+        return event_time >= self._session_started_at
 
     @staticmethod
     def _parse_line(line: str, events: list[dict]) -> None:

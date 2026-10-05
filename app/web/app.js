@@ -681,7 +681,7 @@ function renderGrid(force) {
     q: $("search").value,
     s: $("sort").value,
     c: state.current_avatar_id,
-    items: list.map((e) => [e.id, e.name, e.thumb, e.author, e.favorite,
+    items: list.map((e) => [e.id, e.name, e.thumb, e.author, e.favorite, !!e.inaccessible,
       e.release_status, (e.platforms || []).join(","), (e.tags || []).join(",")]),
   });
   if (!force && sig === lastGridSig) return;
@@ -715,10 +715,9 @@ function renderGrid(force) {
     const favOn = entry.favorite ? "on" : "";
     const badges = [];
     if (entry.inaccessible) {
-      // VRChat already refused this one. Worth saying on the card rather than
-      // letting the user click Wear and watch nothing happen.
-      badges.push('<span class="platform-badge" title="VRChat refused to wear this avatar. '
-        + 'It is not available to your account.">unwearable</span>');
+      // This records a previous refusal, not a permanent wearability verdict.
+      badges.push('<span class="platform-badge" title="VRChat refused the previous wear request. '
+        + 'You can try again.">last attempt refused</span>');
     }
     if (entry.release_status) {
       badges.push(`<span class="platform-badge ${entry.release_status === "public" ? "public" : ""}">${escapeHtml(entry.release_status)}</span>`);
@@ -733,7 +732,7 @@ function renderGrid(force) {
         <button class="fav-btn ${favOn}" title="Favorite">♥</button>
         ${entry.id === state.current_avatar_id ? '<span class="badge wearing-badge">● Wearing</span>' : ""}
         <div class="poster-actions">
-          <button class="btn primary wear-quick"${entry.inaccessible ? " disabled" : ""}>Wear</button>
+          <button class="btn primary wear-quick">Wear</button>
         </div>
       </div>
       <div class="card-body">
@@ -768,14 +767,6 @@ function renderGrid(force) {
     });
     card.querySelector(".wear-quick").addEventListener("click", (e) => {
       e.stopPropagation();
-      // A disabled button swallows clicks in a real browser, but the context
-      // menu and Enter/keyboard paths still reach here, so check as well.
-      if (entry.inaccessible) {
-        showAlert("VRChat won't wear this avatar",
-          "VRChat already refused this one, so it is not available to your "
-          + "account. It may be private, restricted, or removed since you found it.");
-        return;
-      }
       wear(entry.id);
     });
     frag.appendChild(card);
@@ -1266,17 +1257,8 @@ function cardMenuItems(entry) {
   return [
     {
       icon: "▶",
-      label: entry.inaccessible ? "Unwearable - VRChat refused it" : "Wear Avatar",
-      disabled: !!entry.inaccessible,
-      action: () => {
-        if (entry.inaccessible) {
-          showAlert("VRChat won't wear this avatar",
-            "VRChat already refused this one, so it is not available to your "
-            + "account. It may be private, restricted, or removed since you found it.");
-          return;
-        }
-        wear(entry.id);
-      },
+      label: "Wear Avatar",
+      action: () => wear(entry.id),
     },
     {
       icon: "♥",

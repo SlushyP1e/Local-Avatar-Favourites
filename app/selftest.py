@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -102,6 +103,36 @@ def test_api_helpers() -> None:
     check("cookie domain", cookie.domain == "api.vrchat.cloud")
 
 
+def test_select_avatar_api_endpoint() -> None:
+    from api import AuthError, VRCApi
+
+    avatar_id = "avtr_b2863f70-318b-4ec5-99de-7a41227fa1e8"
+    api = VRCApi("token")
+    calls: list[tuple[str, str]] = []
+
+    def success(method, path, **kwargs):
+        calls.append((method, path))
+        return 200, json.dumps({"currentAvatar": avatar_id}).encode("utf-8")
+
+    api._request = success
+    selected = api.select_avatar(avatar_id)
+    check("select avatar uses documented PUT endpoint",
+          calls == [("PUT", f"/avatars/{avatar_id}/select")], str(calls))
+    check("select avatar returns current avatar", selected.get("currentAvatar") == avatar_id,
+          str(selected))
+
+    def unauthorized(method, path, **kwargs):
+        return 401, b'{"error":{"message":"Missing Credentials"}}'
+
+    api._request = unauthorized
+    try:
+        api.select_avatar(avatar_id)
+        check("select avatar reports expired authentication", False)
+    except AuthError as exc:
+        check("select avatar reports expired authentication",
+              exc.status == 401 and "Missing Credentials" in str(exc), str(exc))
+
+
 def test_storage_merge() -> None:
     existing = [storage.new_entry("avtr_aaaa", "Existing")]
     incoming = [
@@ -168,55 +199,62 @@ def test_refused_wear_is_not_reported_as_a_success() -> None:
     check("fixture entry named", b._entry(avatar_id) is not None
           and b._entry(avatar_id)["name"] == name, str(b.entries))
 
-    # Request the switch for real, so _last_request is populated the way the
-    # running app populates it. Only the UDP send is stubbed.
+    # Request the switch for real. Only the UDP send is stubbed.
     b.osc.change_avatar = lambda avatar_id: True
     b.osc.listening = True
     sent = b.wear(avatar_id)
     check("wear accepted", sent.get("ok") is True, str(sent))
 
-    # The optimistic broadcast, delivered the way VRChat delivers it: through the
-    # OSC bridge's handler, which is what sets current_avatar_id and then calls
-    # the backend's listener.
+    # VRChat can echo the requested id before deciding whether it can load it.
     b.osc._handle_avatar_change("/avatar/change", avatar_id)
     check("broadcast seen as current", b.osc.current_avatar_id == avatar_id)
-    check("broadcast reported as worn", "Now wearing" in b.status, b.status)
+    check("echo is not treated as load confirmation", "waiting for load confirmation" in b.status,
+          b.status)
+    check("active request remains available for refusal correlation", b._pending_wear is not None)
+    check("last request copy is cleared on OSC echo", b._last_request is None)
 
     # Then the refusal lands in the log a moment later.
-    b._note_inaccessible(avatar_id)
+    event_time = datetime.now().astimezone().isoformat(timespec="seconds")
+    b._note_inaccessible(avatar_id, event_time)
     check("pending wear cleared", b._pending_wear is None, str(b._pending_wear))
     check("status says refused", "refused" in b.status.lower(), b.status)
     check("status names the avatar", name in b.status, b.status)
-    check("status explains why",
-          "private" in b.status.lower() or "not available" in b.status.lower(), b.status)
-    check("status says it cannot be cloned",
-          "clone" in b.status.lower(), b.status)
+    check("status identifies client refusal", "client refused" in b.status.lower(), b.status)
+    check("status identifies missing API authentication",
+          "not logged in" in b.status.lower(), b.status)
 
-    # Someone else's refusal is routine and must not be announced.
+    # A refusal for a different id cannot match the active request.
     b._set_status("untouched")
-    b._note_inaccessible("avtr_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    b._note_inaccessible("avtr_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", event_time)
     check("an unrelated refusal is ignored", b.status == "untouched", repr(b.status))
 
-    # And a refusal long after the request is not ours to explain.
+    # A stale last-request timestamp is never enough without an active request.
     b._set_status("untouched")
-    b._last_request = (avatar_id, __import__("time").monotonic() - 3600)
-    b._note_inaccessible(avatar_id)
-    check("a stale refusal is ignored", b.status == "untouched", repr(b.status))
+    b._last_request = (avatar_id, time.monotonic())
+    b._note_inaccessible(avatar_id, event_time)
+    check("a refusal without active pending is ignored", b.status == "untouched", repr(b.status))
 
-    # A refusal while nothing was ever requested must not invent a status.
-    b._set_status("")
+    # A current pending id still cannot claim a log line timestamped before the
+    # user clicked Wear.
+    b.wear(avatar_id)
+    b._set_status("untouched")
+    b._note_inaccessible(avatar_id, "2020-01-02T03:04:05+00:00")
+    check("pre-request refusal timestamp is ignored", b.status == "untouched", b.status)
+    check("pre-request event leaves current request pending", b._pending_wear is not None)
+    b._pending_wear = None
+    b._pending_wear_wall_time = None
     b._last_request = None
-    b._note_inaccessible("avtr_bbbbbbbb-cccc-4ddd-8eee-ffffffffffff")
-    check("no pending wear means no message", b.status == "", repr(b.status))
+
+    # Even a matching id is ignored when the active request is too old.
+    b._set_status("")
+    from backend import WEAR_REFUSAL_WINDOW
+    b._pending_wear = (avatar_id, time.monotonic() - WEAR_REFUSAL_WINDOW - 1)
+    b._note_inaccessible(avatar_id, event_time)
+    check("an expired pending request is ignored", b.status == "", repr(b.status))
 
 
-def test_a_refused_avatar_is_remembered_and_blocked() -> None:
-    """One refusal must stop the user repeating it.
-
-    VRChat gives no reason beyond a single log line, so re-deriving the answer
-    means another silent failure and another puzzled click. The refusal is
-    therefore written onto the entry, where it survives restarts and exports.
-    """
+def test_a_refused_avatar_can_be_retried() -> None:
+    """A refusal is historical feedback, not a permanent preflight veto."""
     b = _isolated_backend()
     avatar_id = "avtr_3ee37c96-3a1d-4edc-b2ba-6e576d6f140b"
     b.add_by_id(avatar_id)
@@ -226,16 +264,16 @@ def test_a_refused_avatar_is_remembered_and_blocked() -> None:
 
     b.wear(avatar_id)
     b.osc._handle_avatar_change("/avatar/change", avatar_id)
-    b._note_inaccessible(avatar_id)
+    b._note_inaccessible(avatar_id, datetime.now().astimezone().isoformat(timespec="seconds"))
 
     entry = b._entry(avatar_id)
-    check("entry marked unwearable", entry is not None and entry.get("inaccessible") is True,
+    check("last refusal recorded", entry is not None and entry.get("inaccessible") is True,
           str(entry))
     check("mark persisted", storage.load_favourites()[0].get("inaccessible") is True,
           str(storage.load_favourites()))
-    check("status says it is remembered", "remembered" in b.status.lower(), b.status)
+    check("status explains retry path", "try again" in b.status.lower(), b.status)
 
-    # A second attempt is refused up front, with no OSC traffic at all.
+    # A second explicit attempt must reach VRChat even with a remembered refusal.
     sent: list[str] = []
 
     def record_send(value) -> bool:
@@ -244,11 +282,13 @@ def test_a_refused_avatar_is_remembered_and_blocked() -> None:
 
     b.osc.change_avatar = record_send
     again = b.wear(avatar_id)
-    check("second wear refused", again.get("ok") is False, str(again))
-    check("nothing sent to VRChat", sent == [], str(sent))
-    check("refusal is explained", "not available to your account" in again.get("message", ""),
-          str(again))
-    check("no second status message", "VRChat refused" in b.status, b.status)
+    check("retry accepted", again.get("ok") is True, str(again))
+    check("retry sent to VRChat", sent == [avatar_id], str(sent))
+    check("old refusal cleared before retry", "inaccessible" not in b._entry(avatar_id),
+          str(b._entry(avatar_id)))
+    check("old refusal removed from disk",
+          "inaccessible" not in storage.load_favourites()[0],
+          str(storage.load_favourites()))
 
     # An unrelated avatar is unaffected.
     other = "avtr_010d4eb7-f46d-455e-a951-26d30c839ade"
@@ -256,16 +296,19 @@ def test_a_refused_avatar_is_remembered_and_blocked() -> None:
     check("other avatar still wearable", b.wear(other).get("ok") is True,
           str(b.wear(other)))
 
-    # Clearing it is possible: the avatar could become available later.
-    with b._lock:
-        b._entry(avatar_id)["inaccessible"] = False
-        storage.save_favourites(b.entries)
-    check("clearing the mark allows a retry", b.wear(avatar_id).get("ok") is True,
-          str(b.wear(avatar_id)))
+    # A retry may be refused again; that latest attempt is recorded, but still
+    # remains retryable rather than disabling the next request.
+    b.wear(avatar_id)
+    b.osc._handle_avatar_change("/avatar/change", avatar_id)
+    b._note_inaccessible(avatar_id, datetime.now().astimezone().isoformat(timespec="seconds"))
+    check("new refusal is recorded", b._entry(avatar_id).get("inaccessible") is True,
+          str(b._entry(avatar_id)))
+    check("new refusal still permits another retry", b.wear(avatar_id).get("ok") is True,
+          str(b.status))
 
 
-def test_unwearable_mark_survives_export_and_import() -> None:
-    """A refusal is a fact about the avatar, not about this install."""
+def test_last_refusal_survives_export_and_import() -> None:
+    """A previous refusal remains visible as history after import."""
     b = _isolated_backend()
     avatar_id = "avtr_3ee37c96-3a1d-4edc-b2ba-6e576d6f140b"
     b.add_by_id(avatar_id)
@@ -313,6 +356,39 @@ def test_vrclog_parse() -> None:
               and id_events[0]["type"] == "avatar-id"
               and id_events[0]["id"] == "avtr_12345678-1234-1234-1234-123456789abc",
               str(id_events))
+
+
+def test_vrclog_starts_at_eof_and_filters_old_timestamps() -> None:
+    import vrclog
+
+    avatar_id = "avtr_b2863f70-318b-4ec5-99de-7a41227fa1e8"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "output_log_previous_session.txt"
+        old_line = (
+            "2020.01.02 03:04:05 Error - Trying to change to an inaccessible "
+            f"avatar: {avatar_id}\n"
+        )
+        path.write_text(old_line, encoding="utf-8")
+
+        watcher = vrclog.VRCLogWatcher()
+        watcher.latest_log = lambda: path
+        check("watcher startup ignores historical lines", watcher.poll() == [])
+        check("watcher startup seeks exactly to EOF", watcher._offset == path.stat().st_size,
+              f"{watcher._offset} / {path.stat().st_size}")
+
+        now = datetime.now().astimezone().strftime("%Y.%m.%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{now} Error - Trying to change to an inaccessible avatar: "
+                         f"{avatar_id}\n")
+        fresh_events = watcher.poll()
+        check("watcher reads a new refusal after EOF",
+              len(fresh_events) == 1 and fresh_events[0]["type"] == "avatar-inaccessible",
+              str(fresh_events))
+
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"2020.01.02 03:04:05 Error - Trying to change to an inaccessible "
+                         f"avatar: {avatar_id}\n")
+        check("watcher filters old-timestamp appended lines", watcher.poll() == [])
 
 
 def test_vrclog_ignores_noise_lines() -> None:
@@ -1426,7 +1502,7 @@ def test_auth_token_encryption() -> None:
 
 
 def test_wear_confirms_or_reports_failure() -> None:
-    """VRChat never acknowledges /avatar/change, so we infer the outcome."""
+    """OSC echoes are provisional; client logs confirm loads, timeout is explicit."""
     import backend
 
     b = _isolated_backend()
@@ -1437,10 +1513,11 @@ def test_wear_confirms_or_reports_failure() -> None:
     entry = b._entry(avatar_id)
     entry["name"] = "Test Avatar"
 
-    # No OSC socket in the isolated backend: sending fails and nothing is pending.
+    # No OSC socket or API login: report the actual unauthenticated fallback state.
     res = b.wear(avatar_id)
     check("wear reports the OSC problem", res["ok"] is False, str(res))
     check("failed send leaves nothing pending", b._pending_wear is None)
+    check("failed send explains missing API login", "not authenticated" in b.status.lower(), b.status)
 
     # Simulate a successful send so the confirmation path can be exercised.
     b.osc.listening = True
@@ -1460,24 +1537,32 @@ def test_wear_confirms_or_reports_failure() -> None:
     # Not yet due: nothing should be reported.
     b._expire_pending_wear()
     check("pending wear is not expired early", b._pending_wear is not None)
-    check("no failure status yet", "did not switch" not in b.status.lower(), b.status)
+    check("no failure or fallback status yet",
+          not any(marker in b.status.lower() for marker in
+                  ("failed", "timed out", "refused", "fallback")), b.status)
 
-    # VRChat echoes the id back -> confirmed, no failure message.
+    # VRChat echoes the id, but that is not proof that client asset loading
+    # completed. A current-session client log load is the positive confirmation.
     b.osc.current_avatar_id = avatar_id
     b._on_avatar_change(avatar_id)
-    check("confirmation clears the pending wear", b._pending_wear is None)
-    check("confirmation is reported", "now wearing" in b.status.lower(), b.status)
+    check("OSC echo keeps request pending", b._pending_wear is not None)
+    check("OSC echo is provisional", "waiting for load confirmation" in b.status.lower(), b.status)
+    check("client log confirms the pending request",
+          b._confirm_wear_from_log(avatar_id, datetime.now().astimezone().isoformat()),
+          b.status)
+    check("client log confirmation clears pending", b._pending_wear is None)
     check("confirmation uses the name when known", "Test Avatar" in b.status, b.status)
 
-    # Time passes with no echo -> VRChat refused it.
+    # No client load event before the timeout -> unauthenticated OSC timeout.
     b.status = ""
     b.osc.current_avatar_id = other
     b.wear(avatar_id)
     b._pending_wear = (avatar_id, time.monotonic() - (backend.WEAR_CONFIRM_TIMEOUT + 1))
     b._expire_pending_wear()
     check("stale wear is cleared", b._pending_wear is None)
-    check("refusal is reported", "did not switch" in b.status.lower(), b.status)
-    check("refusal explains why", "private" in b.status.lower(), b.status)
+    check("OSC timeout is reported", "osc timed out" in b.status.lower(), b.status)
+    check("OSC timeout explains API fallback needs login",
+          "not authenticated" in b.status.lower(), b.status)
 
     # An unrelated avatar change must not confirm or expire the request.
     b.status = ""
@@ -1486,8 +1571,105 @@ def test_wear_confirms_or_reports_failure() -> None:
     b._on_avatar_change(other)
     check("wrong avatar does not confirm", b._pending_wear is not None)
     b._expire_pending_wear()
-    check("wrong avatar still expires as a refusal",
-          "did not switch" in b.status.lower(), b.status)
+    check("wrong avatar still expires as an OSC timeout",
+          "osc timed out" in b.status.lower(), b.status)
+
+
+def test_api_fallback_runs_on_osc_send_failure_and_timeout() -> None:
+    avatar_id = "avtr_4d4d4d4d-1111-2222-3333-444444444444"
+
+    class FakeApi:
+        def __init__(self, gate: threading.Event | None = None,
+                     current: str = "") -> None:
+            self.selected: list[str] = []
+            self.reads: list[str] = []
+            self.done = threading.Event()
+            # Held so the fallback's in-flight state can be inspected before the
+            # request completes; otherwise the worker can finish before the
+            # assertion runs.
+            self.gate = gate
+            # What GET /auth/user reports. Empty means "not switched yet", so the
+            # fallback proceeds to PUT .../select.
+            self.current = current
+
+        def is_logged_in(self) -> bool:
+            return True
+
+        def current_avatar(self) -> str:
+            if self.gate is not None:
+                self.gate.wait(2)
+            self.reads.append("current")
+            return self.current
+
+        def select_avatar(self, requested_id: str) -> dict:
+            if self.gate is not None:
+                self.gate.wait(2)
+            self.selected.append(requested_id)
+            self.done.set()
+            return {"currentAvatar": requested_id}
+
+    def wait_for_result(backend, api) -> None:
+        api.done.wait(2)
+        deadline = time.monotonic() + 2
+        while backend._pending_wear is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    # A failed UDP send immediately falls back to the authenticated API.
+    b = _isolated_backend()
+    b.add_by_id(avatar_id)
+    api = FakeApi()
+    b.api = api
+    b.osc.listening = True
+    b.osc.error = None
+    b.osc.change_avatar = lambda _id: False
+    sent = b.wear(avatar_id)
+    check("failed OSC send starts API fallback",
+          sent.get("ok") is True and sent.get("fallback") == "api", str(sent))
+    wait_for_result(b, api)
+    check("API fallback selected after send failure", api.selected == [avatar_id], str(api.selected))
+    check("API fallback result is reported", "VRChat API selected" in b.status, b.status)
+
+    # When the account already reports the avatar as current, the read-only check
+    # confirms the wear and no mutating select is sent.
+    b = _isolated_backend()
+    b.add_by_id(avatar_id)
+    api = FakeApi(current=avatar_id)
+    b.api = api
+    b.osc.listening = True
+    b.osc.error = None
+    b.osc.change_avatar = lambda _id: True
+    b.wear(avatar_id)
+    b.osc.current_avatar_id = avatar_id
+    b._on_avatar_change(avatar_id)
+    b._pending_wear = (avatar_id, time.monotonic() - 7)
+    b._expire_pending_wear()
+    wait_for_result(b, api)
+    check("server-side match avoids a redundant select", api.selected == [], str(api.selected))
+    check("server-side confirmation is reported",
+          "already reports" in b.status, b.status)
+
+    # An OSC echo with the requested id is provisional. If no client-load log
+# arrives, the timeout still invokes the authenticated API fallback.
+    b = _isolated_backend()
+    b.add_by_id(avatar_id)
+    gate = threading.Event()
+    api = FakeApi(gate)
+    b.api = api
+    b.osc.listening = True
+    b.osc.error = None
+    b.osc.change_avatar = lambda _id: True
+    b.wear(avatar_id)
+    b.osc.current_avatar_id = avatar_id
+    b._on_avatar_change(avatar_id)
+    b._pending_wear = (avatar_id, time.monotonic() - 7)
+    b._expire_pending_wear()
+    check("timeout launches API fallback despite optimistic OSC echo",
+          b._api_fallback_wear is not None, b.status)
+    gate.set()
+    wait_for_result(b, api)
+    check("timeout API fallback selected avatar", api.selected == [avatar_id], str(api.selected))
+    check("timeout API fallback read current avatar first", api.reads == ["current"], str(api.reads))
+    check("timeout fallback reason is reported", "timed out" in b.status.lower(), b.status)
 
 
 def test_import_vrchat_favourites() -> None:
@@ -2468,12 +2650,14 @@ def main() -> int:
         test_osc_receive,
         test_osc_send,
         test_api_helpers,
+        test_select_avatar_api_endpoint,
         test_api_image_download_guards,
         test_vrclog_parse,
+        test_vrclog_starts_at_eof_and_filters_old_timestamps,
         test_vrclog_reports_inaccessible_avatars,
         test_refused_wear_is_not_reported_as_a_success,
-        test_a_refused_avatar_is_remembered_and_blocked,
-        test_unwearable_mark_survives_export_and_import,
+        test_a_refused_avatar_can_be_retried,
+        test_last_refusal_survives_export_and_import,
         test_vrclog_ignores_noise_lines,
         test_default_avatar_list,
         test_default_avatar_name_matching,
@@ -2503,6 +2687,7 @@ def main() -> int:
         test_osc_settings_not_persisted_on_failure,
         test_discovery_state_reported,
         test_wear_confirms_or_reports_failure,
+        test_api_fallback_runs_on_osc_send_failure_and_timeout,
         test_import_vrchat_favourites,
         test_import_vrchat_requires_login,
         test_login_with_two_factor,

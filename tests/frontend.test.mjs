@@ -892,6 +892,24 @@ test("changing group invalidates the grid", () => {
   assert.equal(cards().length, 4);
 });
 
+test("a prior VRChat refusal does not disable Wear", async () => {
+  const requested = [];
+  const { env, app } = setup({ wear: async (id) => { requested.push(id); return { ok: true }; } });
+  app.state = {
+    ...app.state,
+    entries: [{ id: "avtr_retry", name: "Retry me", tags: [], inaccessible: true }],
+  };
+
+  app.renderGrid(true);
+  const card = env.document.getElementById("grid").children[0].children[0];
+  assert.match(card.innerHTML, /last attempt refused/);
+  assert.doesNotMatch(card.innerHTML, /wear-quick[^>]*disabled/);
+
+  card.querySelector(".wear-quick").dispatch("click", { stopPropagation() {} });
+  await tick();
+  assert.deepEqual(requested, ["avtr_retry"]);
+});
+
 test("group chips are hidden on the log scanner", () => {
   // They filter the avatar grid, so on the log view they would be dead controls.
   const { env, app } = withGroups();

@@ -7,6 +7,7 @@ frontend through ``window.pywebview.api``.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -156,6 +157,14 @@ class _Shell:
 
 
 def main() -> int:
+    # Wear-request diagnostics are opt-in so normal GUI launches stay quiet.
+    # When running from a terminal, set this to 1 to see timestamped source and
+    # reason fields for OSC, client-log, and API-fallback decisions.
+    if os.environ.get("LOCAL_AVATAR_FAVOURITES_DEBUG") == "1" and sys.stderr is not None:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
     # CI, and anyone debugging a packaged build, runs the executable with
     # --selftest. A bundle missing an import or shipping a stale stylesheet fails
     # here rather than looking like a broken feature.
