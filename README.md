@@ -1,6 +1,6 @@
 # Local Avatar Favourites
 
-A small standalone Windows tool for VRChat that keeps an **unlimited local list of favourite avatars** (with notes, tags, search, and thumbnails) and lets you **switch to them with one click** while in-game.
+A small standalone Windows tool for VRChat that keeps an **unlimited local list of favourite avatars** (with notes, tags, search, and thumbnails) and lets you **switch to them with one click** while in-game, this is the main use. Avatar Log is second to this so do not expect perfection.
 
 ![uses: OSC](https://img.shields.io/badge/uses-OSC-8a2be2) ![platform: Windows](https://img.shields.io/badge/platform-Windows-blue) ![built: Python](https://img.shields.io/badge/built-Python_3.11-green) ![license: MIT](https://img.shields.io/badge/license-MIT-green)
 
