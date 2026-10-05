@@ -117,6 +117,174 @@ def test_storage_merge() -> None:
     check("normalize id", storage.normalize_id("  AVTR_X  ") == "avtr_x")
 
 
+def test_vrclog_reports_inaccessible_avatars() -> None:
+    """VRChat's refusal line, which is the only explanation a failed switch gives.
+
+    VRChat broadcasts the requested id over OSC and *then* refuses, so from
+    outside the switch looks like it worked. Nothing follows it in the log -- no
+    load, no revert -- so the id stays current and the usual timeout can never
+    explain it. Reproduced verbatim from a real log.
+    """
+    import vrclog
+
+    avatar_id = "avtr_b2863f70-318b-4ec5-99de-7a41227fa1e8"
+    events: list[dict] = []
+    vrclog.VRCLogWatcher._parse_line(
+        f"2026.10.05 17:33:43 Error      -  Trying to change to an inaccessible "
+        f"avatar: {avatar_id}", events)
+    check("refusal parsed", len(events) == 1, str(events))
+    check("refusal carries the id",
+          events and events[0]["type"] == "avatar-inaccessible"
+          and events[0]["id"] == avatar_id, str(events))
+    check("refusal carries the time",
+          events and events[0]["time"].startswith("2026-10-05T17:33:43"),
+          str(events))
+
+    # And it must not also be mistaken for a discovery.
+    events = []
+    vrclog.VRCLogWatcher._parse_line(
+        f"2026.10.05 17:33:43 Error      -  Trying to change to an inaccessible "
+        f"avatar: {avatar_id}", events)
+    check("refusal is not also a discovery",
+          all(e["type"] != "avatar-id" for e in events), str(events))
+
+    # An unrelated error line must not trip it.
+    events = []
+    vrclog.VRCLogWatcher._parse_line(
+        "2026.10.05 17:33:43 Error      -  [API] [1, 404, Get, -1 "
+        f"https://api.vrchat.cloud/api/1/avatars/{avatar_id}] Avatar Not Found",
+        events)
+    check("a plain 404 is not a refusal", events == [], str(events))
+
+
+def test_refused_wear_is_not_reported_as_a_success() -> None:
+    """The correction has to beat the optimistic broadcast, and only for our own id."""
+    b = _isolated_backend()
+    avatar_id = "avtr_b2863f70-318b-4ec5-99de-7a41227fa1e8"
+    name = "Someone's Private Avatar"
+    # The user's scenario: saved from the log scanner, then worn.
+    b.add_by_id(avatar_id)
+    b.save_details(avatar_id, name, "", [])
+    check("fixture entry named", b._entry(avatar_id) is not None
+          and b._entry(avatar_id)["name"] == name, str(b.entries))
+
+    # Request the switch for real, so _last_request is populated the way the
+    # running app populates it. Only the UDP send is stubbed.
+    b.osc.change_avatar = lambda avatar_id: True
+    b.osc.listening = True
+    sent = b.wear(avatar_id)
+    check("wear accepted", sent.get("ok") is True, str(sent))
+
+    # The optimistic broadcast, delivered the way VRChat delivers it: through the
+    # OSC bridge's handler, which is what sets current_avatar_id and then calls
+    # the backend's listener.
+    b.osc._handle_avatar_change("/avatar/change", avatar_id)
+    check("broadcast seen as current", b.osc.current_avatar_id == avatar_id)
+    check("broadcast reported as worn", "Now wearing" in b.status, b.status)
+
+    # Then the refusal lands in the log a moment later.
+    b._note_inaccessible(avatar_id)
+    check("pending wear cleared", b._pending_wear is None, str(b._pending_wear))
+    check("status says refused", "refused" in b.status.lower(), b.status)
+    check("status names the avatar", name in b.status, b.status)
+    check("status explains why",
+          "private" in b.status.lower() or "not available" in b.status.lower(), b.status)
+    check("status says it cannot be cloned",
+          "clone" in b.status.lower(), b.status)
+
+    # Someone else's refusal is routine and must not be announced.
+    b._set_status("untouched")
+    b._note_inaccessible("avtr_aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+    check("an unrelated refusal is ignored", b.status == "untouched", repr(b.status))
+
+    # And a refusal long after the request is not ours to explain.
+    b._set_status("untouched")
+    b._last_request = (avatar_id, __import__("time").monotonic() - 3600)
+    b._note_inaccessible(avatar_id)
+    check("a stale refusal is ignored", b.status == "untouched", repr(b.status))
+
+    # A refusal while nothing was ever requested must not invent a status.
+    b._set_status("")
+    b._last_request = None
+    b._note_inaccessible("avtr_bbbbbbbb-cccc-4ddd-8eee-ffffffffffff")
+    check("no pending wear means no message", b.status == "", repr(b.status))
+
+
+def test_a_refused_avatar_is_remembered_and_blocked() -> None:
+    """One refusal must stop the user repeating it.
+
+    VRChat gives no reason beyond a single log line, so re-deriving the answer
+    means another silent failure and another puzzled click. The refusal is
+    therefore written onto the entry, where it survives restarts and exports.
+    """
+    b = _isolated_backend()
+    avatar_id = "avtr_3ee37c96-3a1d-4edc-b2ba-6e576d6f140b"
+    b.add_by_id(avatar_id)
+    b.save_details(avatar_id, "Pika Homer", "", [])
+    b.osc.change_avatar = lambda avatar_id: True
+    b.osc.listening = True
+
+    b.wear(avatar_id)
+    b.osc._handle_avatar_change("/avatar/change", avatar_id)
+    b._note_inaccessible(avatar_id)
+
+    entry = b._entry(avatar_id)
+    check("entry marked unwearable", entry is not None and entry.get("inaccessible") is True,
+          str(entry))
+    check("mark persisted", storage.load_favourites()[0].get("inaccessible") is True,
+          str(storage.load_favourites()))
+    check("status says it is remembered", "remembered" in b.status.lower(), b.status)
+
+    # A second attempt is refused up front, with no OSC traffic at all.
+    sent: list[str] = []
+
+    def record_send(value) -> bool:
+        sent.append(value)
+        return True
+
+    b.osc.change_avatar = record_send
+    again = b.wear(avatar_id)
+    check("second wear refused", again.get("ok") is False, str(again))
+    check("nothing sent to VRChat", sent == [], str(sent))
+    check("refusal is explained", "not available to your account" in again.get("message", ""),
+          str(again))
+    check("no second status message", "VRChat refused" in b.status, b.status)
+
+    # An unrelated avatar is unaffected.
+    other = "avtr_010d4eb7-f46d-455e-a951-26d30c839ade"
+    b.add_by_id(other)
+    check("other avatar still wearable", b.wear(other).get("ok") is True,
+          str(b.wear(other)))
+
+    # Clearing it is possible: the avatar could become available later.
+    with b._lock:
+        b._entry(avatar_id)["inaccessible"] = False
+        storage.save_favourites(b.entries)
+    check("clearing the mark allows a retry", b.wear(avatar_id).get("ok") is True,
+          str(b.wear(avatar_id)))
+
+
+def test_unwearable_mark_survives_export_and_import() -> None:
+    """A refusal is a fact about the avatar, not about this install."""
+    b = _isolated_backend()
+    avatar_id = "avtr_3ee37c96-3a1d-4edc-b2ba-6e576d6f140b"
+    b.add_by_id(avatar_id)
+    b.save_details(avatar_id, "Pika Homer", "", [])
+    with b._lock:
+        b._entry(avatar_id)["inaccessible"] = True
+
+    exported = json.dumps({"version": 1, "entries": [dict(b.entries[0])]})
+    check("export carries the mark", '"inaccessible": true' in exported, exported[-200:])
+
+    with b._lock:
+        del b._entry(avatar_id)["inaccessible"]
+        b.delete(avatar_id)
+    restored = b.restore_entry(json.loads(exported)["entries"][0])
+    check("restore succeeds", restored.get("ok") is True, str(restored))
+    check("mark restored", b._entry(avatar_id).get("inaccessible") is True,
+          str(b._entry(avatar_id)))
+
+
 def test_vrclog_parse() -> None:
     import vrclog
 
@@ -2167,6 +2335,10 @@ def main() -> int:
         test_api_helpers,
         test_api_image_download_guards,
         test_vrclog_parse,
+        test_vrclog_reports_inaccessible_avatars,
+        test_refused_wear_is_not_reported_as_a_success,
+        test_a_refused_avatar_is_remembered_and_blocked,
+        test_unwearable_mark_survives_export_and_import,
         test_vrclog_ignores_noise_lines,
         test_default_avatar_list,
         test_default_avatar_name_matching,

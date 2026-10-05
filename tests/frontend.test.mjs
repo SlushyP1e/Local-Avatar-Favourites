@@ -433,6 +433,105 @@ test("cardSub prefers author, then platforms, then tags, then id", () => {
 });
 
 // ---------------------------------------------------------------------------
+// styled prompt
+// ---------------------------------------------------------------------------
+
+test("showPrompt resolves with the trimmed value", async () => {
+  // Replaces window.prompt, which rendered as a separate browser window titled
+  // "127.0.0.1:23017 says" and looked like a download warning.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const modal = env.document.getElementById("modal-prompt");
+  const input = env.document.getElementById("prompt-input");
+
+  const pending = app.showPrompt("Add a tag", "Applied to every selected avatar.");
+  assert.ok(!modal.classList.contains("hidden"), "the styled modal must open");
+  assert.equal(env.document.getElementById("prompt-title").textContent, "Add a tag");
+  assert.equal(env.document.getElementById("prompt-message").textContent,
+    "Applied to every selected avatar.");
+  assert.equal(input.value, "", "the field must start empty, not stale");
+
+  input.value = "  catboy  ";
+  click(env.document.getElementById("prompt-ok"));
+  assert.equal(await pending, "catboy", "surrounding whitespace is trimmed");
+  assert.ok(modal.classList.contains("hidden"), "and the modal closes again");
+});
+
+test("showPrompt seeds the field with an initial value", async () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const input = env.document.getElementById("prompt-input");
+
+  const pending = app.showPrompt("Remove a tag", "From the selection.", "favourite");
+  assert.equal(input.value, "favourite");
+  click(env.document.getElementById("prompt-ok"));
+  assert.equal(await pending, "favourite");
+});
+
+test("showPrompt resolves null on cancel, backdrop and Escape", async () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const modal = env.document.getElementById("modal-prompt");
+  const input = env.document.getElementById("prompt-input");
+
+  let pending = app.showPrompt("t", "m");
+  input.value = "typed";
+  click(env.document.getElementById("prompt-cancel"));
+  assert.equal(await pending, null);
+
+  pending = app.showPrompt("t", "m");
+  input.value = "typed";
+  modal.dispatch("click", { target: modal });
+  assert.equal(await pending, null, "backdrop click cancels");
+
+  pending = app.showPrompt("t", "m");
+  input.value = "typed";
+  env.document.dispatch("keydown",
+    { key: "Escape", stopPropagation() {}, preventDefault() {} });
+  assert.equal(await pending, null, "Escape cancels");
+});
+
+test("showPrompt submits on Enter", async () => {
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const input = env.document.getElementById("prompt-input");
+
+  const pending = app.showPrompt("t", "m");
+  input.value = "quicktag";
+  input.dispatch("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(await pending, "quicktag",
+    "Enter should submit, which a lone text field otherwise will not");
+});
+
+test("showPrompt treats a blank value as a cancel", async () => {
+  // An empty tag would silently do nothing, so it is the same as declining.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const input = env.document.getElementById("prompt-input");
+
+  const pending = app.showPrompt("t", "m");
+  input.value = "   ";
+  click(env.document.getElementById("prompt-ok"));
+  assert.equal(await pending, null);
+});
+
+test("showPrompt settles an earlier prompt rather than orphaning it", async () => {
+  // Same guard showConfirm has: two awaits must never both be left waiting.
+  const env = makeEnvironment();
+  const app = loadApp(env);
+  const input = env.document.getElementById("prompt-input");
+
+  const first = app.showPrompt("t", "m");
+  input.value = "first";
+  const second = app.showPrompt("t", "m");
+  assert.equal(await first, null, "the first is settled as cancelled");
+
+  input.value = "second";
+  click(env.document.getElementById("prompt-ok"));
+  assert.equal(await second, "second");
+});
+
+// ---------------------------------------------------------------------------
 // discovery line
 // ---------------------------------------------------------------------------
 

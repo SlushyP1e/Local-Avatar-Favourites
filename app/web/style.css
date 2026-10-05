@@ -215,6 +215,10 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
 .text-input::placeholder { color: rgba(255, 255, 255, 0.4); }
 .text-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 
+/* Spacing between a prompt's message, its field and its buttons. The field has
+   no default margin, so without this it butts straight up against both. */
+#modal-prompt .text-input { margin-top: 0.7rem; }
+
 /* ---------------------------------------------------------------- buttons */
 .btn {
   display: inline-flex;
@@ -979,6 +983,15 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
 .context-item:hover { background: var(--surface-2); }
 .context-item.danger { color: #cfcfcf; }
 .context-item.danger:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+/* A menu item that cannot be used. Greyer and with no hover, so it does not
+   invite a click that is going to be refused. */
+.context-item.disabled,
+.context-item.disabled:hover {
+  color: var(--muted);
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: transparent;
+}
 .context-item .ico { width: 1rem; text-align: center; opacity: 0.85; }
 .context-sep { height: 1px; margin: 0.3rem 0.4rem; background: var(--border-soft); }
 

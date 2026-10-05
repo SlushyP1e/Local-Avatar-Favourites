@@ -282,6 +282,67 @@ function showConfirm(title, message) {
   });
 }
 
+// Only one text prompt may be pending; opening a second settles the first so
+// its awaiting caller is never left hanging, exactly as showConfirm does.
+let pendingPrompt = null;
+
+// A styled replacement for window.prompt. The native one renders as a separate
+// browser window titled by host and port -- "127.0.0.1:23017 says" -- which
+// looks like a download warning rather than part of the app. Resolves to the
+// trimmed string, or null when cancelled or left blank.
+function showPrompt(title, message, initial = "") {
+  if (pendingPrompt) pendingPrompt(null);
+  return new Promise((resolve) => {
+    $("prompt-title").textContent = title || "Enter a value";
+    $("prompt-message").textContent = message || "";
+
+    const input = $("prompt-input");
+    input.value = initial == null ? "" : String(initial);
+
+    const modal = $("modal-prompt");
+    const ok = $("prompt-ok");
+    const cancel = $("prompt-cancel");
+    openModal("modal-prompt");
+
+    // Every exit path must settle the promise: OK, Cancel, backdrop, Escape.
+    const finish = (value) => {
+      ok.removeEventListener("click", onOk);
+      cancel.removeEventListener("click", onCancel);
+      input.removeEventListener("keydown", onInputKey);
+      modal.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onKeydown, true);
+      pendingPrompt = null;
+      closeModal("modal-prompt");
+      resolve(value);
+    };
+    const onOk = () => finish(input.value.trim() || null);
+    const onCancel = () => finish(null);
+    const onBackdrop = (e) => { if (e.target === modal) finish(null); };
+    const onKeydown = (e) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      e.preventDefault();
+      finish(null);
+    };
+    // Enter submits, which a lone text field otherwise will not do.
+    const onInputKey = (e) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      finish(input.value.trim() || null);
+    };
+
+    ok.addEventListener("click", onOk);
+    cancel.addEventListener("click", onCancel);
+    input.addEventListener("keydown", onInputKey);
+    modal.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onKeydown, true);
+
+    pendingPrompt = finish;
+    input.focus();
+    input.select();
+  });
+}
+
 async function call(method, ...args) {
   try {
     return await api()[method](...args);
@@ -307,10 +368,15 @@ function showContextMenu(x, y, items) {
       continue;
     }
     const btn = document.createElement("button");
-    btn.className = "context-item" + (item.danger ? " danger" : "");
+    btn.className = "context-item" + (item.danger ? " danger" : "")
+      + (item.disabled ? " disabled" : "");
     btn.innerHTML = `<span class="ico">${item.icon || ""}</span>${escapeHtml(item.label)}`;
+    if (item.disabled) btn.disabled = true;
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
+      // Guarded as well as disabled: a disabled button swallows clicks in a real
+      // browser, but the action is still callable from a keyboard path.
+      if (item.disabled) return;
       hideContextMenu();
       item.action();
     });
@@ -441,6 +507,12 @@ function renderGrid(force) {
     const src = ensureThumb(entry) || placeholderDataUri(entry.name);
     const favOn = entry.favorite ? "on" : "";
     const badges = [];
+    if (entry.inaccessible) {
+      // VRChat already refused this one. Worth saying on the card rather than
+      // letting the user click Wear and watch nothing happen.
+      badges.push('<span class="platform-badge" title="VRChat refused to wear this avatar. '
+        + 'It is not available to your account.">unwearable</span>');
+    }
     if (entry.release_status) {
       badges.push(`<span class="platform-badge ${entry.release_status === "public" ? "public" : ""}">${escapeHtml(entry.release_status)}</span>`);
     }
@@ -454,7 +526,7 @@ function renderGrid(force) {
         <button class="fav-btn ${favOn}" title="Favorite">♥</button>
         ${entry.id === state.current_avatar_id ? '<span class="badge wearing-badge">● Wearing</span>' : ""}
         <div class="poster-actions">
-          <button class="btn primary wear-quick">Wear</button>
+          <button class="btn primary wear-quick"${entry.inaccessible ? " disabled" : ""}>Wear</button>
         </div>
       </div>
       <div class="card-body">
@@ -489,6 +561,14 @@ function renderGrid(force) {
     });
     card.querySelector(".wear-quick").addEventListener("click", (e) => {
       e.stopPropagation();
+      // A disabled button swallows clicks in a real browser, but the context
+      // menu and Enter/keyboard paths still reach here, so check as well.
+      if (entry.inaccessible) {
+        showAlert("VRChat won't wear this avatar",
+          "VRChat already refused this one, so it is not available to your "
+          + "account. It may be private, restricted, or removed since you found it.");
+        return;
+      }
       wear(entry.id);
     });
     frag.appendChild(card);
@@ -935,7 +1015,20 @@ async function toggleFavorite(id) {
 
 function cardMenuItems(entry) {
   return [
-    { icon: "▶", label: "Wear Avatar", action: () => wear(entry.id) },
+    {
+      icon: "▶",
+      label: entry.inaccessible ? "Unwearable - VRChat refused it" : "Wear Avatar",
+      disabled: !!entry.inaccessible,
+      action: () => {
+        if (entry.inaccessible) {
+          showAlert("VRChat won't wear this avatar",
+            "VRChat already refused this one, so it is not available to your "
+            + "account. It may be private, restricted, or removed since you found it.");
+          return;
+        }
+        wear(entry.id);
+      },
+    },
     {
       icon: "♥",
       label: entry.favorite ? "Remove from Favorites" : "Add to Favorites",
@@ -1408,12 +1501,14 @@ function wire() {
   $("bulk-refresh").addEventListener("click", () => runBulk("refresh"));
   $("bulk-delete").addEventListener("click", () => runBulk("delete"));
   $("bulk-tag").addEventListener("click", async () => {
-    const value = prompt("Tag to add to the selected avatars:");
-    if (value && value.trim()) await runBulk("tag", value.trim());
+    const value = await showPrompt("Add a tag",
+      "Applied to every selected avatar. Separate several with commas.");
+    if (value) await runBulk("tag", value);
   });
   $("bulk-untag").addEventListener("click", async () => {
-    const value = prompt("Tag to remove from the selected avatars:");
-    if (value && value.trim()) await runBulk("untag", value.trim());
+    const value = await showPrompt("Remove a tag",
+      "Removed from every selected avatar. Separate several with commas.");
+    if (value) await runBulk("untag", value);
   });
   $("undo-btn").addEventListener("click", doUndo);
   $("job-cancel").addEventListener("click", async () => {

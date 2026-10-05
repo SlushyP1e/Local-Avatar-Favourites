@@ -49,6 +49,10 @@ DISCOVERY_FEED_MAX = 300
 # How long to wait for VRChat to broadcast the avatar back before assuming the
 # change was refused. Large avatars can take a while to download.
 WEAR_CONFIRM_TIMEOUT = 6.0
+# How long after a request a refusal still counts as ours. VRChat writes the
+# refusal to its log within a second or so of the request; a longer window than
+# that is only there to absorb a slow poll.
+WEAR_REFUSAL_WINDOW = 30.0
 
 # Where a logged avatar id came from. Surfaced in the UI so it is obvious which
 # source is actually producing discoveries.
@@ -117,6 +121,12 @@ class Backend:
         self.session_expired = False
         # (avatar_id, monotonic timestamp) of an unconfirmed wear request.
         self._pending_wear: tuple[str, float] | None = None
+        # The last id we asked VRChat to wear, kept *after* _pending_wear is
+        # cleared. VRChat echoes the requested id over OSC before deciding
+        # whether it can honour the request, and that echo clears _pending_wear
+        # -- so the refusal arrives with nothing left to match against. Without
+        # this the one message that explains the failure can never be shown.
+        self._last_request: tuple[str, float] | None = None
         self._jobs = JobRegistry()
         self._runner = JobRunner(self._jobs)
 
@@ -198,6 +208,8 @@ class Backend:
                     if self._record_log(event["id"], event.get("time", ""),
                                         save=False, source=SOURCE_LOG):
                         changed_log = True
+                elif event["type"] == "avatar-inaccessible":
+                    self._note_inaccessible(event["id"])
                 elif event["type"] == "avatar-change" and self._record_change(
                     event.get("player", ""),
                     event.get("avatar", ""),
@@ -275,6 +287,49 @@ class Backend:
         name = f"Now wearing {entry['name']}." if entry and entry.get("name") \
             else f"Now wearing {avatar_id}."
         self._set_status(name)
+
+    def _note_inaccessible(self, avatar_id: str) -> None:
+        """VRChat refused an avatar change; correct the optimistic success.
+
+        VRChat broadcasts the requested id over OSC before it decides whether it
+        can honour the request, so an inaccessible avatar arrives looking exactly
+        like a successful switch. Nothing follows it in the log either -- no load,
+        no revert -- so the id stays current and the usual timeout never fires
+        with an explanation.
+
+        This is the only signal that says what actually went wrong, and it is
+        common: ids discovered by a tracker include avatars that are private,
+        deleted or region-locked, none of which can be worn or cloned.
+        """
+        avatar_id = self._norm_id(avatar_id)
+        with self._lock:
+            # Matched against the remembered request rather than _pending_wear:
+            # the optimistic broadcast already cleared that, and this line
+            # always follows it. Bounded, so a refusal hours later -- the user
+            # trying the same avatar from VRChat's own menu, say -- is not
+            # announced as though the app had asked for it.
+            request = self._last_request
+            if not request or request[0] != avatar_id:
+                return
+            if time.monotonic() - request[1] > WEAR_REFUSAL_WINDOW:
+                return
+            if self._pending_wear and self._pending_wear[0] == avatar_id:
+                self._pending_wear = None
+            entry = self._entry(avatar_id)
+            name = entry.get("name") if entry else None
+            # Remember it. VRChat gives no reason beyond the single log line, so
+            # re-deriving it means another silent failure and another puzzled
+            # click. Marking the card stops that happening a third time.
+            if entry is not None and not entry.get("inaccessible"):
+                entry["inaccessible"] = True
+                storage.save_favourites(self.entries)
+                self._touch("entries")
+        label = f'"{name}"' if name else avatar_id
+        self._set_status(
+            f"VRChat refused {label}. It is private, deleted, or not available "
+            "to your account -- so it cannot be worn or cloned. "
+            "This is remembered; the card is now marked."
+        )
 
     def _record_log(self, avatar_id: str, when: str = "", save: bool = True,
                      source: str = SOURCE_OSC) -> bool:
@@ -590,11 +645,24 @@ class Backend:
         if not self.osc.listening:
             return {"ok": False, "title": "OSC not running",
                     "message": "The OSC connection is not active."}
-        # VRChat does not acknowledge /avatar/change. It broadcasts the new id
-        # back once the avatar actually loads, which is the only confirmation we
-        # get, so remember what we asked for and check it later.
         with self._lock:
+            entry = self._entry(avatar_id)
+            if entry is not None and entry.get("inaccessible"):
+                # Already known to be unwearable. Saying so up front is kinder
+                # than letting VRChat ignore the request in silence again.
+                name = f'"{entry.get("name") or avatar_id}"'
+                return {
+                    "ok": False,
+                    "title": "VRChat won't wear this avatar",
+                    "message": f"VRChat refused {name} the last time you tried, so "
+                               "it is not available to your account. It may be "
+                               "private, restricted, or removed since you found it.",
+                }
+            # VRChat does not acknowledge /avatar/change. It broadcasts the new id
+            # back once the avatar actually loads, which is the only confirmation we
+            # get, so remember what we asked for and check it later.
             self._pending_wear = (avatar_id, time.monotonic())
+            self._last_request = self._pending_wear
         if self.osc.change_avatar(avatar_id):
             self._set_status("Requested avatar change over OSC.")
             return {"ok": True, "pending": avatar_id}
@@ -623,8 +691,10 @@ class Backend:
         entry = self._entry(avatar_id)
         name = f'"{entry["name"]}"' if entry and entry.get("name") else avatar_id
         self._set_status(
-            f"VRChat did not switch to {name}. It may be private, or a paid "
-            "avatar your account does not own."
+            f"VRChat did not switch to {name}. It may be private, deleted, or a "
+            "paid avatar your account does not own. IDs discovered by a tracker "
+            "often are -- they include avatars other players wore that you "
+            "cannot access."
         )
 
     def delete(self, avatar_id: str) -> dict:
@@ -965,6 +1035,10 @@ class Backend:
                         "thumb_url", "added"):
                 if entry.get(key):
                     restored[key] = entry[key]
+            # Carried through an export/import round trip: a refusal is a fact
+            # about the avatar, not about this install.
+            if entry.get("inaccessible"):
+                restored["inaccessible"] = True
             for key in ("tags", "platforms"):
                 if isinstance(entry.get(key), list):
                     restored[key] = [str(v) for v in entry[key]]

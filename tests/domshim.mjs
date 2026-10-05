@@ -48,6 +48,11 @@ export function makeElement(id = "el") {
     dispatch(type, event = {}) {
       for (const fn of (listeners.get(type) || []).slice()) fn(event);
     },
+    // Standard element methods. showPrompt focuses and selects its field, so
+    // without these the shim would throw where a real DOM would not.
+    focus() {},
+    select() {},
+    blur() {},
     listenerCount(type) {
       return (listeners.get(type) || []).length;
     },
@@ -125,7 +130,7 @@ export function loadApp(env) {
     "document", "window", "CSS", "setTimeout", "clearTimeout", "setInterval",
     `${src}
 ; return {
-  showConfirm, showAlert, openModal, closeModal, ensureThumb,
+  showConfirm, showAlert, showPrompt, openModal, closeModal, ensureThumb,
   scheduleSave, flushDraft, captureDraft, openDrawer, closeDrawer, call,
   thumbCache, thumbKey, thumbPending, thumbOrder, visibleEntries, cardSub, escapeHtml,
   setView, animateView, applyStagger, revealOnce, replayAnimation,

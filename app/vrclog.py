@@ -45,6 +45,25 @@ AVATAR_ID_RE = re.compile(
 SWITCH_RE = re.compile(r"\[Behaviour\] Switching (.+) to avatar (.+?)\s*$")
 TIMESTAMP_RE = re.compile(r"^(\d{4})\.(\d{2})\.(\d{2}) (\d{2}):(\d{2}):(\d{2})")
 
+# VRChat refusing an avatar-change request. This is the only place VRChat says
+# *why* a switch did not happen, and it matters more than it looks:
+#
+#   Trying to change to an inaccessible avatar: avtr_...
+#
+# VRChat broadcasts the requested id over OSC and then refuses to apply it, so
+# the request looks like a success from outside -- the app reported "Now
+# wearing ..." for an avatar that never loaded. Watching for this line is the
+# only way to tell the two apart, and it names the exact id that failed.
+#
+# Common causes: the avatar is private, deleted, region-locked, or otherwise not
+# available to this account. None of which is obvious from the id alone.
+AVATAR_INACCESSIBLE_RE = re.compile(
+    r"change to an inaccessible avatar:?\s*"
+    r"(avtr_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12})",
+    re.IGNORECASE,
+)
+
 # The only line shapes from which an avatar id is treated as a discovery.
 #
 #   Loading Avatar Data:<id>   VRChat opened a locally cached avatar
@@ -185,6 +204,18 @@ class VRCLogWatcher:
         # few string compares for the overwhelming majority of lines.
         if "avtr_" not in line:
             return
+
+        # Checked before the allowlist: a refused avatar change is reported on an
+        # API error line, which the discovery allowlist rejects.
+        refused = AVATAR_INACCESSIBLE_RE.search(line)
+        if refused:
+            events.append({
+                "type": "avatar-inaccessible",
+                "id": refused.group(1).lower(),
+                "time": _line_time(line),
+            })
+            return
+
         if any(marker in line for marker in IGNORED_ID_LINE_MARKERS):
             return
 
