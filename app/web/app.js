@@ -21,6 +21,13 @@ let state = {
 
 let currentView = "home";     // home | logs
 let currentFilter = "all";    // all | favorites | public | quest | pc
+// Group is kept separate from currentFilter rather than folded into it: those
+// five names are a fixed vocabulary the rest of the code compares against,
+// while group names are whatever the user typed. Sharing one variable would let
+// a group called "all" silently become the show-everything filter.
+// null = every group. "" is reserved for the Ungrouped chip, so the two must
+// not share a value.
+let currentGroup = null;      // null = all groups | "" = ungrouped | key
 let logTab = "avatars";       // avatars | players
 let selectedId = null;
 let lastStatus = "";
@@ -47,6 +54,13 @@ const thumbPending = {};  // id -> true
 // entries evicted once it is full.
 const THUMB_CACHE_MAX = 200;
 const thumbOrder = [];
+
+// Group names are typed by hand, so they are bounded and stripped of control
+// characters before they reach a chip or an export. These two mirror
+// storage.MAX_GROUP_NAME and the isprintable() filter in
+// storage.normalize_group.
+const MAX_GROUP_NAME = 40;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/g;
 
 const VIEW_TITLES = {
   home: "Avatars",
@@ -179,7 +193,88 @@ async function doUndo() {
   await refreshState();
 }
 
+// Group names are matched case-insensitively, so "Furry" and "furry" are one
+// group. Kept in step with storage.MAX_GROUP_NAME and storage.group_key on the
+// Python side: collapsing whitespace, dropping control characters and truncating
+// all happen before the comparison. If the two disagreed, a name the backend had
+// already trimmed to 40 characters would get a different key here, and the
+// dropdown would show "No group" for an avatar that plainly has one.
+function groupKey(name) {
+  const text = String(name == null ? "" : name);
+  const collapsed = text.split(/\s+/).filter(Boolean).join(" ");
+  const printable = collapsed.replace(CONTROL_CHARS, "");
+  return printable.slice(0, MAX_GROUP_NAME).toLowerCase();
+}
+
+function entryGroupKey(entry) {
+  return groupKey(entry.group);
+}
+
+// The distinct groups in the current list, with counts, sorted by name but
+// carrying the casing the user first typed. Derived from the entries rather
+// than stored separately: a group exists exactly when some avatar is in it, so
+// the chips cannot drift out of sync and nothing needs pruning when a group
+// empties.
+function groupSummary() {
+  const order = [];
+  const byKey = new Map();
+  let ungrouped = 0;
+  for (const entry of state.entries || []) {
+    const key = entryGroupKey(entry);
+    if (!key) { ungrouped++; continue; }
+    let row = byKey.get(key);
+    if (!row) {
+      row = { key, name: (entry.group || "").trim(), count: 0 };
+      byKey.set(key, row);
+      order.push(row);
+    }
+    row.count++;
+  }
+  order.sort((a, b) => a.name.localeCompare(b.name));
+  return { groups: order, ungrouped };
+}
+
+// Renders the group chips after the five fixed ones. Called from renderHeader,
+// so it keeps pace with edits and with the rev-driven state refresh.
+function renderGroupChips() {
+  const row = $("group-chips");
+  if (!row) return;
+  const { groups, ungrouped } = groupSummary();
+  row.innerHTML = "";
+  if (!groups.length && !ungrouped) return;
+
+  const makeChip = (key, label, count) => {
+    const btn = document.createElement("button");
+    btn.className = "chip" + (currentGroup === key ? " active" : "");
+    btn.dataset.group = key;
+    btn.appendChild(document.createTextNode(label));
+    const n = document.createElement("span");
+    n.className = "chip-count";
+    n.textContent = String(count);
+    btn.appendChild(n);
+    row.appendChild(btn);
+  };
+
+  for (const g of groups) makeChip(g.key, g.name, g.count);
+  // Ungrouped needs a chip too, or those avatars become unreachable by browsing.
+  if (ungrouped) makeChip("", "Ungrouped", ungrouped);
+}
+
 function matchesFilter(entry) {
+  // Group and the fixed filter compose: selecting "Quest" inside "Furry" is the
+  // intersection, which is what picking both implies.
+  //
+  // null means every group, "" means the ungrouped bucket specifically. Those
+  // have to be distinct values: conflating them makes the Ungrouped chip a
+  // duplicate of the All chip.
+  if (currentGroup !== null) {
+    const group = entryGroupKey(entry);
+    if (currentGroup === "") {
+      if (group) return false;
+    } else if (group !== currentGroup) {
+      return false;
+    }
+  }
   switch (currentFilter) {
     case "favorites": return !!entry.favorite;
     case "public": return (entry.release_status || "") === "public";
@@ -286,6 +381,107 @@ function showConfirm(title, message) {
 // its awaiting caller is never left hanging, exactly as showConfirm does.
 let pendingPrompt = null;
 
+// Shows or clears the group-list mode. Sharing the prompt modal means one set
+// of dismissal handlers rather than two that can drift apart.
+function setPromptMode(mode) {
+  $("prompt-input").classList.toggle("hidden", mode === "list");
+  $("prompt-list").classList.toggle("hidden", mode !== "list");
+  $("prompt-ok").classList.toggle("hidden", mode === "list");
+}
+
+// The drawer and the bulk bar both need "pick a group, or make one". A free-text
+// field invites typos, and since group names match case-insensitively a typo
+// becomes a near-duplicate group that is easy to miss and annoying to clean up.
+// So this offers the real list, with "New group..." going through showPrompt.
+function showGroupPicker(title, message) {
+  // Same one-at-a-time rule as showPrompt: a second picker cancels the first
+  // rather than leaving its caller awaiting forever.
+  if (pendingPrompt) pendingPrompt(null);
+  return new Promise((resolve) => {
+    const { groups } = groupSummary();
+    $("prompt-title").textContent = title || "Move to group";
+    $("prompt-message").textContent = message || "";
+    setPromptMode("list");
+
+    const list = $("prompt-list");
+    list.innerHTML = "";
+    const add = (label, value) => {
+      const btn = document.createElement("button");
+      btn.className = "group-option";
+      btn.textContent = label;
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        finish(value);
+      });
+      list.appendChild(btn);
+    };
+
+    if (groups.length) {
+      for (const g of groups) {
+        const count = document.createElement("span");
+        count.className = "chip-count";
+        count.textContent = String(g.count);
+        const btn = document.createElement("button");
+        btn.className = "group-option";
+        btn.appendChild(document.createTextNode(g.name));
+        btn.appendChild(count);
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          finish(g.name);
+        });
+        list.appendChild(btn);
+      }
+    } else {
+      const none = document.createElement("p");
+      none.className = "muted small";
+      none.textContent = "No groups yet.";
+      list.appendChild(none);
+    }
+    // "" is the sentinel for ungrouped, which the backend turns into "".
+    add("No group (ungrouped)", "");
+    add("＋ New group…", NEW_GROUP);
+
+    openModal("modal-prompt");
+
+    const modal = $("modal-prompt");
+    const cancel = $("prompt-cancel");
+    const finish = (value) => {
+      cancel.removeEventListener("click", onCancel);
+      modal.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onKeydown, true);
+      pendingPrompt = null;
+      closeModal("modal-prompt");
+      resolve(value);
+    };
+    const onCancel = () => finish(null);
+    const onBackdrop = (e) => { if (e.target === modal) finish(null); };
+    const onKeydown = (e) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      e.preventDefault();
+      finish(null);
+    };
+    cancel.addEventListener("click", onCancel);
+    modal.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onKeydown, true);
+    pendingPrompt = finish;
+  });
+}
+
+// Sentinel for "the user chose New group" in showGroupPicker. A name could
+// never be this, since normalize_group strips whitespace and truncates.
+const NEW_GROUP = "\u0000new";
+
+// Creates a group by name, returning it, or null if the user backs out.
+// Used by both the drawer's dropdown and the bulk picker.
+async function promptForGroupName(title, message, initial) {
+  const value = await showPrompt(title, message, initial);
+  if (value === null) return null;
+  // Trim the same way the backend will, so the name saved is the name shown.
+  const collapsed = String(value).split(/\s+/).filter(Boolean).join(" ");
+  return collapsed.replace(CONTROL_CHARS, "").slice(0, MAX_GROUP_NAME) || null;
+}
+
 // A styled replacement for window.prompt. The native one renders as a separate
 // browser window titled by host and port -- "127.0.0.1:23017 says" -- which
 // looks like a download warning rather than part of the app. Resolves to the
@@ -295,6 +491,7 @@ function showPrompt(title, message, initial = "") {
   return new Promise((resolve) => {
     $("prompt-title").textContent = title || "Enter a value";
     $("prompt-message").textContent = message || "";
+    setPromptMode("text");
 
     const input = $("prompt-input");
     input.value = initial == null ? "" : String(initial);
@@ -452,11 +649,17 @@ function renderHeader() {
   document.querySelectorAll(".rail-btn[data-view]").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.view === currentView);
   });
-  document.querySelectorAll(".chip").forEach((chip) => {
+  // Group chips are rebuilt from state, so the fixed-chip loop below must not
+  // also touch them: they carry data-group, not data-filter.
+  document.querySelectorAll(".chip[data-filter]").forEach((chip) => {
     chip.classList.toggle("active", chip.dataset.filter === currentFilter);
   });
   const isLogs = currentView === "logs";
+  renderGroupChips();
+  // The whole row, groups included, is hidden on the log scanner: it filters
+  // the avatar grid, so showing it there would be a control doing nothing.
   $("chips").classList.toggle("hidden", isLogs);
+  $("group-chips").classList.toggle("hidden", isLogs);
   $("grid-wrap").classList.toggle("hidden", isLogs);
   $("logs-wrap").classList.toggle("hidden", !isLogs);
   // Sort only affects the avatar grid, so hiding it here avoids a control that
@@ -471,6 +674,10 @@ function renderGrid(force) {
   const sig = JSON.stringify({
     v: currentView,
     f: currentFilter,
+    // The selected group changes which entries survive visibleEntries, so it has
+    // to be in the signature or a chip click is a no-op once the grid has been
+    // rendered at least once.
+    g: currentGroup,
     q: $("search").value,
     s: $("sort").value,
     c: state.current_avatar_id,
@@ -742,6 +949,44 @@ function renderPlayerChanges(changes, force) {
   wrap.appendChild(frag);
 }
 
+// Populates the drawer's group dropdown: every existing group, the current
+// one if it somehow is not in the list (a stale or hand-edited file), "No
+// group", and a New group entry.
+function renderGroupDropdown(entry, keep) {
+  const select = $("d-group");
+  if (!select) return;
+  const current = groupKey(entry.group);
+  const { groups } = groupSummary();
+  select.innerHTML = "";
+  const values = [];
+
+  const option = (value, label) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = label;
+    select.appendChild(opt);
+    values.push(value);
+  };
+
+  let found = !current;
+  for (const g of groups) {
+    option(g.key, g.name);
+    if (g.key === current) found = true;
+  }
+  // The entry's own group is normally already in the list. If not -- a stale
+  // filter, or a hand-edited favourites.json -- keep it selectable rather than
+  // silently showing "No group" and inviting a change nobody made.
+  if (!found && current) option(current, (entry.group || "").trim());
+  option("", "No group");
+  option(NEW_GROUP, "＋ New group…");
+  // A pick the user has made but not yet saved has no option yet, and render()
+  // runs on every poll, so keep it rather than snapping back to the saved
+  // value for a moment.
+  const wanted = keep || current;
+  if (keep && !values.includes(keep)) option(keep, keep);
+  select.value = wanted;
+}
+
 function renderDrawer() {
   if (!selectedId) { closeDrawer(); return; }
   const entry = entryById(selectedId);
@@ -756,6 +1001,10 @@ function renderDrawer() {
   if (!editing && active !== $("d-name")) $("d-name").value = entry.name || "";
   if (!editing && active !== $("d-notes")) $("d-notes").value = entry.notes || "";
   if (!editing && active !== $("d-tags")) $("d-tags").value = (entry.tags || []).join(", ");
+  // Rebuilt every render, since the set of groups changes as other avatars are
+  // edited. A <select> is rebuilt rather than patched for the same reason the
+  // option list can grow or shrink between renders.
+  renderGroupDropdown(entry, editing ? $("d-group").value : null);
   suppressSave = false;
 
   const src = ensureThumb(entry) || placeholderDataUri(entry.name);
@@ -1107,6 +1356,16 @@ async function refreshMeta() {
    whenever the selection changes or the drawer closes. */
 let draft = null;
 
+// The group a draft should be saved under, resolving the dropdown's lowercase
+// key back to the display name. Sending the key instead would quietly rewrite
+// every group's stored casing to lowercase the first time it is picked from the
+// drawer.
+function draftGroupName() {
+  const value = $("d-group").value;
+  const match = groupSummary().groups.find((g) => g.key === value);
+  return match ? match.name : value;
+}
+
 function captureDraft() {
   if (suppressSave || !selectedId) return;
   draft = {
@@ -1114,6 +1373,11 @@ function captureDraft() {
     name: $("d-name").value,
     notes: $("d-notes").value,
     tags: $("d-tags").value,
+    // "" clears the group; null means "leave it alone" and is what the New
+    // group sentinel needs, since that value is a mid-choice placeholder rather
+    // than a selection. Confusing the two would make "No group" silently do
+    // nothing, because save_details treats None as not supplied.
+    group: $("d-group").value === NEW_GROUP ? null : draftGroupName(),
   };
 }
 
@@ -1123,7 +1387,8 @@ async function flushDraft(announce) {
   const pending = draft;
   draft = null;
   if (!pending) return false;
-  const res = await call("save_details", pending.id, pending.name, pending.notes, pending.tags);
+  const res = await call("save_details", pending.id, pending.name, pending.notes,
+                         pending.tags, pending.group);
   if (announce && res && res.ok) toast("Saved.");
   return !!(res && res.ok);
 }
@@ -1510,6 +1775,18 @@ function wire() {
       "Removed from every selected avatar. Separate several with commas.");
     if (value) await runBulk("untag", value);
   });
+  $("bulk-group").addEventListener("click", async () => {
+    let value = await showGroupPicker("Move to group",
+      "Applies to every selected avatar. Each avatar ends up in exactly one group.");
+    if (value === NEW_GROUP) {
+      value = await promptForGroupName("New group",
+        "Name the group these avatars will appear under.");
+    }
+    // null means the user backed out; "" is a real choice, the ungrouped one.
+    // Testing falsiness for both would make "No group" do nothing at all.
+    if (value === null) return;
+    await runBulk(value ? "group" : "ungroup", value);
+  });
   $("undo-btn").addEventListener("click", doUndo);
   $("job-cancel").addEventListener("click", async () => {
     if (!activeJob || !activeJob.id) return;
@@ -1525,12 +1802,24 @@ function wire() {
   document.querySelectorAll(".rail-btn[data-view]").forEach((btn) => {
     btn.addEventListener("click", () => setView(btn.dataset.view));
   });
-  document.querySelectorAll(".chip").forEach((chip) => {
+  document.querySelectorAll(".chip[data-filter]").forEach((chip) => {
     chip.addEventListener("click", () => {
       currentFilter = chip.dataset.filter;
       renderHeader();
       renderGrid();
     });
+  });
+
+  // Delegated, because the group chips are rebuilt whenever the entries change
+  // and a per-chip listener would be dropped every time.
+  $("group-chips").addEventListener("click", (e) => {
+    const chip = e.target.closest ? e.target.closest(".chip[data-group]") : null;
+    if (!chip) return;
+    // Clicking the active group clears it, so there is always a way back to
+    // every group without hunting for the All chip.
+    currentGroup = currentGroup === chip.dataset.group ? null : chip.dataset.group;
+    renderHeader();
+    renderGrid();
   });
 
   $("search").addEventListener("input", () => {
@@ -1579,6 +1868,38 @@ function wire() {
   $("d-name").addEventListener("input", scheduleSave);
   $("d-notes").addEventListener("input", scheduleSave);
   $("d-tags").addEventListener("input", scheduleSave);
+  $("d-group").addEventListener("change", async (e) => {
+    if (e.target.value !== NEW_GROUP) { scheduleSave(); return; }
+    // Freeze the drawer's in-progress draft first. renderDrawer() runs after
+    // this and would otherwise rebuild the dropdown, knocking the prompt flow
+    // out from under it.
+    scheduleSave();
+    const wasOpen = selectedId;
+    const name = await promptForGroupName("New group",
+      "Name the group this avatar will appear under.");
+    // The drawer can be closed while the prompt is up, in which case there is
+    // nothing left to set a group on.
+    if (!selectedId || selectedId !== wasOpen) return;
+    // Backing out of the name prompt must put the dropdown back where it was,
+    // otherwise the entry sits on the sentinel and looks ungrouped until the
+    // next redraw.
+    const entry = entryById(selectedId);
+    renderGroupDropdown(entry || {});
+    if (!name) return;
+    const key = groupKey(name);
+    const match = groupSummary().groups.find((g) => g.key === key);
+    // Reuse the existing option when the typed name already matches a group
+    // case-insensitively, so a new spelling cannot fork "Furry" into two.
+    $("d-group").value = match ? key : name;
+    // Re-capture: the draft frozen above still holds the sentinel's null, so
+    // flushing it as-is would save no group at all.
+    scheduleSave();
+    // A name with no existing option has to be saved before the refresh below,
+    // or renderDrawer rebuilds the dropdown without it and the selection
+    // visibly springs back until the debounce lands.
+    await flushDraft(false);
+    await refreshState();
+  });
   $("d-notes").addEventListener("keydown", (e) => {
     if (e.key === "s" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); scheduleSave(); }
   });

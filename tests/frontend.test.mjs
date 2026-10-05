@@ -753,3 +753,547 @@ test("the log-limit note rejects unusable numbers", () => {
     assert.ok(note.classList.contains("warn-text"), `for ${bad}`);
   }
 });
+
+// --------------------------------------------------------------------- groups
+
+const GROUPED = [
+  { id: "avtr_1", name: "Catboy", group: "Furry", platforms: ["Quest"], tags: [] },
+  { id: "avtr_2", name: "Catgirl", group: "furry", platforms: ["PC"], tags: [] },
+  { id: "avtr_3", name: "Robot", group: "Mech", platforms: ["PC", "Quest"], tags: [] },
+  { id: "avtr_4", name: "Loose", tags: [] },
+];
+
+function withGroups(apiImpl = {}) {
+  const env = makeEnvironment(apiImpl);
+  const app = loadApp(env);
+  app.state = { ...app.state, entries: GROUPED };
+  env.document.getElementById("search").value = "";
+  return { env, app };
+}
+
+// The chips, the labels on each chip, and the count badge.
+function chipLabels(env) {
+  return env.document.getElementById("group-chips").children.map((c) => [
+    c.children.map((k) => k.textContent).join(""),
+    c.dataset.group,
+    c.classList.contains("active"),
+  ]);
+}
+
+test("group chips come from the entries, case-insensitively", () => {
+  const { env, app } = withGroups();
+  app.renderGroupChips();
+
+  // "Furry" and "furry" are one group, not two, and the chip shows the count of
+  // both. Sorted by name, with Ungrouped last since it has no name.
+  assert.deepEqual(chipLabels(env), [
+    ["Furry2", "furry", false],
+    ["Mech1", "mech", false],
+    ["Ungrouped1", "", false],
+  ]);
+});
+
+test("an entry with no group key is simply ungrouped", () => {
+  const { env, app } = setup();
+  app.state = { ...app.state, entries: [{ id: "avtr_9", name: "Legacy", tags: [] }] };
+  app.renderGroupChips();
+  assert.deepEqual(chipLabels(env), [["Ungrouped1", "", false]]);
+});
+
+test("clicking a group chip filters, clicking it again clears", () => {
+  const { env, app } = withGroups();
+  app.wire();
+  const row = env.document.getElementById("group-chips");
+  app.renderGroupChips();
+  const chip = row.children[0];
+  // chip.dataset.group is "furry"; the shim's closest() is a stub, so the event
+  // carries the chip as its target the way real delegation delivers it.
+  row.dispatch("click", { target: { ...chip, dataset: chip.dataset, closest: () => chip } });
+
+  assert.equal(app.currentGroup, "furry");
+  assert.deepEqual(app.visibleEntries().map((e) => e.id), ["avtr_1", "avtr_2"]);
+  assert.ok(chipLabels(env)[0][2], "the clicked chip is marked active");
+
+  row.dispatch("click", { target: { ...chip, dataset: chip.dataset, closest: () => chip } });
+  assert.equal(app.currentGroup, null);
+  assert.equal(app.visibleEntries().length, 4);
+});
+
+test("the Ungrouped chip is not the same as no group filter", () => {
+  const { env, app } = withGroups();
+  app.wire();
+  const row = env.document.getElementById("group-chips");
+  app.renderGroupChips();
+  const ungrouped = row.children[2];
+  row.dispatch("click", { target: { ...ungrouped, dataset: ungrouped.dataset, closest: () => ungrouped } });
+
+  assert.equal(app.currentGroup, "");
+  assert.deepEqual(app.visibleEntries().map((e) => e.id), ["avtr_4"]);
+});
+
+test("a group and a fixed filter intersect", () => {
+  const { app } = withGroups();
+  app.currentGroup = "mech";
+  app.currentFilter = "quest";
+  // Mech holds one avatar, and it is Quest, so the intersection is not empty.
+  assert.deepEqual(app.visibleEntries().map((e) => e.id), ["avtr_3"]);
+
+  app.currentGroup = "furry";
+  app.currentFilter = "quest";
+  // Catgirl is Furry but PC only, so picking both must exclude her.
+  assert.deepEqual(app.visibleEntries().map((e) => e.id), ["avtr_1"]);
+});
+
+test("groupKey mirrors the backend's normalization", () => {
+  // storage.group_key collapses whitespace, drops control characters, truncates
+  // to 40 and casefolds. A frontend key that skipped any step would fail to
+  // match a name the backend had already cleaned, so the avatar's own group
+  // would look ungrouped in the dropdown.
+  const { app } = setup();
+  const g = (v) => app.groupKey(v);
+  assert.equal(g("  Big   Furry "), "big furry");
+  assert.equal(g("big\nfurry"), "big furry");
+  assert.equal(g("b\x07ig furry"), "big furry");
+  assert.equal(g("Furry"), g("furry"));
+  assert.equal(g(""), "");
+  assert.equal(g(null), "");
+  assert.equal(g("x".repeat(80)).length, 40);
+  assert.equal(g("x".repeat(80)).length, app.MAX_GROUP_NAME);
+  assert.notEqual(g("furry"), g("quest"));
+});
+
+test("a group named like a fixed filter does not become one", () => {
+  // currentGroup and currentFilter are separate on purpose: folding them
+  // together would let a group called "all" become the show-everything filter.
+  const { app } = setup();
+  app.state = { ...app.state, entries: [
+    { id: "avtr_1", name: "One", group: "all", tags: [] },
+    { id: "avtr_2", name: "Two", tags: [] },
+  ] };
+  app.currentGroup = "all";
+  assert.deepEqual(app.visibleEntries().map((e) => e.id), ["avtr_1"]);
+});
+
+test("changing group invalidates the grid", () => {
+  // The grid is rebuilt from a signature of everything it displays. Group was
+  // missing from that signature, so a chip click left the old grid on screen.
+  const { env, app } = withGroups();
+  const cards = () => env.document.getElementById("grid").children[0].children;
+
+  app.renderGrid(true);
+  assert.equal(cards().length, 4);
+
+  app.currentGroup = "mech";
+  app.renderGrid();
+  assert.equal(cards().length, 1);
+
+  app.currentGroup = null;
+  app.renderGrid();
+  assert.equal(cards().length, 4);
+});
+
+test("group chips are hidden on the log scanner", () => {
+  // They filter the avatar grid, so on the log view they would be dead controls.
+  const { env, app } = withGroups();
+  app.renderHeader();
+  assert.ok(!env.document.getElementById("group-chips").classList.contains("hidden"));
+
+  app.currentView = "logs";
+  app.renderHeader();
+  assert.ok(env.document.getElementById("group-chips").classList.contains("hidden"));
+  assert.ok(env.document.getElementById("chips").classList.contains("hidden"));
+});
+
+// --------------------------------------------------------- drawer group field
+
+test("the drawer dropdown lists the groups and the current one is selected", () => {
+  const { env, app } = withGroups();
+  const select = env.document.getElementById("d-group");
+  app.renderGroupDropdown({ group: "furry" });
+
+  const values = select.children.map((o) => o.value);
+  assert.deepEqual(values, ["furry", "mech", "", app.NEW_GROUP]);
+  assert.equal(select.value, "furry", "case-insensitive match still selects");
+  assert.equal(select.children[0].textContent, "Furry", "the first-typed casing shows");
+});
+
+test("an avatar with no group selects No group", () => {
+  const { env, app } = withGroups();
+  const select = env.document.getElementById("d-group");
+  app.renderGroupDropdown({});
+  assert.equal(select.value, "");
+});
+
+test("a group missing from the list stays selectable", () => {
+  // A hand-edited favourites.json, or a stale chip, must not silently show
+  // "No group" and invite a change nobody made.
+  const { env, app } = withGroups();
+  const select = env.document.getElementById("d-group");
+  app.renderGroupDropdown({ group: "Ghosts" });
+  assert.ok(select.children.some((o) => o.value === "ghosts"));
+  assert.equal(select.value, "ghosts");
+});
+
+test("a pending pick survives the dropdown being rebuilt", () => {
+  // renderDrawer runs on every poll. Rebuilding from the saved group would make
+  // an unsaved pick flicker back to the old value.
+  const { env, app } = withGroups();
+  const select = env.document.getElementById("d-group");
+  app.renderGroupDropdown({ group: "furry" }, "mech");
+  assert.equal(select.value, "mech");
+
+  // A brand new name has no option yet, so the rebuild has to add it back.
+  app.renderGroupDropdown({ group: "furry" }, "Brand New");
+  assert.equal(select.value, "Brand New");
+});
+
+test("the draft saves the group's real casing, not the dropdown key", () => {
+  // Option values are lowercase keys so the two spellings of one group stay
+  // distinct options. Sending that key would rewrite every group's stored
+  // casing the first time it is picked.
+  const { env, app } = withGroups();
+  const saved = [];
+  app.state = app.state;
+  env.document.getElementById("d-group").value = "furry";
+  assert.equal(app.draftGroupName(), "Furry");
+
+  app.selectedId = "avtr_2";
+  app.captureDraft();
+  assert.equal(app.draft.group, "Furry");
+  assert.deepEqual(saved, []);
+});
+
+test("No group clears it, while the New group sentinel changes nothing", async () => {
+  // save_details treats a missing group as "leave it alone", so "" and null
+  // have to stay distinct: conflating them makes "No group" silently do nothing.
+  const saved = [];
+  const api = {
+    save_details: async (id, name, notes, tags, group) => {
+      saved.push(group);
+      return { ok: true };
+    },
+  };
+  const { env, app } = withGroups(api);
+  app.selectedId = "avtr_1";
+
+  env.document.getElementById("d-group").value = "";
+  app.captureDraft();
+  await app.flushDraft();
+  assert.equal(saved.at(-1), "");
+
+  env.document.getElementById("d-group").value = app.NEW_GROUP;
+  app.captureDraft();
+  await app.flushDraft();
+  assert.equal(saved.at(-1), null);
+});
+
+test("the four-argument drawer save leaves the group alone", async () => {
+  // The name/notes/tags autosave predates groups and passes no group at all.
+  const saved = [];
+  const api = {
+    save_details: async (id, name, notes, tags, group) => {
+      saved.push(group);
+      return { ok: true };
+    },
+  };
+  const { env, app } = withGroups(api);
+  app.selectedId = "avtr_1";
+  // The drawer populates the dropdown on every render; editing the name
+  // afterwards must send the avatar's group, not an empty one.
+  app.renderGroupDropdown({ group: "Furry" });
+  env.document.getElementById("d-name").value = "Edited";
+  app.scheduleSave();
+  await app.flushDraft();
+  assert.equal(saved.at(-1), "Furry");
+});
+
+// The other half of that contract -- a missing group means "leave it alone" --
+// is asserted in app/selftest.py against the real backend.
+
+// -------------------------------------------------------------- group picker
+
+test("the picker resolves a group's display casing, not its key", async () => {
+  const { env, app } = withGroups();
+  const p = app.showGroupPicker("Move to group");
+  const list = env.document.getElementById("prompt-list");
+  click(list.children[0]);
+  assert.equal(await p, "Furry");
+});
+
+test("the picker offers ungrouped and a way to make a new one", async () => {
+  const { env, app } = withGroups();
+  const p = app.showGroupPicker("Move to group");
+  const list = env.document.getElementById("prompt-list");
+  // Group rows carry a count child; the trailing actions are plain text.
+  const labels = list.children.map((b) =>
+    (b.children.length ? b.children.map((k) => k.textContent).join("") : b.textContent));
+
+  assert.deepEqual(labels, ["Furry2", "Mech1", "No group (ungrouped)", "＋ New group…"]);
+  click(list.children[2]);
+  // "" is the ungrouped choice, which the drawer turns into a separate action.
+  assert.equal(await p, "");
+  assert.notEqual(app.NEW_GROUP, "", "the sentinel cannot collide with ungrouped");
+});
+
+test("the picker says so when there are no groups yet", async () => {
+  const { env, app } = setup();
+  app.state = { ...app.state, entries: [{ id: "avtr_1", name: "Solo", tags: [] }] };
+  const p = app.showGroupPicker("Move to group");
+  const list = env.document.getElementById("prompt-list");
+  assert.match(list.children[0].textContent, /No groups yet/i);
+  click(list.children[1]);
+  assert.equal(await p, "");
+});
+
+test("the picker resolves null on cancel, backdrop and Escape", async () => {
+  for (const how of ["cancel", "backdrop", "escape"]) {
+    const { env, app } = withGroups();
+    const modal = env.document.getElementById("modal-prompt");
+    const p = app.showGroupPicker("Move to group");
+    if (how === "cancel") click(env.document.getElementById("prompt-cancel"));
+    else if (how === "backdrop") modal.dispatch("click", { target: modal });
+    else env.document.dispatch("keydown", { key: "Escape", stopPropagation() {}, preventDefault() {} });
+    assert.equal(await p, null, how);
+    assert.equal(app.pendingPrompt, null, `${how} leaves nothing pending`);
+  }
+});
+
+test("a second picker settles the first", async () => {
+  // Otherwise the first caller's await never returns and its bulk action hangs.
+  const { app } = withGroups();
+  const first = app.showGroupPicker("One");
+  const second = app.showGroupPicker("Two");
+  assert.equal(await first, null);
+  assert.ok(app.pendingPrompt, "the second is the pending one");
+});
+
+test("the picker hides the text field and keeps the list visible", () => {
+  const { env, app } = withGroups();
+  app.showGroupPicker("Move to group");
+  assert.ok(env.document.getElementById("prompt-list").classList.contains("hidden") === false);
+  assert.ok(env.document.getElementById("prompt-input").classList.contains("hidden"));
+  assert.ok(env.document.getElementById("prompt-ok").classList.contains("hidden"));
+  assert.ok(env.document.getElementById("prompt-cancel").classList.contains("hidden") === false);
+});
+
+// ----------------------------------------------------------------- bulk moves
+
+function withSelected(apiImpl = {}, ids = ["avtr_1", "avtr_2"]) {
+  const { env, app } = withGroups(apiImpl);
+  app.wire();
+  // additive, because a plain toggleSelect replaces the selection with one card.
+  app.toggleSelect(ids[0], false);
+  for (const id of ids.slice(1)) app.toggleSelect(id, true);
+  return { env, app };
+}
+
+test("the bulk bar moves several avatars into one group", async () => {
+  const calls = [];
+  const { env, app } = withSelected({
+    bulk_action: async (ids, action, value) => {
+      calls.push({ ids, action, value });
+      return { ok: true, changed: ids.length };
+    },
+    get_state: async () => ({ revs: { entries: 1 } }),
+  });
+
+  click(env.document.getElementById("bulk-group"));
+  await tick();
+  const list = env.document.getElementById("prompt-list");
+  // Furry first, and the chip row is what the picker lists, in the same order.
+  click(list.children[0]);
+  await tick();
+
+  assert.deepEqual(calls, [{ ids: ["avtr_1", "avtr_2"], action: "group", value: "Furry" }]);
+});
+
+test("the bulk picker's ungrouped option is a different action", async () => {
+  // "" would be sent as "group" with an empty value, which the backend rejects,
+  // so choosing No group has to map onto the ungroup action.
+  const calls = [];
+  const { env, app } = withSelected({
+    bulk_action: async (ids, action, value) => {
+      calls.push({ action, value });
+      return { ok: true, changed: ids.length };
+    },
+    get_state: async () => ({ revs: { entries: 1 } }),
+  });
+
+  click(env.document.getElementById("bulk-group"));
+  await tick();
+  const list = env.document.getElementById("prompt-list");
+  const noGroup = list.children[list.children.length - 2];
+  assert.equal(noGroup.textContent, "No group (ungrouped)");
+  click(noGroup);
+  await tick();
+
+  assert.deepEqual(calls, [{ action: "ungroup", value: "" }]);
+});
+
+test("the bulk picker can create a group on the way", async () => {
+  const calls = [];
+  const { env, app } = withSelected({
+    bulk_action: async (ids, action, value) => {
+      calls.push({ action, value });
+      return { ok: true, changed: ids.length };
+    },
+    get_state: async () => ({ revs: { entries: 1 } }),
+  });
+
+  click(env.document.getElementById("bulk-group"));
+  await tick();
+  const list = env.document.getElementById("prompt-list");
+  click(list.children[list.children.length - 1]);
+  await tick();
+
+  // The picker hands back a sentinel; the button has to turn it into a name.
+  assert.equal(env.document.getElementById("prompt-list").classList.contains("hidden"), true);
+  env.document.getElementById("prompt-input").value = "  Mech   Squad ";
+  click(env.document.getElementById("prompt-ok"));
+  await tick();
+
+  assert.deepEqual(calls, [{ action: "group", value: "Mech Squad" }]);
+});
+
+test("backing out of the bulk picker sends nothing", async () => {
+  const calls = [];
+  const { env, app } = withSelected({
+    bulk_action: async (ids, action, value) => {
+      calls.push({ action });
+      return { ok: true };
+    },
+  });
+
+  click(env.document.getElementById("bulk-group"));
+  await tick();
+  click(env.document.getElementById("prompt-cancel"));
+  await tick();
+  assert.deepEqual(calls, []);
+});
+
+test("backing out of the bulk new-group prompt sends nothing", async () => {
+  const calls = [];
+  const { env, app } = withSelected({
+    bulk_action: async (ids, action, value) => {
+      calls.push({ action });
+      return { ok: true };
+    },
+  });
+
+  click(env.document.getElementById("bulk-group"));
+  await tick();
+  const list = env.document.getElementById("prompt-list");
+  click(list.children[list.children.length - 1]);
+  await tick();
+  click(env.document.getElementById("prompt-cancel"));
+  await tick();
+  assert.deepEqual(calls, []);
+});
+
+test("a blank new-group name sends nothing", async () => {
+  const calls = [];
+  const { env, app } = withSelected({
+    bulk_action: async (ids, action, value) => {
+      calls.push({ action });
+      return { ok: true };
+    },
+  });
+
+  click(env.document.getElementById("bulk-group"));
+  await tick();
+  const list = env.document.getElementById("prompt-list");
+  click(list.children[list.children.length - 1]);
+  await tick();
+  // A name of only whitespace or control characters is not a group name.
+  env.document.getElementById("prompt-input").value = "   \x07  ";
+  click(env.document.getElementById("prompt-ok"));
+  await tick();
+  assert.deepEqual(calls, []);
+});
+
+// ------------------------------------------------------- drawer new-group flow
+
+test("the drawer's New group creates one and saves it", async () => {
+  const saved = [];
+  const { env, app } = withGroups({
+    save_details: async (id, name, notes, tags, group) => {
+      saved.push(group);
+      return { ok: true };
+    },
+    get_state: async () => ({ revs: { entries: 1 } }),
+  });
+  app.wire();
+  app.selectedId = "avtr_1";
+  const select = env.document.getElementById("d-group");
+  app.renderGroupDropdown({ group: "Furry" });
+
+  select.value = app.NEW_GROUP;
+  select.dispatch("change", { target: select });
+  await tick();
+  env.document.getElementById("prompt-input").value = "  Brand   New  ";
+  click(env.document.getElementById("prompt-ok"));
+  await tick();
+
+  assert.deepEqual(saved, ["Brand New"], "saved under the cleaned, typed name");
+});
+
+test("cancelling the drawer's New group leaves the saved group alone", async () => {
+  const saved = [];
+  const { env, app } = withGroups({
+    save_details: async (id, name, notes, tags, group) => {
+      saved.push(group);
+      return { ok: true };
+    },
+  });
+  app.wire();
+  app.selectedId = "avtr_1";
+  const select = env.document.getElementById("d-group");
+  app.renderGroupDropdown({ group: "Furry" });
+
+  select.value = app.NEW_GROUP;
+  select.dispatch("change", { target: select });
+  await tick();
+  click(env.document.getElementById("prompt-cancel"));
+  await tick();
+
+  // The dropdown must not be left sitting on the sentinel, which would read as
+  // "ungrouped" until the next redraw.
+  assert.equal(select.value, "furry");
+  assert.deepEqual(saved, [], "a cancelled prompt changes nothing");
+});
+
+test("typing an existing group's spelling does not fork it", async () => {
+  const saved = [];
+  const { env, app } = withGroups({
+    save_details: async (id, name, notes, tags, group) => {
+      saved.push(group);
+      return { ok: true };
+    },
+  });
+  app.wire();
+  app.selectedId = "avtr_1";
+  const select = env.document.getElementById("d-group");
+  app.renderGroupDropdown({ group: "" });
+
+  select.value = app.NEW_GROUP;
+  select.dispatch("change", { target: select });
+  await tick();
+  env.document.getElementById("prompt-input").value = "FURRY";
+  click(env.document.getElementById("prompt-ok"));
+  await tick();
+
+  assert.equal(select.value, "furry", "the existing option is reused");
+  assert.deepEqual(saved, ["Furry"], "and the first-typed casing is kept");
+});
+
+test("a text prompt after a picker still shows its field", () => {
+  // Both modes share one modal, so switching has to restore what it hid.
+  const { env, app } = withGroups();
+  app.showGroupPicker("Move to group");
+  const p = app.showPrompt("Add a tag");
+  assert.ok(!env.document.getElementById("prompt-input").classList.contains("hidden"));
+  assert.ok(env.document.getElementById("prompt-list").classList.contains("hidden"));
+  assert.ok(!env.document.getElementById("prompt-ok").classList.contains("hidden"));
+  click(env.document.getElementById("prompt-cancel"));
+  return p;
+});

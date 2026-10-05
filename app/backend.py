@@ -721,7 +721,7 @@ class Backend:
     def copy_text(self, text: str) -> dict:
         return {"ok": _set_clipboard(text or "")}
 
-    def save_details(self, avatar_id: str, name: str, notes: str, tags) -> dict:
+    def save_details(self, avatar_id: str, name: str, notes: str, tags, group=None) -> dict:
         avatar_id = self._norm_id(avatar_id)
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -734,6 +734,11 @@ class Backend:
             entry["name"] = (name or "").strip() or "Unnamed avatar"
             entry["notes"] = (notes or "").rstrip("\n")
             entry["tags"] = tags
+            # None means "not supplied", so the drawer's older autosave -- which
+            # passes four arguments -- leaves an existing group alone rather than
+            # silently clearing it.
+            if group is not None:
+                entry["group"] = storage.normalize_group(group)
             storage.save_favourites(self.entries)
             self._touch("entries")
         return {"ok": True}
@@ -957,7 +962,8 @@ class Backend:
     def bulk_action(self, ids, action: str, value: str = "") -> dict:
         """Apply one action to several favourites.
 
-        Supported: favorite, unfavorite, tag, untag, wear, refresh, delete.
+        Supported: favorite, unfavorite, tag, untag, group, ungroup, wear,
+        refresh, delete.
         """
         targets = []
         seen: set[str] = set()
@@ -989,9 +995,9 @@ class Backend:
             job = self.start_metadata_job(targets)
             return {**job, "action": action}
 
-        if action in ("favorite", "unfavorite", "tag", "untag"):
-            if action == "tag" and not value:
-                return {"ok": False, "message": "Enter a tag first."}
+        if action in ("favorite", "unfavorite", "tag", "untag", "group", "ungroup"):
+            if action in ("tag", "group") and not value:
+                return {"ok": False, "message": "Enter a value first."}
             with self._lock:
                 changed = 0
                 for avatar_id in targets:
@@ -1007,15 +1013,23 @@ class Backend:
                         if value not in tags:
                             tags.append(value)
                         entry["tags"] = tags
-                    else:
+                    elif action == "untag":
                         entry["tags"] = [t for t in entry.get("tags") or [] if t != value]
+                    elif action == "group":
+                        entry["group"] = storage.normalize_group(value)
+                    elif action == "ungroup":
+                        entry["group"] = ""
+                    else:
+                        continue
                     changed += 1
                 if changed:
                     storage.save_favourites(self.entries)
                     self._touch("entries")
             verb = {"favorite": "Favourited", "unfavorite": "Unfavourited",
-                    "tag": "Tagged", "untag": "Untagged"}[action]
-            self._set_status(f"{verb} {changed} avatar(s).")
+                    "tag": "Tagged", "untag": "Untagged",
+                    "group": "Moved", "ungroup": "Removed from group"}[action]
+            detail = "" if action in ("group", "ungroup") else f" ({value})"
+            self._set_status(f"{verb} {changed} avatar(s){detail}.")
             return {"ok": True, "changed": changed, "action": action}
 
         return {"ok": False, "message": f"Unknown action: {action}"}
@@ -1039,6 +1053,7 @@ class Backend:
             # about the avatar, not about this install.
             if entry.get("inaccessible"):
                 restored["inaccessible"] = True
+            restored["group"] = storage.normalize_group(entry.get("group"))
             for key in ("tags", "platforms"):
                 if isinstance(entry.get(key), list):
                     restored[key] = [str(v) for v in entry[key]]

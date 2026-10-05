@@ -181,6 +181,31 @@ Two entries on that wiki page are deliberately missing from the list because
 they carry no avatar ID to match on: *Neri* links to a user page rather than an
 avatar page, and *Simple Fox* is marked `[AVATAR DELETED]`.
 
+### Groups
+
+Tags describe an avatar. Groups are for browsing it. An avatar is in exactly one
+group or none, and every group you have used appears as a chip under the
+Favourites row with a count, so a large collection stays navigable without
+renaming anything.
+
+- Set a group from an avatar's drawer, or for several at once with the **Move to
+  group** bulk button.
+- Both pickers list the groups you already have and offer **＋ New group…**, so
+  names are picked rather than typed — a typo would otherwise become a
+  near-duplicate group, since `Furry` and `furry` count as the same one.
+- Names match case-insensitively and the casing you first used is the casing
+  shown.
+- A group and a chip like *Quest Compatible* intersect, so you can ask for the
+  Quest avatars inside a group. Clicking the active group chip clears it.
+- An **Ungrouped** chip appears whenever there is anything not yet in a group,
+  so those avatars stay reachable too.
+
+There is no separate list of groups to maintain. A group exists exactly while
+some avatar is in it, so emptying a group makes its chip disappear and there is
+nothing to prune. Groups live in your local `favourites.json` and travel with an
+export, but they are *not* synced to VRChat's own favourite list — VRChat has no
+API for it.
+
 ### Privacy
 
 Everything stays on your machine. This tool reads those files and nothing else,
@@ -246,6 +271,7 @@ Without login, everything still works — new favourites just show a placeholder
 - **Motion** — sliding transitions between the avatar grid and the log scanner, staggered list entrances, hover feedback
 - **Live tracking** — the avatar you're currently wearing is highlighted in the list
 - **Notes & tags** per avatar
+- **Groups** — one named group per avatar, browsable from dynamic chips with counts (see above)
 - **Search** across names, notes, tags, and IDs (works in both views)
 - **Sort** by name or newest
 - **Thumbnails** (with optional login)

@@ -293,6 +293,50 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   border-color: #fff;
   color: var(--accent-ink);
 }
+/* Group chips sit on their own row so a long list of group names cannot push
+   the fixed filters off the header. */
+.chips-groups { padding-top: 0.1rem; }
+/* The count is decoration, so it is muted unless the chip is the active
+   filter -- then it sits on white and needs the darker ink to stay readable. */
+.chip-count {
+  margin-left: 0.45rem;
+  padding: 0 0.32rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+}
+.chip.active .chip-count { background: rgba(0, 0, 0, 0.12); color: var(--accent-ink); }
+
+/* ------------------------------------------------------- group picker list */
+.group-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.7rem;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.group-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.9rem;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+.group-option:hover { background: var(--surface-3, var(--surface)); border-color: var(--accent); }
+.group-option .chip-count { background: rgba(255, 255, 255, 0.08); }
 
 /* ---------------------------------------------------------------- grid */
 .grid-wrap {

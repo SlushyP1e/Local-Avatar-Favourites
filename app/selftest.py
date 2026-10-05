@@ -1971,6 +1971,141 @@ def test_restore_entry_for_undo() -> None:
     check("restoring a non-dict is refused", b.restore_entry("nope")["ok"] is False)
 
 
+# ------------------------------------------------------------------- groups
+def test_group_names_are_normalized() -> None:
+    """Group names are typed by hand, so they arrive ragged."""
+    check("inner whitespace collapses", storage.normalize_group("big   furry") == "big furry")
+    check("newlines become spaces", storage.normalize_group("big\nfurry") == "big furry")
+    check("control characters are dropped", storage.normalize_group("b\x07ig furry") == "big furry")
+    check("surrounding space trimmed", storage.normalize_group("  quest  ") == "quest")
+    check("overlong names truncated",
+          len(storage.normalize_group("x" * 80)) == storage.MAX_GROUP_NAME)
+    check("a blank name is ungrouped", storage.normalize_group("   ") == "")
+    check("a non-string is ungrouped", storage.normalize_group(None) == "")
+    check("a number is ungrouped", storage.normalize_group(7) == "")
+
+    # Casing is preserved: the name first typed is the name displayed.
+    check("casing is preserved", storage.normalize_group("Furry") == "Furry")
+    # ...but identity ignores it, so "Furry" and "furry" cannot become two
+    # groups the user then has to merge by hand.
+    check("identity ignores case", storage.group_key("Furry") == storage.group_key("furry"))
+    check("identity ignores inner spacing",
+          storage.group_key("big  furry") == storage.group_key("Big Furry"))
+    check("an ungrouped entry has an empty key", storage.group_key("") == "")
+    check("a distinct name is a distinct key",
+          storage.group_key("furry") != storage.group_key("quest"))
+
+
+def test_an_old_favourites_file_gains_a_group() -> None:
+    """Entries written before groups existed must load as ungrouped."""
+    root = Path(tempfile.mkdtemp())
+    storage.DATA_DIR = root
+    storage.FAVS_FILE = root / "favourites.json"
+    storage.FAVS_FILE.write_text(json.dumps({"version": 1, "entries": [
+        {"id": "avtr_1", "name": "Old"},
+        {"id": "avtr_2", "name": "Hand-edited", "group": "  Big   Furry "},
+        {"id": "avtr_3", "name": "Junk", "group": {"not": "a string"}},
+    ]}), encoding="utf-8")
+
+    loaded = storage.load_favourites()
+    check("a group-less entry loads ungrouped", loaded[0]["group"] == "")
+    check("a stored group is cleaned on load", loaded[1]["group"] == "Big Furry")
+    check("a non-string group loads ungrouped", loaded[2]["group"] == "")
+
+
+def test_a_new_entry_is_ungrouped() -> None:
+    entry = storage.new_entry("avtr_12341234-1234-1234-1234-123412341234", "Someone")
+    check("new entry has a group field", "group" in entry)
+    check("new entry starts ungrouped", entry["group"] == "")
+    check("a group is not a tag", "group" not in entry["tags"])
+
+
+def test_a_group_survives_a_save_and_reload() -> None:
+    b = _isolated_backend()
+    avatar_id = "avtr_12341234-1234-1234-1234-123412341234"
+    b.add_by_id(avatar_id)
+
+    res = b.save_details(avatar_id, "Someone", "note", ["cute"], "  Big   Furry ")
+    check("save_details accepts a group", res["ok"] is True, str(res))
+    check("group stored normalized", b._entry(avatar_id)["group"] == "Big Furry")
+
+    # The drawer autosave calls the four-argument form, which predates groups.
+    # It must not wipe the group just because it was not mentioned.
+    b.save_details(avatar_id, "Someone", "note", ["cute"])
+    check("a group-less save keeps the group", b._entry(avatar_id)["group"] == "Big Furry")
+
+    b.save_details(avatar_id, "Someone", "note", ["cute"], "")
+    check("an explicit empty group clears it", b._entry(avatar_id)["group"] == "")
+
+    b.save_details(avatar_id, "Someone", "note", ["cute"], "Quest")
+    check("group persisted to disk",
+          any(e.get("group") == "Quest" for e in storage.load_favourites()))
+
+
+def test_bulk_group_actions() -> None:
+    b = _isolated_backend()
+    ids = [f"avtr_{i:08x}-aaaa-bbbb-cccc-dddddddddddd" for i in range(3)]
+    for avatar_id in ids:
+        b.add_by_id(avatar_id)
+
+    res = b.bulk_action(ids, "group", "Furry")
+    check("bulk group ok", res["ok"] and res["changed"] == 3, str(res))
+    check("group applied to all", all(b._entry(i)["group"] == "Furry" for i in ids))
+
+    res = b.bulk_action(ids[:2], "ungroup")
+    check("bulk ungroup ok", res["ok"] and res["changed"] == 2, str(res))
+    check("group cleared", [b._entry(i)["group"] for i in ids] == ["", "", "Furry"])
+
+    check("group requires a value", b.bulk_action(ids, "group", "")["ok"] is False)
+    check("ungroup needs no value", b.bulk_action(ids, "ungroup", "")["ok"] is True)
+
+    # Moving replaces rather than accumulates: one group per avatar.
+    b.bulk_action(ids, "group", "Quest")
+    check("a second group replaces the first",
+          all(b._entry(i)["group"] == "Quest" for i in ids))
+
+
+def test_a_group_survives_delete_and_undo() -> None:
+    b = _isolated_backend()
+    avatar_id = "avtr_12341234-1234-1234-1234-123412341234"
+    b.add_by_id(avatar_id)
+    entry = b._entry(avatar_id)
+    entry["group"] = "Furry"
+
+    b.delete(avatar_id)
+    res = b.restore_entry(entry)
+    check("undo ok", res["ok"] is True, str(res))
+    check("group came back with the avatar", b._entry(avatar_id)["group"] == "Furry")
+
+    # A deleted entry taken from a hand-edited file may carry no group at all,
+    # or one written by something that never heard of normalize_group.
+    bare_id = "avtr_22222222-2222-2222-2222-222222222222"
+    check("restoring a group-less entry is ungrouped",
+          b.restore_entry({"id": bare_id, "name": "No group"})["ok"] is True)
+    check("missing group becomes empty", b._entry(bare_id)["group"] == "")
+
+    junk_id = "avtr_33333333-3333-3333-3333-333333333333"
+    check("a junk group is cleaned on restore",
+          b.restore_entry({"id": junk_id, "name": "Junk", "group": "  a\nb  "})["ok"] is True)
+    check("junk group normalized", b._entry(junk_id)["group"] == "a b")
+
+
+def test_groups_survive_an_export_and_import() -> None:
+    existing = [{"id": "avtr_11111111-1111-1111-1111-111111111111", "name": "Already here"}]
+    incoming = [{"id": "avtr_22222222-2222-2222-2222-222222222222",
+                 "name": "Keeper", "group": "  Furry  "},
+                {"id": "avtr_33333333-3333-3333-3333-333333333333",
+                 "name": "Second", "group": "Quest", "thumb": "C:\\evil\\thumb.png"},
+                {"id": "avtr_44444444-4444-4444-4444-444444444444", "name": "Bare"}]
+    merged, added = storage.merge_favourites(existing, incoming)
+    by_id = {e["id"]: e for e in merged}
+    check("only new ids are added", added == 3, str(added))
+    check("import carries the group", by_id[incoming[0]["id"]]["group"] == "Furry")
+    check("imported group is cleaned", by_id[incoming[1]["id"]]["group"] == "Quest")
+    check("a local path is still not imported", by_id[incoming[1]["id"]].get("thumb") is None)
+    check("an entry with no group is ungrouped", by_id[incoming[2]["id"]]["group"] == "")
+
+
 def test_start_metadata_job_requires_login() -> None:
     b = _isolated_backend()
     res = b.start_metadata_job(["avtr_00000000-1111-2222-3333-444444444444"])
@@ -2380,6 +2515,13 @@ def main() -> int:
         test_job_progress,
         test_job_counts_failures,
         test_bulk_actions,
+        test_group_names_are_normalized,
+        test_an_old_favourites_file_gains_a_group,
+        test_a_new_entry_is_ungrouped,
+        test_a_group_survives_a_save_and_reload,
+        test_bulk_group_actions,
+        test_a_group_survives_delete_and_undo,
+        test_groups_survive_an_export_and_import,
         test_restore_entry_for_undo,
         test_start_metadata_job_requires_login,
         test_tray_icon,

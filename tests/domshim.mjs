@@ -5,23 +5,37 @@ import { readFileSync } from "node:fs";
 export function makeElement(id = "el") {
   const listeners = new Map();
   const classes = new Set();
-  return {
+  const el = {
     id,
     value: "",
     textContent: "",
     style: { setProperty() {} },
     dataset: {},
-    innerHTML: "",
-    // Enough for the stagger logic, which only reads children.length and
-    // assigns --i on each one.
     children: [],
     offsetWidth: 0,
     getAttribute: () => null,
     setAttribute: () => {},
     closest: () => null,
-    appendChild: () => {},
-    removeChild: () => {},
-    querySelector: () => null,
+    // Children accumulate so renderGroupChips and renderGroupDropdown can be
+    // inspected, and so applyStagger sees the real child count. Assigning
+    // innerHTML clears them, which is what the renderers rely on to rebuild.
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    removeChild(child) {
+      const i = this.children.indexOf(child);
+      if (i >= 0) this.children.splice(i, 1);
+      return child;
+    },
+    // A regular function, not an arrow, because the memo hangs off `this`.
+    querySelector(sel) {
+      // Cards wire listeners onto their own inner buttons. Returning a memoised
+      // stub per selector keeps renderGrid runnable without parsing innerHTML.
+      if (!this._stubs) this._stubs = new Map();
+      if (!this._stubs.has(sel)) this._stubs.set(sel, makeElement(sel));
+      return this._stubs.get(sel);
+    },
     querySelectorAll: () => [],
     getBoundingClientRect: () => ({ width: 0, height: 0 }),
     classList: {
@@ -62,6 +76,38 @@ export function makeElement(id = "el") {
       return n;
     },
   };
+  // innerHTML is only ever assigned wholesale by the renderers, never parsed,
+  // so a plain field is enough as long as it clears the child list.
+  let html = "";
+  Object.defineProperty(el, "innerHTML", {
+    get: () => html,
+    set: (v) => {
+      html = String(v == null ? "" : v);
+      if (html === "") el.children.length = 0;
+    },
+  });
+  // The renderers build elements by assigning className, then ask classList
+  // whether a class is present. Without this bridge those two disagree and a
+  // test sees an "active" chip that reports itself as inactive.
+  let className = "";
+  Object.defineProperty(el, "className", {
+    get: () => className,
+    set: (v) => {
+      className = String(v == null ? "" : v);
+      classes.clear();
+      for (const c of className.split(/\s+/).filter(Boolean)) classes.add(c);
+    },
+  });
+  // Assigning textContent replaces the element's contents in a real DOM.
+  let text = "";
+  Object.defineProperty(el, "textContent", {
+    get: () => text,
+    set: (v) => {
+      text = String(v == null ? "" : v);
+      el.children.length = 0;
+    },
+  });
+  return el;
 }
 
 export function makeEnvironment(apiImpl = {}, options = {}) {
@@ -80,6 +126,7 @@ export function makeEnvironment(apiImpl = {}, options = {}) {
       return elements.get(id);
     },
     createElement: () => makeElement("created"),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
     createDocumentFragment: () => makeElement("fragment"),
     querySelector: () => null,
     querySelectorAll: () => [],
@@ -136,9 +183,20 @@ export function loadApp(env) {
   setView, animateView, applyStagger, revealOnce, replayAnimation,
   clearAnimationWhenDone, applyMotionPreference, systemPrefersReducedMotion,
   renderMotionNote, renderDiscovery, renderLimitsNote, VIEW_ORDER, STAGGER_CAP,
+  groupKey, entryGroupKey, groupSummary, renderGroupChips, matchesFilter,
+  MAX_GROUP_NAME,
+  renderGroupDropdown, draftGroupName, showGroupPicker, setPromptMode, NEW_GROUP,
+  toggleSelect, clearSelection, promptForGroupName,
+  get selection() { return selection; },
+  wire, renderGrid, renderHeader, render,
   get currentView() { return currentView; },
   set currentView(v) { currentView = v; },
+  get currentFilter() { return currentFilter; },
+  set currentFilter(v) { currentFilter = v; },
+  get currentGroup() { return currentGroup; },
+  set currentGroup(v) { currentGroup = v; },
   get pendingConfirm() { return pendingConfirm; },
+  get pendingPrompt() { return pendingPrompt; },
   get draft() { return draft; },
   get selectedId() { return selectedId; },
   set selectedId(v) { selectedId = v; },

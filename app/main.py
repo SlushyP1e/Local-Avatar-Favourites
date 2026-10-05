@@ -45,7 +45,12 @@ def _web_dir() -> str:
 # Markers that must be present in the bundled stylesheet. PyInstaller reuses
 # build/ between runs, and a stale bundle looks exactly like a broken feature:
 # the UI silently loses behaviour with no error anywhere.
-CSS_MARKERS = ("data-motion", "view-in-next", "prefers-reduced-motion")
+CSS_MARKERS = ("data-motion", "view-in-next", "prefers-reduced-motion",
+               ".group-picker", ".chip-count")
+
+# Element ids app.js binds to at startup. A missing one throws in wire(), which
+# would leave every later listener unwired with no useful error.
+HTML_MARKERS = ("group-chips", "d-group", "bulk-group", "prompt-list")
 
 
 def _icon_path() -> str | None:
@@ -180,6 +185,20 @@ def main() -> int:
             print(f"  css            : {len(css)} bytes, "
                   f"{'all markers present' if not missing else 'MISSING ' + ', '.join(missing)}")
 
+        # Same reasoning for the markup. An index.html without these would leave
+        # app.js wiring listeners to elements that are not there, and every group
+        # control would fail silently.
+        html_missing: list[str] = []
+        try:
+            html = Path(os.path.join(_web_dir(), "index.html")).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"  html           : UNREADABLE ({exc})")
+            html_missing = list(HTML_MARKERS)
+        else:
+            html_missing = [m for m in HTML_MARKERS if m not in html]
+            print(f"  html           : {len(html)} bytes, "
+                  f"{'all markers present' if not html_missing else 'MISSING ' + ', '.join(html_missing)}")
+
         # The curated default-avatar list ships inside the frozen bytecode
         # archive, so it cannot be probed for like a data file. Import it and
         # assert the sentinels are actually filterable: a bundle that somehow
@@ -207,6 +226,9 @@ def main() -> int:
             return 1
         if missing:
             print("  ERROR: bundled stylesheet is stale -- rebuild with --clean")
+            return 1
+        if html_missing:
+            print("  ERROR: bundled markup is stale -- rebuild with --clean")
             return 1
         if not filter_ok:
             print("  ERROR: curated default-avatar list missing or unusable in this bundle")

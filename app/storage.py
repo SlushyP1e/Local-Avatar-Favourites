@@ -135,6 +135,9 @@ def merge_favourites(existing: list[dict], incoming: list[dict]) -> tuple[list[d
                 new[key] = value
         if isinstance(entry.get("tags"), list):
             new["tags"] = [str(t) for t in entry["tags"]]
+        # A group name is portable local data, so unlike "thumb" above it is
+        # safe to carry across an import.
+        new["group"] = normalize_group(entry.get("group"))
         if isinstance(entry.get("platforms"), list):
             new["platforms"] = [str(p) for p in entry["platforms"]]
         new["favorite"] = bool(entry.get("favorite"))
@@ -280,7 +283,13 @@ def load_favourites() -> list[dict]:
         entries = data.get("entries", [])
         if not isinstance(entries, list):
             return []
-        return [e for e in entries if isinstance(e, dict) and e.get("id")]
+        loaded = [e for e in entries if isinstance(e, dict) and e.get("id")]
+        # Backfill so every entry in memory carries a group, however old the file
+        # is and whatever is sitting in it. Saves one branch per read on the
+        # frontend, and a hand-edited group name gets cleaned on the way in.
+        for entry in loaded:
+            entry["group"] = normalize_group(entry.get("group"))
+        return loaded
     except (json.JSONDecodeError, OSError):
         return []
 
@@ -299,6 +308,10 @@ def new_entry(avatar_id: str, name: str = "") -> dict:
         "name": name or "Unnamed avatar",
         "notes": "",
         "tags": [],
+        # Exactly one named group, or "" for ungrouped. Deliberately distinct
+        # from "tags": tags are many-per-avatar and describe it, a group is
+        # one-per-avatar and is how you browse it.
+        "group": "",
         "added": _utcnow_iso(),
         "thumb": None,
         "thumb_url": None,
@@ -307,6 +320,33 @@ def new_entry(avatar_id: str, name: str = "") -> dict:
         "release_status": "",
         "favorite": False,
     }
+
+
+# Group names are typed by hand, so they are bounded and stripped of control
+# characters before they reach the chip row or an export file.
+MAX_GROUP_NAME = 40
+
+
+def normalize_group(value) -> str:
+    """Clean a user-supplied group name.
+
+    Returns "" for anything unusable, which is how "ungrouped" is stored. Not
+    case-normalised: two names differing only in case are meant to be the same
+    group, so the UI and the backend both compare with :func:`group_key`
+    instead, and the casing first typed is the casing displayed.
+    """
+    if not isinstance(value, str):
+        return ""
+    # Collapse runs of whitespace, so "big   furry" and "big furry" are one.
+    cleaned = " ".join(value.split())
+    # Control characters would corrupt the single-line chip and the export.
+    cleaned = "".join(ch for ch in cleaned if ch.isprintable()).strip()
+    return cleaned[:MAX_GROUP_NAME]
+
+
+def group_key(value) -> str:
+    """Case- and whitespace-insensitive identity for a group name."""
+    return normalize_group(value).casefold()
 
 
 def sanitize_settings(raw) -> dict:

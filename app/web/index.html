@@ -53,6 +53,9 @@
           <button class="chip" data-filter="quest">Quest Compatible</button>
           <button class="chip" data-filter="pc">PC</button>
         </div>
+        <!-- Group chips are built from the entries at render time, so they carry
+             data-group rather than data-filter and are never authored here. -->
+        <div class="chips chips-groups" id="group-chips"></div>
       </header>
 
       <!-- ---------------------------------------------------- job progress -->
@@ -72,6 +75,7 @@
           <button id="bulk-fav" class="btn small">Favorite</button>
           <button id="bulk-tag" class="btn small">Tag</button>
           <button id="bulk-untag" class="btn small">Remove tag</button>
+          <button id="bulk-group" class="btn small">Move to group</button>
           <button id="bulk-refresh" class="btn small">Refresh</button>
           <button id="bulk-delete" class="btn small danger">Delete</button>
           <span class="spacer"></span>
@@ -170,6 +174,11 @@
     <label class="field-label" for="d-notes">Notes</label>
     <textarea id="d-notes" class="text-input notes" placeholder="Why you like it, where you found it..."></textarea>
 
+    <label class="field-label" for="d-group">Group</label>
+    <select id="d-group" class="select"></select>
+    <p class="muted small">One group per avatar, for browsing. Tags below are for
+      describing it.</p>
+
     <label class="field-label" for="d-tags">Tags <span class="muted">(comma separated)</span></label>
     <input id="d-tags" class="text-input" type="text" placeholder="cute, dark, robot" />
 
@@ -212,6 +221,10 @@
       <h2 id="prompt-title">Enter a value</h2>
       <p id="prompt-message" class="muted"></p>
       <input id="prompt-input" class="text-input" type="text" autocomplete="off" />
+      <!-- Second mode of the same dialog: a list of existing groups. Reusing
+           the modal rather than adding a fourth dialog keeps every dismissal
+           path (Escape, backdrop, Cancel) working the same way. -->
+      <div id="prompt-list" class="group-picker hidden"></div>
       <div class="modal-actions">
         <button id="prompt-cancel" class="btn ghost">Cancel</button>
         <button id="prompt-ok" class="btn primary">OK</button>
