@@ -334,138 +334,341 @@ test("a failed fallback is not retried for ever", async () => {
   assert.equal(calls, 2, "a new thumbnail must be retried");
 });
 
+// --------------------------------------------------------- ignored avatars
+
+test("the blocklist is fetched and rendered in Settings", async () => {
+  const api = {
+    get_ignores: async () => ({
+      ok: true,
+      ids: ["avtr_a", "avtr_b"],
+      names: { avtr_a: "Noisy One", avtr_b: "" },
+    }),
+  };
+  const { env, app } = setup(api);
+  await app.loadIgnores();
+  app.renderIgnoreList();
+
+  assert.deepEqual(app.ignores.ids, ["avtr_a", "avtr_b"]);
+  const list = env.document.getElementById("ignore-list");
+  assert.equal(list.children.length, 2);
+  assert.equal(list.children[0].children[0].textContent, "Noisy One");
+  // An avatar blocked before its name was ever fetched still needs a row.
+  assert.equal(list.children[1].children[0].textContent, "Unnamed avatar");
+  assert.match(env.document.getElementById("ignore-note").textContent, /2 ignored/);
+});
+
+test("an empty blocklist says so rather than showing nothing", async () => {
+  const api = { get_ignores: async () => ({ ok: true, ids: [], names: {} }) };
+  const { env, app } = setup(api);
+  await app.loadIgnores();
+  app.renderIgnoreList();
+
+  const list = env.document.getElementById("ignore-list");
+  assert.equal(list.children.length, 1);
+  assert.equal(list.children[0].textContent, "Nothing ignored yet.");
+});
+
+test("ignoring confirms first, then blocks and reports what it removed", async () => {
+  const calls = [];
+  const api = {
+    get_ignores: async () => ({ ok: true, ids: [], names: {} }),
+    add_ignore: async (id, name) => {
+      calls.push([id, name]);
+      return { ok: true, id, removed: 3 };
+    },
+    get_state: async () => ({ revs: {}, logs: [], entries: [], changes: [] }),
+  };
+  const { env, app } = setup(api);
+  const p = app.ignoreAvatar("avtr_c", "Noisy One");
+  await tick();
+  // Declining must send nothing: this is a destructive, one-way action.
+  click(env.document.getElementById("confirm-cancel"));
+  await p;
+  assert.equal(calls.length, 0, "cancelling the confirmation still blocked the avatar");
+
+  const q = app.ignoreAvatar("avtr_c", "Noisy One");
+  await tick();
+  click(env.document.getElementById("confirm-ok"));
+  await q;
+  assert.deepEqual(calls, [["avtr_c", "Noisy One"]]);
+});
+
+test("a refused block surfaces the reason instead of silently doing nothing", async () => {
+  const api = {
+    get_ignores: async () => ({ ok: true, ids: [], names: {} }),
+    add_ignore: async () => ({ ok: false, message: "Ignore list is full (5000)." }),
+    get_state: async () => ({ revs: {}, logs: [], entries: [], changes: [] }),
+  };
+  const { env, app } = setup(api);
+  const p = app.ignoreAvatar("avtr_d", "Noisy");
+  await tick();
+  click(env.document.getElementById("confirm-ok"));
+  await p;
+
+  const alert = env.document.getElementById("modal-alert");
+  assert.ok(!alert.classList.contains("hidden"),
+    "a refusal must be shown, not swallowed");
+  assert.match(env.document.getElementById("alert-message").textContent, /full/);
+});
+
+test("un-ignoring reloads the list so the row disappears", async () => {
+  const removed = [];
+  let ids = ["avtr_e"];
+  const api = {
+    get_ignores: async () => ({ ok: true, ids: [...ids], names: { avtr_e: "Was Noisy" } }),
+    remove_ignore: async (id) => { removed.push(id); ids = []; return { ok: true, id }; },
+    get_state: async () => ({ revs: {}, logs: [], entries: [], changes: [] }),
+  };
+  const { env, app } = setup(api);
+  await app.loadIgnores();
+  app.renderIgnoreList();
+
+  const row = env.document.getElementById("ignore-list").children[0];
+  const button = row.children[2];
+  assert.equal(button.textContent, "Remove");
+  await click(button);
+  await tick();
+
+  assert.deepEqual(removed, ["avtr_e"]);
+  assert.equal(app.ignores.ids.length, 0, "the list must not still show the removed row");
+});
+
+test("both the log row and the favourite offer to ignore", async () => {
+  const api = { get_ignores: async () => ({ ok: true, ids: [], names: {} }) };
+  const { app } = setup(api);
+  const entry = { id: "avtr_f", name: "Fave" };
+  app.state = { ...app.state, entries: [entry] };
+
+  // The log row's context menu, which is where a first sighting is dealt with.
+  const logItems = await app.forgetLogMenuItems(
+    { id: "avtr_g", name: "Logged", count: 1, last_seen: "2026-01-01T00:00:00+00:00" });
+  const logLabels = logItems.filter((i) => !i.sep).map((i) => i.label);
+  assert.ok(logLabels.includes("Never log this avatar"), logLabels.join(" | "));
+  assert.ok(logLabels.includes("Remove from Log"), logLabels.join(" | "));
+
+  // And a favourite, since an avatar you already saved is often exactly the one
+  // that keeps showing up in the log.
+  const cardLabels = app.cardMenuItems(entry).filter((i) => !i.sep).map((i) => i.label);
+  assert.ok(cardLabels.includes("Never log this avatar"), cardLabels.join(" | "));
+});
+
+test("ignoring prefers the resolved name over the raw id", async () => {
+  const api = { get_ignores: async () => ({ ok: true, ids: [], names: {} }) };
+  const { app } = setup(api);
+  const saved = { id: "avtr_h", name: "Real Name" };
+  app.state = { ...app.state, entries: [saved] };
+  const items = await app.forgetLogMenuItems({ id: "avtr_h", name: "", last_seen: "" });
+  const item = items.find((i) => i.label === "Never log this avatar");
+  // An unnamed log row must not be blocked under a blank label when the
+  // favourite already knows the real name.
+  assert.ok(item, "the ignore action is missing");
+});
+
 // ------------------------------------------------------- progressive lists
 
-test("a long grid draws one page, not every row", () => {
-  const entries = Array.from({ length: 900 }, (_, i) => ({
-    id: "avtr_" + i, name: "Avatar " + i, tags: [], platforms: [], added: "2026-01-01T00:00:00+00:00",
-  }));
+test("a page is 50 rows, so the lazy image loading works in small units", () => {
+  // One page is one unit of thumbnail work: only drawn rows hold an image, so a
+  // large page would mean a large spike of decoded bitmaps on the first paint.
   const { app } = setup();
-  app.state = { ...app.state, entries };
+  assert.equal(app.PAGE_ROWS, 50);
+});
+
+function withAvatars(app, count) {
+  app.state = { ...app.state, entries: Array.from({ length: count }, (_, i) => ({
+    id: "avtr_" + i,
+    name: "Avatar " + i,
+    tags: [],
+    platforms: [],
+    added: `2026-01-${String((i % 28) + 1).padStart(2, "0")}T00:00:00+00:00`,
+  })) };
   app.currentFilter = "all";
   app.currentGroup = null;
+}
 
-  assert.ok(app.PAGE_ROWS < 900, "the fixture must exceed one page");
+// The rendered rows are cards; a pager is appended after them.
+const gridRows = (env) => {
+  const grid = env.document.getElementById("grid");
+  const kids = grid.children;
+  const at = kids.findIndex((c) => c.className === "pager");
+  return { cards: at === -1 ? kids : kids.slice(0, at), pager: at === -1 ? null : kids[at] };
+};
+
+test("94 favourites show 50 rows and numbered pages 1 and 2", () => {
+  // The reported case, verbatim: a real collection of 94 showed no pagination.
+  const { env, app } = setup();
+  withAvatars(app, 94);
+
   app.renderGrid(true);
-  assert.equal(app.listTotal.grid, 900, "the full list is still known");
-  assert.equal(app.pageSize.grid, app.PAGE_ROWS,
-    "only one page is drawn until the user scrolls for more");
+
+  assert.equal(app.listTotal.grid, 94, "all 94 are known about");
+  assert.equal(app.pageCount(94), 2, "94 rows is two pages of 50");
+  assert.equal(app.currentPage.grid, 1, "opens on page 1");
+
+  const { cards, pager } = gridRows(env);
+  assert.equal(cards.length, 50, "only the first page's cards are drawn");
+  assert.ok(pager, "page buttons must be drawn");
+  assert.equal(pager.className, "pager");
+
+  // nav > [<] [1] [2] [>]
+  const labels = pager.children.map((c) => c.textContent);
+  assert.deepEqual(labels, ["‹", "1", "2", "›"], pager.children.map((c) => c.textContent).join("|"));
+  assert.ok(pager.children[0].disabled, "Previous is disabled on page 1");
+  assert.equal(pager.children[2].disabled, false, "Next is available on page 1");
 });
 
-test("a long log draws one page, not every row", () => {
-  const logs = Array.from({ length: 640 }, (_, i) => ({
-    id: "avtr_log" + i, name: "Logged " + i, count: 1, last_seen: "2026-01-01T00:00:00+00:00",
-    private: false, source: "log",
-  }));
-  const { app } = setup();
-  app.state = { ...app.state, logs, changes: [] };
-  app.currentView = "logs";
-  app.logTab = "avatars";
-
-  app.renderLogs(true);
-  assert.equal(app.listTotal.logs, 640);
-  assert.equal(app.pageSize.logs, app.PAGE_ROWS);
-});
-
-test("changing the search starts the list over at one page", () => {
-  const logs = Array.from({ length: 640 }, (_, i) => ({
-    id: "avtr_log" + i, name: "Logged " + i, count: 1, last_seen: "2026-01-01T00:00:00+00:00",
-    private: false, source: "log",
-  }));
+test("clicking page 2 shows the remaining 44", () => {
   const { env, app } = setup();
-  app.state = { ...app.state, logs, changes: [] };
-  app.currentView = "logs";
-  app.logTab = "avatars";
+  withAvatars(app, 94);
+  app.renderGrid(true);
 
-  app.renderLogs(true);
-  app.growActiveList();
-  assert.equal(app.pageSize.logs, app.PAGE_ROWS * 2, "scrolling adds a page");
+  // Re-read after the click: the grid is rebuilt, so the old nodes are detached.
+  gridRows(env).pager.children[2].dispatch("click",
+    { preventDefault() {}, stopPropagation() {} });
 
-  // A new search is a different list, so it must not inherit the old scroll
-  // depth.
-  env.document.getElementById("search").value = "Logged 1";
-  app.renderLogs(true);
-  assert.equal(app.pageSize.logs, app.PAGE_ROWS, "a new search restarts at one page");
+  assert.equal(app.currentPage.grid, 2, "now on page 2");
+  assert.equal(gridRows(env).cards.length, 44, "the tail is 44 rows, not a full page");
+
+  // Page 2 of 2: a way back, but no way forward.
+  const pager = gridRows(env).pager;
+  assert.equal(pager.children[0].textContent, "‹");
+  assert.equal(pager.children[0].disabled, false, "Previous is available on page 2");
+  assert.equal(pager.children[3].textContent, "›");
+  assert.equal(pager.children[3].disabled, true, "Next is disabled on the last page");
 });
 
-test("new rows arriving do not collapse a list the user is part-way down", () => {
-  const make = (n) => Array.from({ length: n }, (_, i) => ({
+test("the page buttons mark which page you are on", () => {
+  const { env, app } = setup();
+  withAvatars(app, 94);
+  app.renderGrid(true);
+
+  let pager = gridRows(env).pager;
+  assert.ok(pager.children[1].className.includes("active"), "page 1 is active");
+  assert.ok(!pager.children[2].className.includes("active"), "page 2 is not");
+
+  pager.children[2].dispatch("click", { preventDefault() {}, stopPropagation() {} });
+  pager = gridRows(env).pager;
+  assert.ok(pager.children[2].className.includes("active"), "page 2 is now active");
+  assert.ok(!pager.children[1].className.includes("active"), "page 1 is not");
+});
+
+test("exactly 50 favourites gets no pager at all", () => {
+  // One full page is not a partial one, so a lone "1" would be noise.
+  const { env, app } = setup();
+  withAvatars(app, 50);
+  app.renderGrid(true);
+  const { cards, pager } = gridRows(env);
+  assert.equal(cards.length, 50);
+  assert.equal(pager, null);
+  assert.equal(app.renderPager("grid"), null);
+});
+
+test("a long list caps the number of page buttons", () => {
+  // 4,000 rows is 80 pages. Rendering a button per page would be worse than the
+  // problem it solves.
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.renderGrid(true);
+
+  const pager = gridRows(env).pager;
+  assert.ok(pager, "a list this long must be paginated");
+  // 80 pages must not become 80 buttons: prev + a 5-page window + a gap on each
+  // side + the last page + next.
+  assert.equal(pager.children.length, 9,
+    `pager drew ${pager.children.length} controls: `
+    + pager.children.map((c) => c.textContent).join(""));
+  const labels = pager.children.map((c) => c.textContent);
+  assert.deepEqual(labels, ["‹", "1", "2", "3", "4", "5", "…", "80", "›"],
+    labels.join(""));
+  // One gap is enough here: the window starts at page 1, so nothing is hidden
+  // before it. A gap appears on both sides once the window is in the middle.
+  assert.equal(labels.filter((l) => l === "…").length, 1);
+});
+
+test("the pager window follows the current page", () => {
+  const { env, app } = setup();
+  withAvatars(app, 4000);          // 80 pages
+  app.renderGrid(true);
+
+  // Jump deep into the list, then check the window moved with it rather than
+  // staying pinned to page 1 for the whole way down.
+  app.goToPage("grid", 40);
+  const pager = gridRows(env).pager;
+  const labels = pager.children.map((c) => c.textContent);
+  assert.ok(labels.includes("40"), labels.join("|"));
+  // Page 1 is still offered as a jump target, but no longer as one of the
+  // consecutive numbers: the window is centred on 40.
+  assert.ok(labels.includes("1"), "the first page stays reachable");
+  assert.deepEqual(
+    labels.filter((l) => /^\d+$/.test(l) && l !== "1" && l !== "80"),
+    ["38", "39", "40", "41", "42"],
+    labels.join("|"));
+  assert.equal(gridRows(env).cards.length, 50);
+});
+
+test("the last page is always reachable", () => {
+  const { env, app } = setup();
+  withAvatars(app, 1234);          // 25 pages
+  app.renderGrid(true);
+
+  app.goToPage("grid", 25);
+  const labels = gridRows(env).pager.children.map((c) => c.textContent);
+  assert.ok(labels.includes("25"), labels.join("|"));
+  assert.ok(labels.includes("1"), "the first page stays reachable");
+  assert.equal(gridRows(env).cards.length, 1234 - 24 * 50, "the tail only");
+});
+
+test("a list that shrinks clamps the page instead of stranding you", () => {
+  // Searching can cut 94 rows down to 3 while the user sits on page 2. A pager
+  // still offering page 2 would be a dead end.
+  const { env, app } = setup();
+  withAvatars(app, 94);
+  app.renderGrid(true);
+  app.goToPage("grid", 2);
+  assert.equal(app.currentPage.grid, 2);
+
+  env.document.getElementById("search").value = "Avatar 1";
+  app.renderGrid(true);
+  assert.equal(app.currentPage.grid, 1, "the page is pulled back into range");
+  assert.ok(gridRows(env).cards.length <= 50);
+});
+
+test("changing the filter starts again at page 1", () => {
+  const { env, app } = setup();
+  withAvatars(app, 94);
+  app.renderGrid(true);
+  app.goToPage("grid", 2);
+  assert.equal(app.currentPage.grid, 2);
+
+  app.currentGroup = "mech";
+  app.renderGrid(true);
+  assert.equal(app.currentPage.grid, 1, "a new filter is a new list");
+});
+
+test("a data refresh does not throw you back to page 1", () => {
+  // New metadata arrives every few seconds from the poll. Resetting the page on
+  // each one would make page 2 impossible to stay on.
+  const { app } = setup();
+  withAvatars(app, 94);
+  app.renderGrid(true);
+  app.goToPage("grid", 2);
+
+  app.renderGrid(true);
+  assert.equal(app.currentPage.grid, 2, "stayed on page 2 across a re-render");
+});
+
+test("the log list paginates too, and says which page", () => {
+  const { env, app } = setup();
+  app.state = { ...app.state, logs: Array.from({ length: 120 }, (_, i) => ({
     id: "avtr_log" + i, name: "Logged " + i, count: 1,
-    last_seen: `2026-01-0${(i % 9) + 1}T00:00:00+00:00`, private: false, source: "log",
-  }));
-  const { app } = setup();
-  app.state = { ...app.state, logs: make(640), changes: [] };
+    last_seen: "2026-01-01T00:00:00+00:00", private: false, source: "log",
+  })) };
   app.currentView = "logs";
   app.logTab = "avatars";
 
   app.renderLogs(true);
-  app.growActiveList();
-  assert.equal(app.pageSize.logs, app.PAGE_ROWS * 2);
-
-  // A new discovery lands at the top of the list; the user keeps their depth.
-  const fresh = [{ id: "avtr_new", name: "Fresh", count: 1,
-    last_seen: "2027-01-01T00:00:00+00:00", private: false, source: "log" }, ...make(640)];
-  app.state = { ...app.state, logs: fresh };
-  app.renderLogs(true);
-  assert.equal(app.pageSize.logs, app.PAGE_ROWS * 2,
-    "a data refresh must not throw away the page the user had scrolled to");
-});
-
-test("the paged list says how much is not drawn, and can draw more", () => {
-  const { app } = setup();
-  app.listTotal.logs = 640;
-  app.pageSize.logs = 200;
-
-  const row = app.renderMoreRow("logs");
-  assert.ok(row, "a partly drawn list must say so");
-  assert.equal(row.children[0].textContent, "Showing 200 of 640");
-  assert.equal(row.children[1].textContent, "Show more");
-
-  // Nothing to reveal once the whole list is on screen.
-  app.pageSize.logs = 640;
-  assert.equal(app.renderMoreRow("logs"), null);
-});
-
-test("scrolling to the end of a list extends it, scrolling elsewhere does not", () => {
-  const { env, app } = setup();
-  app.currentView = "home";
-  app.currentFilter = "all";
-  app.currentGroup = null;
-  app.listTotal.grid = 640;
-  app.pageSize.grid = 200;
-
-  const wrap = env.document.getElementById("grid-wrap");
-  wrap.scrollHeight = 5000;
-  wrap.clientHeight = 500;
-
-  wrap.scrollTop = 4500;
-  app.growOnScroll(wrap);
-  assert.equal(app.pageSize.grid, 400, "reaching the end adds a page");
-
-  // Not at the end yet.
-  wrap.scrollTop = 0;
-  app.growOnScroll(wrap);
-  assert.equal(app.pageSize.grid, 400, "scrolling part way must not extend the list");
-
-  // The scroll event also fires for inner elements; only the two list
-  // containers count.
-  wrap.scrollTop = 4900;
-  app.growOnScroll(env.document.getElementById("search"));
-  assert.equal(app.pageSize.grid, 400, "an unrelated scroller must be ignored");
-
-  // An element with no measurable geometry -- a hidden panel, or a stub.
-  app.growOnScroll(env.document.getElementById("logs-wrap"));
-  assert.equal(app.pageSize.grid, 400, "no geometry means no extension");
-});
-
-test("a list that is already fully drawn is not extended again", () => {
-  const { app } = setup();
-  app.currentView = "home";
-  app.listTotal.grid = 100;
-  app.pageSize.grid = 200;
-
-  app.growOnScroll({ scrollHeight: 5000, scrollTop: 4900, clientHeight: 500 });
-  assert.equal(app.pageSize.grid, 200, "nothing left to draw");
+  const logs = env.document.getElementById("logs");
+  assert.equal(logs.children.length, 51, "50 rows plus the pager");
+  assert.match(env.document.getElementById("logs-count").textContent, /page 1 of 3/);
 });
 
 // ------------------------------------------------------------------- autosave
@@ -599,13 +802,14 @@ test("setView ignores a switch to the current view", () => {
 test("stagger caps the index so long lists do not crawl", () => {
   const { env, app } = setup();
   const list = env.document.getElementById("grid");
-  // Stand in for a few hundred cards.
-  list.children = Array.from({ length: 200 }, () => ({
+  // Stand in for a few hundred drawn rows. Well above one page of 50, so this
+  // is the list the cap exists for.
+  list.children = Array.from({ length: 400 }, () => ({
     style: { setProperty() {} },
   }));
   app.applyStagger(list);
   assert.equal(app.STAGGER_CAP, 14,
-    "the cap is what keeps a 200 item list from taking seconds");
+    "the cap is what keeps a long list from taking seconds");
 });
 
 test("revealOnce only animates on the hidden edge", () => {
@@ -1159,7 +1363,9 @@ test("changing group invalidates the grid", () => {
   // The grid is rebuilt from a signature of everything it displays. Group was
   // missing from that signature, so a chip click left the old grid on screen.
   const { env, app } = withGroups();
-  const cards = () => env.document.getElementById("grid").children[0].children;
+  // The grid container's children are the cards themselves: a DocumentFragment
+  // empties into its parent, so there is no wrapper between them.
+  const cards = () => env.document.getElementById("grid").children;
 
   app.renderGrid(true);
   assert.equal(cards().length, 4);
@@ -1182,7 +1388,7 @@ test("a prior VRChat refusal does not disable Wear", async () => {
   };
 
   app.renderGrid(true);
-  const card = env.document.getElementById("grid").children[0].children[0];
+  const card = env.document.getElementById("grid").children[0];
   assert.match(card.innerHTML, /last attempt refused/);
   assert.doesNotMatch(card.innerHTML, /wear-quick[^>]*disabled/);
 

@@ -47,7 +47,7 @@ def _web_dir() -> str:
 # build/ between runs, and a stale bundle looks exactly like a broken feature:
 # the UI silently loses behaviour with no error anywhere.
 CSS_MARKERS = ("data-motion", "view-in-next", "prefers-reduced-motion",
-               ".group-picker", ".chip-count", ".more-row")
+               ".group-picker", ".chip-count", ".pager")
 
 # Element ids app.js binds to at startup. A missing one throws in wire(), which
 # would leave every later listener unwired with no useful error.

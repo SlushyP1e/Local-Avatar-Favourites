@@ -134,6 +134,12 @@ class Backend:
         # never cross the bridge as base64. Optional: if it cannot bind, the UI
         # falls back to the bridge path and behaves the same, just heavier.
         self._thumbs = ThumbServer()
+        # Avatar ids the user never wants logged. Read from settings on demand by
+        # :meth:`_ignored`; these two fields only cache the derived *name* set
+        # used for player changes, which VRChat identifies by name rather than id.
+        self._ignore_version = 0
+        self._ignored_names_cache: set[str] | None = None
+        self._ignored_names_stamp: tuple[int, int] | None = None
 
         self.entries: list[dict] = storage.load_favourites()
         self._index: dict[str, dict] = {}
@@ -148,6 +154,10 @@ class Backend:
         # Same reasoning: a cap lowered since the last launch must take effect
         # before the first poll, not whenever the list next overflows.
         self.trim_logs_to_limits()
+        # A blocklist edited while the app was closed must apply to rows already
+        # on disk, not only to sightings from now on.
+        with self._lock:
+            self._drop_ignored_rows_locked()
         self.api = VRCApi(self.settings.get("auth_token", ""))
         self.osc = OSCBridge(
             send_ip=self.settings.get("osc_send_ip", "127.0.0.1"),
@@ -263,6 +273,191 @@ class Backend:
 
     def _touch(self, section: str) -> None:
         self._revs[section] = self._revs.get(section, 0) + 1
+
+    # ------------------------------------------------------------- blocklist
+    def _ignored(self) -> set[str]:
+        """The blocklist as a set, for lookup.
+
+        Rebuilt from settings on demand rather than mirrored into an attribute:
+        it is read on every recorded row, and settings.json is the user's to
+        edit, so a mirror could disagree with what was actually saved.
+        """
+        return set(self.settings.get("ignored_avatars") or [])
+
+    def _is_ignored(self, avatar_id) -> bool:
+        # Rows come from JSON and hand-edited files, so id may be anything.
+        return isinstance(avatar_id, str) and avatar_id in self._ignored()
+
+    def _ignored_names(self) -> set[str]:
+        """Case-folded names of every blocked avatar that is known by name.
+
+        VRChat logs only a *name* for a remote player's avatar, so blocking a
+        player change can only work by name. Names come from the rows and
+        favourites already on hand rather than being fetched: a block must not
+        depend on being logged in.
+
+        Cached, because this is consulted on every player-change row and
+        rebuilding the set each time would walk both lists per sighting. The
+        cache is keyed on the blocklist, so adding or removing an ignore
+        invalidates it, and it is dropped whenever the underlying name data
+        changes by touching :attr:`_ignored_names_stamp`.
+        """
+        blocked = self._ignored()
+        stamp = (len(blocked), self._ignore_version)
+        if self._ignored_names_cache is None or self._ignored_names_stamp != stamp:
+            names: set[str] = set()
+            for source in (self.entries, self.log):
+                for row in source:
+                    name = row.get("name")
+                    if isinstance(name, str) and name.strip():
+                        names.add(name.strip().casefold())
+            self._ignored_names_cache = names
+            self._ignored_names_stamp = stamp
+        return self._ignored_names_cache
+
+    def _is_change_ignored(self, avatar_name: str) -> bool:
+        name = (avatar_name or "").strip()
+        if not name:
+            return False
+        return name.casefold() in self._ignored_names()
+
+    def is_ignored(self, avatar_id: str) -> bool:
+        """Whether an avatar is on the blocklist. Used by the UI for badges."""
+        return self._is_ignored(self._norm_id(avatar_id))
+
+    def add_ignore(self, avatar_id: str, name: str = "") -> dict:
+        """Stop an avatar ever being logged again, and drop any row it has.
+
+        The existing row is removed rather than hidden, because a blocklist that
+        leaves yesterday's findings on screen is not doing what the user asked.
+        """
+        avatar_id = self._norm_id(avatar_id)
+        if not avatar_id:
+            return {"ok": False, "message": "No avatar ID given."}
+        with self._lock:
+            current = storage.normalize_ignored(self.settings.get("ignored_avatars"))
+            if avatar_id in current:
+                return {"ok": True, "id": avatar_id, "already": True}
+            if len(current) >= storage.MAX_IGNORED:
+                return {"ok": False, "message":
+                        f"Ignore list is full ({storage.MAX_IGNORED})."}
+            # Read the name before the row is dropped: the log row is often the
+            # only place it has ever been recorded, and losing it would leave
+            # the Settings list showing "Unnamed avatar" for exactly the avatars
+            # the user just blocked. The UI's label is preferred because it has
+            # already resolved the same way the user sees it.
+            label = self._known_name(avatar_id) or name
+            self.settings["ignored_avatars"] = [*current, avatar_id]
+            if label:
+                names = dict(storage.normalize_ignored_names(
+                    self.settings.get("ignored_names"), current))
+                names[avatar_id] = label
+                self.settings["ignored_names"] = names
+            storage.save_settings(self.settings)
+            self._invalidate_ignore_cache()
+            removed = self._drop_ignored_rows_locked()
+        label = name or avatar_id
+        self._set_status(
+            f"Ignoring {label}. It will not be logged again."
+            + (f" Removed {removed} existing row(s)." if removed else "")
+        )
+        return {"ok": True, "id": avatar_id, "removed": removed}
+
+    def remove_ignore(self, avatar_id: str) -> dict:
+        """Un-ignore, so the avatar can be discovered again."""
+        avatar_id = self._norm_id(avatar_id)
+        if not avatar_id:
+            return {"ok": False, "message": "No avatar ID given."}
+        with self._lock:
+            current = storage.normalize_ignored(self.settings.get("ignored_avatars"))
+            if avatar_id not in current:
+                return {"ok": True, "id": avatar_id, "already": True}
+            self.settings["ignored_avatars"] = [i for i in current if i != avatar_id]
+            # Drop the stored name with the entry, or the file would keep a label
+            # for an avatar that is no longer blocked.
+            names = dict(storage.normalize_ignored_names(
+                self.settings.get("ignored_names"), self.settings["ignored_avatars"]))
+            names.pop(avatar_id, None)
+            self.settings["ignored_names"] = names
+            storage.save_settings(self.settings)
+            self._invalidate_ignore_cache()
+        self._set_status("No longer ignoring this avatar.")
+        return {"ok": True, "id": avatar_id}
+
+    def _known_name(self, avatar_id: str) -> str:
+        """Best available display name for an avatar, from data already held.
+
+        A favourite wins over a log row: it is the one the user has actually
+        named or accepted. Never fetches, so blocking works while logged out.
+        """
+        if not avatar_id:
+            return ""
+        entry = self._entry(avatar_id)
+        if entry:
+            name = entry.get("name")
+            if isinstance(name, str) and name.strip() and name != "Unnamed avatar":
+                return name.strip()
+        row = next((e for e in self.log if e.get("id") == avatar_id), None)
+        if row:
+            name = row.get("name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+        return ""
+
+    def _invalidate_ignore_cache(self) -> None:
+        """Drop the derived block-by-name set after the blocklist or a name changes."""
+        self._ignore_version += 1
+        self._ignored_names_cache = None
+        self._ignored_names_stamp = None
+
+    def _drop_ignored_rows_locked(self) -> int:
+        """Remove log rows and player-change rows for blocked avatars.
+
+        Returns how many rows went. Player changes are matched by avatar *name*
+        because VRChat never logs a remote player's id, so the block is applied
+        to the name there; the id half of the block cannot help at all.
+        """
+        blocked_names = self._ignored_names()
+        blocked = self._ignored()
+        if not blocked:
+            return 0
+        removed = 0
+
+        if self.log:
+            kept_logs = [e for e in self.log if not self._is_ignored(e.get("id"))]
+            if len(kept_logs) != len(self.log):
+                removed += len(self.log) - len(kept_logs)
+                self.log = kept_logs
+                storage.save_log(self.log)
+                self._touch("logs")
+
+        # Collected before the log rows above are dropped, since the row being
+        # removed is often the only place the avatar's name is known.
+        blocked_names = self._ignored_names()
+        if blocked_names:
+            kept_changes = [
+                c for c in self.changes
+                if str(c.get("avatar") or "").strip().casefold() not in blocked_names
+            ]
+            if len(kept_changes) != len(self.changes):
+                removed += len(self.changes) - len(kept_changes)
+                self.changes = kept_changes
+                storage.save_changes(self.changes)
+                self._touch("changes")
+        return removed
+
+    def get_ignores(self) -> dict:
+        """The blocklist for the Settings panel, with names where known."""
+        with self._lock:
+            ids = storage.normalize_ignored(self.settings.get("ignored_avatars"))
+            # The stored label first, because blocking already removed the row it
+            # came from; live data only as a fallback for an id blocked while the
+            # app was closed and so never captured one.
+            names: dict[str, str] = dict(storage.normalize_ignored_names(
+                self.settings.get("ignored_names"), ids))
+            for avatar_id in ids:
+                names.setdefault(avatar_id, self._known_name(avatar_id))
+        return {"ok": True, "ids": ids, "names": names}
 
     def _reindex(self) -> None:
         """Rebuild the id -> entry map after the list is replaced wholesale."""
@@ -460,6 +655,10 @@ class Backend:
         stamp = when or storage.now_iso()
         bucket = stamp[:16]
         with self._lock:
+            # Checked inside the lock so a block added while a batch is being
+            # ingested cannot be raced past by the rest of the batch.
+            if self._is_ignored(avatar_id):
+                return False
             entry = next((e for e in self.log if e.get("id") == avatar_id), None)
             if entry:
                 if entry.get("seen_bucket") == bucket:
@@ -501,6 +700,11 @@ class Backend:
             return False
         stamp = when or storage.now_iso()
         with self._lock:
+            # A player-change row has no id, only a name, so a blocked avatar can
+            # only be honoured here by name. That is the same limitation the rest
+            # of this feature has: VRChat simply does not log remote ids.
+            if self._is_change_ignored(avatar):
+                return False
             entry = next((e for e in self.changes
                           if e.get("player") == player and e.get("avatar") == avatar), None)
             if entry:

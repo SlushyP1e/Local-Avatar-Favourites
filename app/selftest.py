@@ -1987,6 +1987,242 @@ def test_thumbnail_pruning() -> None:
         check("clear_thumbs on empty dir", storage.clear_thumbs() == 0)
 
 
+def test_ignored_avatars_are_never_logged() -> None:
+    """A blocked avatar must not come back, by any of the three sources."""
+    b = _isolated_backend()
+    blocked = _avtr_id(41)
+    other = _avtr_id(42)
+
+    check("recorded before blocking",
+          b._record_log(blocked, when="2026-01-01T00:00:00+00:00") is True)
+    check("row exists", len(b.log) == 1, str(b.log))
+
+    res = b.add_ignore(blocked, "Noisy Avatar")
+    check("ignore accepted", res["ok"] is True, str(res))
+    check("existing row removed", res["removed"] == 1, str(res))
+    check("log is empty", b.log == [], str(b.log))
+    check("persisted, not just hidden", storage.load_log() == [], str(storage.load_log()))
+
+    # A fresh sighting is refused, whichever source it arrives from, and it must
+    # not consume one of the capped slots.
+    for source in ("osc", "log", "cache-db"):
+        check(f"{source} sighting refused",
+              b._record_log(blocked, source=source) is False)
+    check("still empty", b.log == [], str(b.log))
+    check("blocking an ordinary avatar still works",
+          b._record_log(other) is True and len(b.log) == 1, str(b.log))
+
+    check("is_ignored reports it", b.is_ignored(blocked) is True)
+    check("case does not matter", b.is_ignored(blocked.upper()) is True)
+    check("other avatar is not ignored", b.is_ignored(other) is False)
+
+    # Idempotent: ignoring twice must not duplicate the entry, and must not
+    # double-count a removal.
+    again = b.add_ignore(blocked)
+    check("re-ignoring is a no-op", again.get("already") is True, str(again))
+    check("list has one entry", storage.normalize_ignored(
+        b.settings["ignored_avatars"]) == [blocked],
+        str(b.settings["ignored_avatars"]))
+
+    # Un-ignoring lets it back in, which is the whole point of being able to undo.
+    check("remove accepted", b.remove_ignore(blocked)["ok"] is True)
+    check("list empty again", b.settings["ignored_avatars"] == [],
+          str(b.settings["ignored_avatars"]))
+    check("recorded once more", b._record_log(blocked) is True)
+    check("removing something not blocked is harmless",
+          b.remove_ignore(_avtr_id(99)).get("already") is True)
+
+
+def test_ignores_survive_a_restart() -> None:
+    """A blocklist edited while the app was closed must still be enforced."""
+    blocked = _avtr_id(43)
+    b = _isolated_backend()
+    b.add_ignore(blocked)
+
+    from backend import Backend
+    b2 = Backend(start_services=False, cache=b._cache)
+    check("block survived the restart", b2.is_ignored(blocked) is True)
+    check("sighting refused after restart", b2._record_log(blocked) is False)
+    check("nothing logged", b2.log == [], str(b2.log))
+
+    # A row written to disk before the block existed is removed at start-up,
+    # rather than sitting on screen until the next overflow.
+    check("still not ignored after removing",
+          (b2.remove_ignore(blocked)["ok"] is True))
+    b2._record_log(blocked, when="2026-02-01T00:00:00+00:00")
+    storage.save_log(b2.log)
+    b2.add_ignore(blocked)
+    b3 = Backend(start_services=False, cache=b._cache)
+    check("stale row cleared on launch", b3.log == [], str(b3.log))
+
+
+def test_ignored_avatars_block_player_changes_by_name() -> None:
+    """VRChat logs a remote player's avatar name, never its id.
+
+    So the only way a block can apply to a player change is by name, and only
+    once that name is known -- from the avatar's own row or from a favourite.
+    """
+    b = _isolated_backend()
+    avatar_id = _avtr_id(44)
+    b._record_log(avatar_id, when="2026-01-01T00:00:00+00:00")
+    # The metadata fetch is what fills the name in, and it is what a block has to
+    # work from without the user being logged in.
+    b.log[0]["name"] = "Very Noisy Avatar"
+    storage.save_log(b.log)
+
+    check("change recorded before blocking",
+          b._record_change("Player1", "Very Noisy Avatar",
+                           when="2026-01-02T00:00:00+00:00") is True)
+    check("one change", len(b.changes) == 1, str(b.changes))
+
+    res = b.add_ignore(avatar_id)
+    check("avatar row removed", res["removed"] >= 1, str(res))
+    check("change row removed too", b.changes == [], str(b.changes))
+    check("change removal persisted", storage.load_changes() == [],
+          str(storage.load_changes()))
+
+    # And it must stay blocked, including across a name that differs only in
+    # case or surrounding whitespace, which is how VRChat's own log varies.
+    for variant in ("very noisy avatar", "  Very Noisy Avatar  ", "VERY NOISY AVATAR"):
+        check(f"blocked despite {variant!r}",
+              b._record_change("Player2", variant) is False)
+
+    # An unrelated avatar is untouched: the block is by name, so it must not
+    # swallow every change row in the log.
+    check("other player still recorded",
+          b._record_change("Player3", "Some Other Avatar") is True)
+    check("exactly one change", len(b.changes) == 1, str(b.changes))
+
+    b.remove_ignore(avatar_id)
+    check("unblocked changes are recorded again",
+          b._record_change("Player4", "Very Noisy Avatar") is True)
+
+
+def test_ignore_list_is_sanitised() -> None:
+    """settings.json is hand-editable, so the blocklist is untrusted input."""
+    import storage as st
+
+    check("ids are lower-cased",
+          st.normalize_ignored(["AVTR_A", " avtr_b "]) == ["avtr_a", "avtr_b"])
+    check("duplicates collapse",
+          st.normalize_ignored(["avtr_a", "AVTR_A", "avtr_a"]) == ["avtr_a"])
+    check("order is preserved",
+          st.normalize_ignored(["avtr_c", "avtr_a", "avtr_b"])
+          == ["avtr_c", "avtr_a", "avtr_b"])
+    for junk in (None, "", "avtr_x", 42, {"a": 1}, True):
+        check(f"{junk!r} is not a blocklist", st.normalize_ignored(junk) == [])
+    check("non-string entries are dropped, not coerced",
+          st.normalize_ignored(["avtr_a", 7, None, "avtr_b"]) == ["avtr_a", "avtr_b"])
+    check("empty entries dropped",
+          st.normalize_ignored(["", "   ", "avtr_a"]) == ["avtr_a"])
+
+    # Unusable junk in the file must not crash the log or wipe the settings.
+    for junk in ("nope", 42, {"avtr_a": True}, [1, 2, 3]):
+        clean = st.sanitize_settings({"ignored_avatars": junk})
+        check(f"{junk!r} falls back to empty",
+              clean["ignored_avatars"] == [], str(clean["ignored_avatars"]))
+
+    # Bounded, so a hand-edited file cannot become another unbounded list.
+    huge = [f"avtr_{i:032x}" for i in range(st.MAX_IGNORED + 250)]
+    check("over-cap list is trimmed", len(st.normalize_ignored(huge)) == st.MAX_IGNORED)
+    check("the kept entries are the earliest ones",
+          st.normalize_ignored(huge)[0] == huge[0])
+
+    # The whole settings round trip must keep the blocklist.
+    check("survives save/load",
+          st.normalize_ignored(st.sanitize_settings(
+              {"ignored_avatars": ["avtr_keep_me"]})["ignored_avatars"])
+          == ["avtr_keep_me"])
+
+    # The id -> name map is only trusted for ids that are actually blocked.
+    check("name kept for a blocked id",
+          st.normalize_ignored_names({"AVTR_A": "  Big   Avatar  "}, ["avtr_a"])
+          == {"avtr_a": "Big Avatar"})
+    check("name dropped for an id that is not blocked",
+          st.normalize_ignored_names({"avtr_b": "Other"}, ["avtr_a"]) == {})
+    for junk in (None, "nope", 42, ["avtr_a"], {"avtr_a": 7}, {7: "x"}, {None: "x"}):
+        check(f"{junk!r} yields no names",
+              st.normalize_ignored_names(junk, ["avtr_a"]) == {})
+    check("control characters stripped",
+          st.normalize_ignored_names({"avtr_a": "badname"}, ["avtr_a"])
+          == {"avtr_a": "badname"})
+    check("long name truncated",
+          len(st.normalize_ignored_names(
+              {"avtr_a": "x" * 500}, ["avtr_a"])["avtr_a"]) == st.MAX_IGNORED_NAME)
+    check("empty name dropped",
+          st.normalize_ignored_names({"avtr_a": "   "}, ["avtr_a"]) == {})
+
+    # A hand-edited name map must never widen the blocklist it describes.
+    clean = st.sanitize_settings({"ignored_avatars": ["avtr_a"],
+                                  "ignored_names": {"avtr_zzz": "Sneaky"}})
+    check("name map cannot add a block", clean["ignored_avatars"] == ["avtr_a"],
+          str(clean["ignored_avatars"]))
+    check("unblocked name dropped by sanitising",
+          clean["ignored_names"] == {}, str(clean["ignored_names"]))
+
+
+def test_ignore_reports_a_full_list_rather_than_growing() -> None:
+    b = _isolated_backend()
+    b.settings["ignored_avatars"] = [f"avtr_{i:032x}" for i in range(storage.MAX_IGNORED)]
+    res = b.add_ignore(_avtr_id(77))
+    check("full list refused", res["ok"] is False, str(res))
+    check("the refusal explains itself", "full" in res.get("message", ""), str(res))
+    check("nothing was added", len(b.settings["ignored_avatars"]) == storage.MAX_IGNORED)
+    check("empty id refused", b.add_ignore("")["ok"] is False)
+    check("empty remove refused", b.remove_ignore("")["ok"] is False)
+
+
+def test_get_ignores_names_avatars_where_known() -> None:
+    """The Settings list needs a label; a blocked avatar may have no name yet."""
+    b = _isolated_backend()
+    named = _avtr_id(51)
+    unnamed = _avtr_id(52)
+    b._record_log(named, when="2026-01-01T00:00:00+00:00")
+    b.log[0]["name"] = "Known Name"
+    b.add_ignore(named)
+    b.add_ignore(unnamed)
+
+    res = b.get_ignores()
+    check("both listed", res["ids"] == [named, unnamed], str(res["ids"]))
+    check("name captured before the row was dropped",
+          res["names"][named] == "Known Name", str(res["names"]))
+    # The label has to be readable after a restart, since the log row that held
+    # it is gone for good by then.
+    from backend import Backend
+    b2 = Backend(start_services=False, cache=b._cache)
+    check("name survived the restart", b2.get_ignores()["names"][named] == "Known Name",
+          str(b2.get_ignores()["names"]))
+    # And un-ignoring must not leave the label behind for an avatar that is no
+    # longer blocked.
+    b2.remove_ignore(named)
+    check("label dropped with the entry",
+          named not in b2.settings["ignored_names"], str(b2.settings["ignored_names"]))
+    check("unknown name is empty, not invented", res["names"][unnamed] == "",
+          str(res["names"]))
+
+    # Removing one leaves the other alone.
+    b.remove_ignore(named)
+    check("one left", b.get_ignores()["ids"] == [unnamed], str(b.get_ignores()))
+
+
+def test_ignored_avatars_do_not_break_wear_last() -> None:
+    """wear_last walks the log; a blocklist must not leave it holding a ghost."""
+    b = _isolated_backend()
+    wanted = _avtr_id(61)
+    ignored = _avtr_id(62)
+    b.add_by_id(wanted)
+    b.add_by_id(ignored)
+    for avatar_id in (wanted, ignored):
+        b._record_log(avatar_id, when="2026-01-01T00:00:00+00:00")
+    b.add_ignore(ignored)
+
+    check("blocked row gone from the log",
+          all(e.get("id") != ignored for e in b.log), str(b.log))
+    check("the other row remains",
+          any(e.get("id") == wanted for e in b.log), str(b.log))
+    check("favourite itself is untouched", b._entry(ignored) is not None)
+
+
 def test_thumbnail_http_server() -> None:
     """The loopback server must serve cached images and nothing else.
 
@@ -2829,6 +3065,13 @@ def main() -> int:
         test_thumbnail_pruning,
         test_thumbnail_http_server,
         test_backend_reports_the_thumbnail_url,
+        test_ignored_avatars_are_never_logged,
+        test_ignores_survive_a_restart,
+        test_ignored_avatars_block_player_changes_by_name,
+        test_ignore_list_is_sanitised,
+        test_ignore_reports_a_full_list_rather_than_growing,
+        test_get_ignores_names_avatars_where_known,
+        test_ignored_avatars_do_not_break_wear_last,
         test_delete_leaves_thumbnail_for_undo,
     ]
     failed = 0

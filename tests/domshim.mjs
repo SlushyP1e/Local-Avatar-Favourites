@@ -5,10 +5,12 @@ import { readFileSync } from "node:fs";
 export function makeElement(id = "el") {
   const listeners = new Map();
   const classes = new Set();
+  let disabled = false;
   const el = {
     id,
     value: "",
     textContent: "",
+    title: "",
     style: { setProperty() {} },
     dataset: {},
     children: [],
@@ -19,7 +21,16 @@ export function makeElement(id = "el") {
     // Children accumulate so renderGroupChips and renderGroupDropdown can be
     // inspected, and so applyStagger sees the real child count. Assigning
     // innerHTML clears them, which is what the renderers rely on to rebuild.
+    // A real DocumentFragment empties itself into the parent: appending one
+    // splices its children in, and the fragment is left with none. Treating it
+    // as an ordinary element made every rendered row count as a single child,
+    // so a test could not tell 50 cards from 1.
     appendChild(child) {
+      if (child && child.nodeType === 11) {
+        this.children.push(...child.children);
+        child.children.length = 0;
+        return child;
+      }
       this.children.push(child);
       return child;
     },
@@ -60,6 +71,9 @@ export function makeElement(id = "el") {
       if (i >= 0) arr.splice(i, 1);
     },
     dispatch(type, event = {}) {
+      // Match a real disabled control: the browser does not deliver the event,
+      // so a click handler cannot run and a test cannot pass by ignoring this.
+      if (disabled && type !== "animationend") return;
       for (const fn of (listeners.get(type) || []).slice()) fn(event);
     },
     // Standard element methods. showPrompt focuses and selects its field, so
@@ -67,6 +81,10 @@ export function makeElement(id = "el") {
     focus() {},
     select() {},
     blur() {},
+    // A real button swallows clicks while disabled, so a test that clicks one
+    // must see nothing happen. Dispatch is below, where it can check this.
+    get disabled() { return disabled; },
+    set disabled(value) { disabled = !!value; },
     listenerCount(type) {
       return (listeners.get(type) || []).length;
     },
@@ -131,7 +149,11 @@ export function makeEnvironment(apiImpl = {}, options = {}) {
     },
     createElement: () => makeElement("created"),
     createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
-    createDocumentFragment: () => makeElement("fragment"),
+    createDocumentFragment: () => {
+      const frag = makeElement("fragment");
+      frag.nodeType = 11;
+      return frag;
+    },
     querySelector: () => null,
     querySelectorAll: (sel) => {
       const match = THUMB_SELECTOR.exec(String(sel || ""));
@@ -203,8 +225,12 @@ export function loadApp(env) {
   get selection() { return selection; },
   wire, renderGrid, renderHeader, render, renderLogs,
   setThumbBase, thumbUrlFor, lazyThumb, resolveThumbSrc, onThumbVisibility,
-  thumbLoadFailed, PAGE_ROWS, pageFor, pageSize, listTotal, growActiveList,
-  growOnScroll, renderMoreRow, activeListName,
+  thumbLoadFailed, PAGE_ROWS, PAGE_BUTTON_CAP, pageCount, clampPage, pageSlice,
+  pageFor, currentPage, listTotal, renderPager, goToPage, goToActivePage,
+  activeListName,
+  ignoreAvatar, unignoreAvatar, loadIgnores, renderIgnoreList, forgetLogMenuItems,
+  cardMenuItems, get ignores() { return ignores; },
+  set ignores(v) { ignores = v; },
   get logTab() { return logTab; },
   set logTab(v) { logTab = v; },
   get currentView() { return currentView; },

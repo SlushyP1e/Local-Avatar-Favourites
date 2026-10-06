@@ -788,36 +788,66 @@ function applyThumb(id) {
   });
 }
 
-/* ------------------------------------------------------- progressive lists */
+/* ---------------------------------------------------------------- paging */
 // The three long lists here (the avatar grid and the two log tabs) can each hold
 // thousands of rows, and one row is not one node: a card is a dozen elements,
 // so a 5,000-avatar grid is tens of thousands of live nodes the webview carries
-// for as long as the view is open. Rendering the first page and extending as
-// the user scrolls keeps the live node count at roughly a screenful plus a page
-// while still letting them scroll through everything.
+// for as long as the view is open. So the lists are paged rather than drawn
+// whole, and only the current page's rows exist in the DOM.
 //
-// How far each list has been extended is keyed on what the list is *showing*,
-// not on its contents, so a new avatar appearing at the top of the log does not
-// throw away the page the user had scrolled to.
-const PAGE_ROWS = 200;
-const pageSize = { grid: PAGE_ROWS, logs: PAGE_ROWS, changes: PAGE_ROWS };
-// null means "this list has never been drawn". Using "" for that would make the
-// very first render look like a filter change and quietly undo an extension the
-// user had already asked for.
-const pageKey = { grid: null, logs: null, changes: null };
-const listTotal = { grid: 0, logs: 0, changes: 0 };
+// 50 rows per page, not more: this is also the unit the lazy image loading works
+// in, since only drawn rows ever hold a thumbnail. A smaller page means fewer
+// decoded images alive at once and a faster first paint.
+const PAGE_ROWS = 50;
+// How many numbered buttons to show around the current page. A hard cap, so a
+// 10,000-row list does not render 200 buttons.
+const PAGE_BUTTON_CAP = 7;
 
-// Returns how many rows this list should draw, resetting to one page whenever
-// the filters, search, sort or tab changed since the last render. The key is the
-// JSON of the parts rather than a joined string, because a group name and a
-// search term are arbitrary text and must not be able to join into the same key.
-function pageFor(name, parts) {
+// Which page each list is on. Not reset by a data refresh -- a new avatar
+// appearing must not throw the user back to page 1 -- but reset by anything that
+// changes what the list is showing.
+const currentPage = { grid: 1, logs: 1, changes: 1 };
+const listTotal = { grid: 0, logs: 0, changes: 0 };
+// null means "this list has never been drawn".
+const pageKey = { grid: null, logs: null, changes: null };
+
+function pageCount(total) {
+  return Math.max(1, Math.ceil(total / PAGE_ROWS));
+}
+
+// Keeps the stored page inside the list. A search or a delete can shrink the list
+// out from under the page the user was on, and a pager pointing at page 9 of a
+// 2-page list would be a dead end with no obvious way back.
+function clampPage(name) {
+  const pages = pageCount(listTotal[name]);
+  if (currentPage[name] > pages) currentPage[name] = pages;
+  if (currentPage[name] < 1) currentPage[name] = 1;
+  return currentPage[name];
+}
+
+// The slice of the list to draw for the current page.
+function pageSlice(name, list) {
+  const page = clampPage(name);
+  const start = (page - 1) * PAGE_ROWS;
+  return list.slice(start, start + PAGE_ROWS);
+}
+
+// Called by each renderer before it slices, to record the list's total and
+// settle which page to draw. Resets to page 1 whenever the filters, search, sort
+// or tab changed since last time. The key is the JSON of the parts rather than
+// a joined string, because a group name and a search term are arbitrary text
+// and must not be able to join into the same key.
+//
+// Returns the page to draw. Use pageCount() on the *total*, not on this: this is
+// a page number, and conflating the two silently yields a single page forever.
+function pageFor(name, parts, total) {
   const key = JSON.stringify(parts);
   if (pageKey[name] !== null && pageKey[name] !== key) {
-    pageSize[name] = PAGE_ROWS;
+    currentPage[name] = 1;
   }
   pageKey[name] = key;
-  return pageSize[name];
+  listTotal[name] = total;
+  return clampPage(name);
 }
 
 function activeListName() {
@@ -825,56 +855,92 @@ function activeListName() {
   return logTab === "players" ? "changes" : "logs";
 }
 
-let listGrowing = false;
-
-function growActiveList() {
-  // Rebuilding the list changes its height, which in some engines re-fires the
-  // scroll event synchronously. Without this the handler can call itself before
-  // the first pass has finished updating the page size.
-  if (listGrowing) return;
-  const name = activeListName();
-  if (pageSize[name] >= listTotal[name]) return;
-  pageSize[name] = Math.min(listTotal[name], pageSize[name] + PAGE_ROWS);
-  listGrowing = true;
-  try {
-    if (name === "grid") renderGrid(true);
-    else renderLogs(true);
-  } finally {
-    listGrowing = false;
-  }
+function goToPage(name, page) {
+  const pages = pageCount(listTotal[name]);
+  const next = Math.min(Math.max(1, page), pages);
+  if (next === currentPage[name]) return;
+  // Set before rendering, because the renderers read the page to draw it and
+  // clamp it into range. Setting it afterwards would draw the old page and then
+  // claim the new one.
+  currentPage[name] = next;
+  if (name === "grid") renderGrid(true);
+  else renderLogs(true);
+  // Jumping pages leaves the previous page's scroll offset in place, which would
+  // otherwise park the user halfway down a short final page.
+  const wrap = $(name === "grid" ? "grid-wrap" : "logs-wrap");
+  if (wrap) wrap.scrollTop = 0;
 }
 
-// Extend the list whose scroll container the user just reached the end of.
-// Called from a scroll listener, so it must be cheap and must not assume the
-// element really is a scroller -- the event also fires for inner elements.
-function growOnScroll(el) {
-  if (!el || (el !== $("grid-wrap") && el !== $("logs-wrap"))) return;
-  const name = activeListName();
-  if (pageSize[name] >= listTotal[name]) return;
-  const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
-  if (!Number.isFinite(remaining) || remaining > 800) return;
-  growActiveList();
+function goToActivePage(page) {
+  goToPage(activeListName(), page);
 }
 
-// The trailing row of a paged list. Gives the count that is *not* drawn, and a
-// button, so the rest is reachable without a scroll gesture (keyboard, touch
-// drag that never reaches the true bottom, or a screen reader).
-function renderMoreRow(name) {
+// The page buttons. Returns null when everything fits on one page, because a
+// lone "1" is noise rather than navigation.
+function renderPager(name) {
   const total = listTotal[name];
-  const shown = pageSize[name];
-  if (!total || shown >= total) return null;
-  const row = document.createElement("div");
-  row.className = "more-row";
-  const label = document.createElement("span");
-  label.className = "muted small";
-  label.textContent = `Showing ${shown.toLocaleString()} of ${total.toLocaleString()}`;
-  const btn = document.createElement("button");
-  btn.className = "btn small";
-  btn.textContent = "Show more";
-  btn.addEventListener("click", growActiveList);
-  row.appendChild(label);
-  row.appendChild(btn);
-  return row;
+  const pages = pageCount(total);
+  if (pages <= 1) return null;
+
+  const nav = document.createElement("nav");
+  nav.className = "pager";
+  nav.setAttribute("aria-label", "Pagination");
+
+  const addButton = (label, page, opts) => {
+    const btn = document.createElement("button");
+    btn.className = "pager-btn" + ((opts && opts.active) ? " active" : "")
+      + ((opts && opts.disabled) ? " disabled" : "");
+    btn.textContent = label;
+    btn.disabled = !!(opts && opts.disabled);
+    if (opts && opts.title) btn.title = opts.title;
+    btn.addEventListener("click", () => goToPage(name, page));
+    nav.appendChild(btn);
+    return btn;
+  };
+
+  const here = clampPage(name);
+  addButton("‹", here - 1, {
+    disabled: here <= 1,
+    title: "Previous page",
+  });
+
+  // A window of PAGE_BUTTON_CAP - 2 consecutive pages centred on the current one,
+  // so the numbers move with the user instead of stranding them on a row that
+  // does not change until they are halfway through the list.
+  const span = PAGE_BUTTON_CAP - 2;
+  let first = Math.max(1, here - Math.floor(span / 2));
+  let last = Math.min(pages, first + span - 1);
+  // Sliding back when we hit the end keeps the window full, so the last page is
+  // never shown alone.
+  first = Math.max(1, Math.min(first, last - span + 1));
+
+  if (first > 1) {
+    addButton("1", 1, {});
+    if (first > 2) nav.appendChild(gap());
+  }
+  for (let page = first; page <= last; page++) {
+    addButton(String(page), page, { active: page === here });
+  }
+  if (last < pages) {
+    if (last < pages - 1) nav.appendChild(gap());
+    addButton(String(pages), pages, {});
+  }
+
+  addButton("›", here + 1, {
+    disabled: here >= pages,
+    title: "Next page",
+  });
+
+  return nav;
+}
+
+// The ellipsis between page groups. A plain span, so it is never focusable and
+// cannot be mistaken for a page you can jump to.
+function gap() {
+  const el = document.createElement("span");
+  el.className = "pager-gap";
+  el.textContent = "…";
+  return el;
 }
 
 /* ------------------------------------------------------------------ render */
@@ -918,28 +984,30 @@ function renderGrid(force) {
     items: list.map((e) => [e.id, e.name, e.thumb, e.author, e.favorite, !!e.inaccessible,
       e.release_status, (e.platforms || []).join(","), (e.tags || []).join(",")]),
   });
-  // Reset to one page when the filters change, keep the page count when only the
-  // data underneath changed, so a background metadata refresh does not collapse
-  // a list the user is halfway down.
-  const shown = pageFor("grid",
-    [currentFilter, currentGroup, $("search").value, $("sort").value]);
   if (!force && sig === lastGridSig) return;
   lastGridSig = sig;
 
   const grid = $("grid");
   grid.innerHTML = "";
-  listTotal.grid = list.length;
 
   if (!list.length) {
+    pageFor("grid", [currentFilter, currentGroup, $("search").value,
+      $("sort").value], 0);
     $("grid-empty").classList.remove("hidden");
     $("count").textContent = "0 avatars";
     return;
   }
   $("grid-empty").classList.add("hidden");
-  $("count").textContent = `${list.length} avatar${list.length === 1 ? "" : "s"}`;
+  pageFor("grid", [currentFilter, currentGroup, $("search").value,
+    $("sort").value], list.length);
+  const pages = pageCount(list.length);
+  const page = currentPage.grid;
+  $("count").textContent = pages > 1
+    ? `${list.length} avatar${list.length === 1 ? "" : "s"} · page ${page} of ${pages}`
+    : `${list.length} avatar${list.length === 1 ? "" : "s"}`;
 
   const frag = document.createDocumentFragment();
-  for (const entry of list.slice(0, shown)) {
+  for (const entry of pageSlice("grid", list)) {
     const card = document.createElement("article");
     card.className = "card"
       + (entry.id === state.current_avatar_id ? " wearing" : "")
@@ -1014,8 +1082,8 @@ function renderGrid(force) {
     });
     frag.appendChild(card);
   }
-  const more = renderMoreRow("grid");
-  if (more) frag.appendChild(more);
+  const pager = renderPager("grid");
+  if (pager) frag.appendChild(pager);
   grid.appendChild(frag);
 }
 
@@ -1061,9 +1129,6 @@ function renderLogs(force) {
 }
 
 function renderAvatarLogs(logs, force) {
-  // Tab and search decide what this list shows, so they reset the page count;
-  // the rows changing underneath it must not.
-  const shown = pageFor("logs", [logTab, $("search").value]);
   const sig = JSON.stringify(logs.map((e) =>
     [e.id, e.name, e.count, e.last_seen, e.private, e.source, !!entryById(e.id)]));
   if (!force && sig === lastLogsSig) return;
@@ -1071,13 +1136,17 @@ function renderAvatarLogs(logs, force) {
 
   const wrap = $("logs");
   wrap.innerHTML = "";
-  listTotal.logs = logs.length;
-  $("logs-count").textContent = logs.length
-    ? `${logs.length} avatar${logs.length === 1 ? "" : "s"} logged` : "";
+  pageFor("logs", [logTab, $("search").value], logs.length);
+  const pages = pageCount(logs.length);
+  const page = currentPage.logs;
+  $("logs-count").textContent = !logs.length ? ""
+    : pages > 1
+      ? `${logs.length} logged · page ${page} of ${pages}`
+      : `${logs.length} avatar${logs.length === 1 ? "" : "s"} logged`;
   if (!logs.length) return;
 
   const frag = document.createDocumentFragment();
-  for (const log of logs.slice(0, shown)) {
+  for (const log of pageSlice("logs", logs)) {
     const fav = entryById(log.id);
     const name = log.name || (fav ? fav.name : "");
     const countBadge = log.count > 1 ? `<span class="platform-badge">×${log.count}</span>` : "";
@@ -1110,32 +1179,18 @@ function renderAvatarLogs(logs, force) {
     else row.querySelector(".log-thumb").src = placeholderDataUri(name || log.id);
     row.querySelector(".save-log").addEventListener("click", () => saveFromLog(log.id));
     row.querySelector(".forget-log").addEventListener("click", () => forgetLog(log.id));
-    row.addEventListener("contextmenu", (e) => {
+    row.addEventListener("contextmenu", async (e) => {
       e.preventDefault();
-      const items = [];
-      if (!saved && !log.private) {
-        items.push({ icon: "＋", label: "Save to Favourites", action: () => saveFromLog(log.id) });
-      }
-      items.push({
-        icon: "⧉", label: "Copy Avatar ID",
-        action: async () => {
-          const res = await call("copy_id", log.id);
-          toast(res.ok ? "Avatar ID copied." : "Could not copy.");
-        },
-      });
-      items.push({ sep: true });
-      items.push({ icon: "✕", label: "Remove from Log", danger: true, action: () => forgetLog(log.id) });
-      showContextMenu(e.clientX, e.clientY, items);
+      showContextMenu(e.clientX, e.clientY, await forgetLogMenuItems(log));
     });
     frag.appendChild(row);
   }
-  const more = renderMoreRow("logs");
-  if (more) frag.appendChild(more);
+  const pager = renderPager("logs");
+  if (pager) frag.appendChild(pager);
   wrap.appendChild(frag);
 }
 
 function renderPlayerChanges(changes, force) {
-  const shown = pageFor("changes", [logTab, $("search").value]);
   const sig = JSON.stringify(changes.map((e) =>
     [e.player, e.avatar, e.count, e.last_seen]));
   if (!force && sig === lastChangesSig) return;
@@ -1143,13 +1198,17 @@ function renderPlayerChanges(changes, force) {
 
   const wrap = $("changes");
   wrap.innerHTML = "";
-  listTotal.changes = changes.length;
-  $("logs-count").textContent = changes.length
-    ? `${changes.length} change${changes.length === 1 ? "" : "s"} logged` : "";
+  pageFor("changes", [logTab, $("search").value], changes.length);
+  const pages = pageCount(changes.length);
+  const page = currentPage.changes;
+  $("logs-count").textContent = !changes.length ? ""
+    : pages > 1
+      ? `${changes.length} logged · page ${page} of ${pages}`
+      : `${changes.length} change${changes.length === 1 ? "" : "s"} logged`;
   if (!changes.length) return;
 
   const frag = document.createDocumentFragment();
-  for (const change of changes.slice(0, shown)) {
+  for (const change of pageSlice("changes", changes)) {
     const initial = (change.player || "?").trim()[0] || "?";
     const countBadge = change.count > 1 ? `<span class="log-badge">×${change.count}</span>` : "";
     const row = document.createElement("div");
@@ -1192,8 +1251,8 @@ function renderPlayerChanges(changes, force) {
     });
     frag.appendChild(row);
   }
-  const more = renderMoreRow("changes");
-  if (more) frag.appendChild(more);
+  const pager = renderPager("changes");
+  if (pager) frag.appendChild(pager);
   wrap.appendChild(frag);
 }
 
@@ -1528,6 +1587,14 @@ function cardMenuItems(entry) {
     { icon: "⧉", label: "Copy Avatar ID", action: () => copyEntryId(entry.id) },
     { icon: "⟳", label: "Refresh Metadata", action: () => refreshMetaFor(entry.id) },
     { sep: true },
+    // Offered on a favourite too: an avatar you have already saved is often
+    // exactly the one you keep seeing and no longer want cluttering the log.
+    {
+      icon: "🚫",
+      label: "Never log this avatar",
+      action: () => ignoreAvatar(entry.id, entry.name),
+    },
+    { sep: true },
     {
       icon: "✕",
       label: "Delete",
@@ -1569,6 +1636,32 @@ async function saveFromLog(id) {
 async function forgetLog(id) {
   await call("delete_log", id);
   await refreshState();
+}
+
+// Both "remove one row" and "never again" live in the same place, because they
+// are the same decision at two levels: the row is what is on screen now, the
+// block is what stops it coming back.
+async function forgetLogMenuItems(log) {
+  const fav = entryById(log.id);
+  const name = log.name || (fav ? fav.name : "") || log.id;
+  const items = [];
+  if (!fav && !log.private) {
+    items.push({ icon: "＋", label: "Save to Favourites", action: () => saveFromLog(log.id) });
+  }
+  items.push({
+    icon: "⧉", label: "Copy Avatar ID",
+    action: async () => {
+      const res = await call("copy_id", log.id);
+      toast(res.ok ? "Avatar ID copied." : "Could not copy.");
+    },
+  });
+  items.push({ sep: true });
+  items.push({ icon: "✕", label: "Remove from Log", danger: true, action: () => forgetLog(log.id) });
+  items.push({
+    icon: "🚫", label: "Never log this avatar",
+    action: () => ignoreAvatar(log.id, name),
+  });
+  return items;
 }
 
 async function del() {
@@ -1655,6 +1748,10 @@ async function openSettings() {
   $("set-max-avatar-log").value = s.max_avatar_log || 200;
   $("set-max-player-changes").value = s.max_player_changes || 1000;
   renderLimitsNote();
+  // The blocklist has its own buttons rather than being saved with the rest of
+  // the form, so it is read fresh every time the panel opens.
+  await loadIgnores();
+  renderIgnoreList();
   $("set-tray-note").textContent = s.tray
     ? "With this off, closing the window keeps the app in the notification area. " +
       "Right-click the tray icon for Open, Wear last avatar and Quit."
@@ -1755,6 +1852,87 @@ async function saveSettings() {
 }
 
 /* Explains what the two log caps will cost before the user commits to them. */
+// Avatars the user has blocked from the log. Held as ids plus a display label
+// each, so the Settings list can say something more useful than a UUID while
+// still working for an avatar whose name was never fetched.
+let ignores = { ids: [], names: {} };
+
+async function loadIgnores() {
+  const res = await call("get_ignores");
+  if (!res || !res.ok) return;
+  ignores = { ids: res.ids || [], names: res.names || {} };
+}
+
+async function ignoreAvatar(id, name) {
+  const label = name || id;
+  const yes = await showConfirm("Ignore avatar",
+    `Stop logging "${label}"? Any rows it already has are removed, and it will not `
+    + "appear in the log again. You can undo this from Settings > Ignored avatars.");
+  if (!yes) return;
+  const res = await call("add_ignore", id, label);
+  if (!res || !res.ok) {
+    if (res && res.message) showAlert("Could not ignore that avatar", res.message);
+    return;
+  }
+  if (res.already) toast("That avatar was already ignored.");
+  else if (res.removed) toast(`Ignoring ${label}. Removed ${res.removed} log row(s).`);
+  else toast(`Ignoring ${label}. It will not be logged again.`);
+  await refreshState();
+}
+
+async function unignoreAvatar(id) {
+  const res = await call("remove_ignore", id);
+  if (!res || !res.ok) {
+    if (res && res.message) showAlert("Could not remove that avatar", res.message);
+    return;
+  }
+  await refreshState();
+  await loadIgnores();
+  renderIgnoreList();
+  toast("No longer ignoring this avatar. It may reappear in the log.");
+}
+
+function renderIgnoreList() {
+  const box = $("ignore-list");
+  if (!box) return;
+  box.innerHTML = "";
+  const ids = ignores.ids || [];
+  if (!ids.length) {
+    const empty = document.createElement("p");
+    empty.className = "muted small";
+    empty.textContent = "Nothing ignored yet.";
+    box.appendChild(empty);
+    if ($("ignore-note")) $("ignore-note").textContent = "";
+    return;
+  }
+  for (const id of ids) {
+    const row = document.createElement("div");
+    row.className = "ignore-row";
+    const name = document.createElement("span");
+    name.className = "ignore-name";
+    // A name is a best effort: an avatar blocked before it was ever fetched has
+    // none, and the id is the only thing that identifies it.
+    name.textContent = (ignores.names && ignores.names[id]) || "Unnamed avatar";
+    name.title = id;
+    const idEl = document.createElement("code");
+    idEl.className = "muted small";
+    idEl.textContent = id;
+    const btn = document.createElement("button");
+    btn.className = "btn small ghost";
+    btn.textContent = "Remove";
+    btn.addEventListener("click", () => unignoreAvatar(id));
+    row.appendChild(name);
+    row.appendChild(idEl);
+    row.appendChild(btn);
+    box.appendChild(row);
+  }
+  if ($("ignore-note")) {
+    $("ignore-note").textContent =
+      `${ids.length} ignored. Removed avatars are not logged again, but they can `
+      + "come back if VRChat reports them and the block is removed.";
+  }
+}
+
 function renderLimitsNote() {
   const el = $("set-limits-note");
   if (!el) return;
@@ -2011,12 +2189,6 @@ function wire() {
   // The drawer preview is not lazy, but it gets the same one-shot fallback: a
   // thumbnail the loopback server cannot find must still appear.
   $("preview").addEventListener("error", () => thumbLoadFailed($("preview")));
-  // Reaching the end of a long list extends it by a page. Both scroll
-  // containers are covered, because either one can be the one on screen.
-  $("grid-wrap").addEventListener("scroll", () => growOnScroll($("grid-wrap")),
-    { passive: true });
-  $("logs-wrap").addEventListener("scroll", () => growOnScroll($("logs-wrap")),
-    { passive: true });
   $("bulk-clear").addEventListener("click", clearSelection);
   $("bulk-fav").addEventListener("click", () => runBulk("favorite"));
   $("bulk-wear").addEventListener("click", () => runBulk("wear"));

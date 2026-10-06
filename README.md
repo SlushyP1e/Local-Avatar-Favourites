@@ -136,6 +136,24 @@ number is really a ceiling on how much memory the log view can hold. Player
 changes are much cheaper per row — no ID and no thumbnail — which is why their
 default is higher.
 
+### Ignoring avatars
+
+Some avatars are simply not interesting, and no cap helps with an avatar you see
+every session. Right-click any row in **Avatar Logs** — or any favourite — and
+choose **Never log this avatar**. It is dropped from the log immediately and never
+recorded again, from any of the discovery sources.
+
+**Settings → Ignored avatars** lists what you have blocked and lets you undo it.
+Un-ignoring does not restore the rows it removed; the avatar simply becomes
+eligible for discovery again, so it will reappear only if VRChat reports it once
+more.
+
+One honest limitation: VRChat logs a remote player's avatar *name*, never its
+ID. So a block also suppresses player-change rows for that avatar, but only once
+the name is known — from the avatar's own log row or from a favourite. An avatar
+you never see by ID cannot be blocked by name, and a name you have not
+encountered yet cannot be matched.
+
 ### Memory
 
 A few thousand saved avatars used to push the app past 3 GB of RAM. Two things
@@ -150,13 +168,21 @@ were responsible, and both are fixed:
   straight at it. It is bound to loopback, guarded by a random per-run token,
   and serves nothing outside the cache folder; if it cannot start, the UI falls
   back to base64 by itself.
-- **Images load only near the viewport, and long lists draw a page at a time.**
+- **Images load only near the viewport, and long lists are paged.**
   The webview keeps a decoded bitmap for every image it has painted — about a
   megabyte for a 512×512 avatar thumbnail — so a few thousand rows pinned a few
   gigabytes regardless of how small the files were. Off-screen images now drop
   their source and fall back to a shared placeholder, and the avatar grid and
-  both log tabs draw 200 rows at a time, extending as you scroll (or via the
-  **Show more** button) and saying how many are not drawn yet.
+  both log tabs show **50 rows per page** with numbered page buttons underneath,
+  rather than drawing every row at once.
+
+Fifty is not arbitrary. A page is also the unit of thumbnail work: only rows
+actually drawn ever hold an image, so a smaller page means fewer decoded images
+alive at once and a faster first paint. The pager shows a sliding window of page
+numbers with the first and last always reachable, so a 4,000-avatar list is
+still a row of buttons rather than 80. Changing the filter, search or sort
+returns to page 1; a background data refresh does not, so you stay where you
+were.
 
 The text log is scanned for IDs, but only from the handful of lines that mean an
 avatar is genuinely available to you. VRChat mentions avatar IDs in a lot of

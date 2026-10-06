@@ -54,6 +54,21 @@ DEFAULT_MAX_PLAYER_CHANGES = 1000
 MIN_LOG_LIMIT = 1
 MAX_LOG_LIMIT = 10000
 
+# Avatars the user has chosen never to see again. Stored as bare ids in
+# settings.json rather than as a separate file so it travels with the rest of
+# the settings, and so "export my data" cannot leave it behind somewhere the
+# user would not think to look.
+#
+# The cap stops a hand-edited or imported file from growing this into another
+# unbounded list: unlike the log itself, an ignored avatar is never revisited, so
+# there is no reason for a real user to need thousands of them.
+MAX_IGNORED = 5000
+
+# Display names on the blocklist are cosmetic, so they get a short bound of
+# their own. VRChat avatar names are short; anything longer is truncated rather
+# than rejected, since refusing to record a name would only lose information.
+MAX_IGNORED_NAME = 120
+
 DEFAULT_SETTINGS = {
     "osc_send_ip": "127.0.0.1",
     "osc_send_port": 9000,
@@ -69,6 +84,17 @@ DEFAULT_SETTINGS = {
     # silently consumes the other one's budget.
     "max_avatar_log": DEFAULT_MAX_AVATAR_LOG,
     "max_player_changes": DEFAULT_MAX_PLAYER_CHANGES,
+    # Avatar ids the user never wants logged again. Normalised to lowercase on
+    # the way in, because that is how ids are compared everywhere else and a
+    # hand-edited upper-case entry that silently never matched would be the
+    # worst possible failure for a blocklist.
+    "ignored_avatars": [],
+    # id -> display name, captured at the moment of blocking. Needed because
+    # blocking removes the log row that was often the only place the name had
+    # ever been recorded, so without this the Settings list could only ever show
+    # "Unnamed avatar" for the very avatars the user just blocked. Best effort
+    # and cosmetic: an avatar blocked before it was ever named has no entry.
+    "ignored_names": {},
 }
 
 
@@ -395,6 +421,13 @@ def sanitize_settings(raw) -> dict:
     motion = str(settings.get("motion") or "system").strip().lower()
     settings["motion"] = motion if motion in MOTION_MODES else DEFAULT_MOTION
 
+    # The blocklist. A hand-edited file could hold a string, a dict, a list of
+    # non-strings or a million entries; all of those are treated as "no
+    # ignores" rather than being allowed to crash the log on the next row.
+    settings["ignored_avatars"] = normalize_ignored(settings.get("ignored_avatars"))
+    settings["ignored_names"] = normalize_ignored_names(
+        settings.get("ignored_names"), settings["ignored_avatars"])
+
     # Log caps. A hand-edited file can hold a float, a string, or nothing at
     # all, and an out-of-range value here would either grow the list without
     # bound or wipe it on the next write.
@@ -413,6 +446,60 @@ def sanitize_settings(raw) -> dict:
         settings[key] = limit
 
     return settings
+
+
+def normalize_ignored(value) -> list[str]:
+    """Clean a blocklist into a de-duplicated list of normalised avatar ids.
+
+    Order is preserved: the Settings list shows them in the order they were
+    ignored, which is the order the user recognises. Anything unrecognisable is
+    dropped rather than coerced, because a blocklist entry that is not an id
+    could never match anything and would only mislead.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        avatar_id = normalize_id(item)
+        # Reject an empty string outright: normalize_id turns None, 0 and ""
+        # all into "", and an entry that matches nothing must not sit in the
+        # list looking like a real block.
+        if not avatar_id or avatar_id in seen:
+            continue
+        seen.add(avatar_id)
+        cleaned.append(avatar_id)
+        if len(cleaned) >= MAX_IGNORED:
+            break
+    return cleaned
+
+
+def normalize_ignored_names(value, allowed) -> dict[str, str]:
+    """Clean the id -> name map used to label the blocklist.
+
+    Only ids that are actually blocked keep an entry. Allowing a name for an id
+    that is not blocked would mean the file grows a row every time an ignore is
+    removed, with nothing to show for it.
+    """
+    permitted = set(allowed)
+    if not isinstance(value, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for raw_id, raw_name in value.items():
+        if not isinstance(raw_id, str) or not isinstance(raw_name, str):
+            continue
+        avatar_id = normalize_id(raw_id)
+        # Bounded by MAX_IGNORED because permitted cannot exceed it, so this
+        # cannot outgrow the blocklist itself.
+        if not avatar_id or avatar_id not in permitted:
+            continue
+        name = " ".join(raw_name.split())[:MAX_IGNORED_NAME]
+        name = "".join(ch for ch in name if ch.isprintable())
+        if name:
+            cleaned[avatar_id] = name
+    return cleaned
 
 
 def load_settings() -> dict:
