@@ -10,28 +10,13 @@ A small standalone Windows tool for VRChat that keeps an **unlimited local list 
 
 ## Screenshots
 
-| Favourites grid | Page buttons |
+| Favourites grid | Avatar details |
 | --- | --- |
-| ![Favourites grid](docs/screenshot-home.png) | ![Page buttons](docs/screenshot-pager.png) |
+| ![Favourites grid](docs/screenshot-home.png) | ![Avatar details](docs/screenshot-drawer.png) |
 
-| Avatar logs | Avatar details |
+| Avatar logs | Settings |
 | --- | --- |
-| ![Avatar logs](docs/screenshot-logs.png) | ![Avatar details](docs/screenshot-drawer.png) |
-
-| Settings | |
-| --- | --- |
-| ![Settings](docs/screenshot-settings.png) | |
-
-The images are generated, not hand-taken. `docs/render_screenshots.py` and
-`docs/render_preview.py` load the shipped `index.html`, `style.css` and `app.js`
-in headless Chrome against invented fixture data, so the screenshots cannot drift
-from the interface and no real avatar artwork or personal collection is
-published. Run them after a UI change:
-
-```
-python docs/render_screenshots.py
-python docs/render_preview.py
-```
+| ![Avatar logs](docs/screenshot-logs.png) | ![Settings](docs/screenshot-settings.png) |
 
 ---
 
@@ -408,8 +393,6 @@ tests/
   domshim.mjs       minimal DOM stub
   frontend.test.mjs frontend regression tests (node --test)
 docs/           README screenshots and preview GIF
-  render_screenshots.py  regenerates the PNGs from the real UI
-  render_preview.py      regenerates the preview GIF
 build.bat       PyInstaller build script
 pyproject.toml  project metadata, ruff and mypy configuration
 requirements.txt
