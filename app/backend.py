@@ -1199,11 +1199,18 @@ class Backend:
             return {"ok": False, "title": "Could not read favourites", "message": str(exc)}
 
         added = 0
+        already = 0
         unresolved: list[str] = []
         with self._lock:
             for avatar in remote:
                 avatar_id = self._norm_id(avatar.get("id"))
-                if not avatar_id or self._entry(avatar_id):
+                if not avatar_id:
+                    continue
+                # Counted rather than skipped silently. Re-importing a list you
+                # already imported is the normal case, not a failure, and saying
+                # "Imported 0 avatar(s)" for it reads as a broken button.
+                if self._entry(avatar_id):
+                    already += 1
                     continue
                 entry = storage.new_entry(avatar_id, avatar.get("name") or "")
                 entry["author"] = avatar.get("authorName") or ""
@@ -1217,11 +1224,23 @@ class Backend:
             if added:
                 storage.save_favourites(self.entries)
                 self._touch("entries")
-        self._set_status(f"Imported {added} avatar(s) from VRChat.")
+        if not remote:
+            # An empty payload from a successful call is not the same as "you
+            # already have them all", and only one of those is worth acting on.
+            self._set_status(
+                "VRChat returned no favourites. Log in again in Settings and retry."
+            )
+        elif added:
+            self._set_status(f"Imported {added} new avatar(s) from VRChat.")
+        else:
+            self._set_status(
+                f"All {already} of your VRChat favourites are already saved."
+            )
         if unresolved:
             threading.Thread(target=self._bulk_metadata, args=(unresolved,),
                              daemon=True).start()
-        return {"ok": True, "added": added}
+        return {"ok": True, "added": added, "already": already,
+                "remote": len(remote)}
 
     # ------------------------------------------------------------------ logs
     def save_from_log(self, avatar_id: str) -> dict:

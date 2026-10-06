@@ -1711,6 +1711,45 @@ def test_import_vrchat_favourites() -> None:
     # Second run must not duplicate.
     res = b.import_vrchat_favourites()
     check("re-import adds nothing", res["added"] == 0 and len(b.entries) == 2, str(res))
+    # Regression: the second run reported "Imported 0 avatar(s) from VRChat",
+    # which is indistinguishable from the button being broken. Re-importing a
+    # list you already imported is the normal case and has to say so.
+    check("re-import counts what was already there",
+          res["already"] == 2 and res["remote"] == 2, str(res))
+    check("re-import status says so",
+          "already saved" in b.status and "Imported 0" not in b.status, b.status)
+
+    # An empty payload is a different outcome again: nothing came back at all,
+    # which usually means the session is stale rather than that there is nothing
+    # to import.
+    class EmptyApi(FakeApi):
+        def list_favorite_avatars(self, limit=100, offset=0):
+            return []
+
+    b2 = _isolated_backend()
+    b2.api = EmptyApi()
+    empty = b2.import_vrchat_favourites()
+    check("empty payload reported as empty",
+          empty["added"] == 0 and empty["remote"] == 0, str(empty))
+    check("empty payload status is actionable",
+          "no favourites" in b2.status, b2.status)
+
+    # A partial import: some new, some already held.
+    class MixedApi(FakeApi):
+        def list_favorite_avatars(self, limit=100, offset=0):
+            return [
+                {"id": "avtr_aaaaaaaa-1111-2222-3333-444444444444", "name": "Alpha"},
+                {"id": "avtr_cccccccc-1111-2222-3333-444444444444", "name": "Gamma"},
+            ]
+
+    b3 = _isolated_backend()
+    b3.add_by_id("avtr_aaaaaaaa-1111-2222-3333-444444444444")
+    b3.api = MixedApi()
+    mixed = b3.import_vrchat_favourites()
+    check("mixed import counts both sides",
+          mixed["added"] == 1 and mixed["already"] == 1, str(mixed))
+    check("mixed import status reports the new one",
+          "Imported 1 new avatar" in b3.status, b3.status)
 
 
 def test_import_vrchat_requires_login() -> None:

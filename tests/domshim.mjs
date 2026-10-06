@@ -6,9 +6,9 @@ export function makeElement(id = "el") {
   const listeners = new Map();
   const classes = new Set();
   let disabled = false;
+  let value = "";
   const el = {
     id,
-    value: "",
     textContent: "",
     title: "",
     style: { setProperty() {} },
@@ -116,6 +116,19 @@ export function makeElement(id = "el") {
       for (const c of className.split(/\s+/).filter(Boolean)) classes.add(c);
     },
   });
+  // A real <select> whose assigned value matches none of its options selects
+  // nothing: reading .value back gives "". Modelling that matters, because the
+  // alternative hides a whole class of bug from the tests -- the property would
+  // keep the value it was given while the browser showed a blank dropdown, and
+  // any test asserting on .value would pass against a UI that is visibly empty.
+  Object.defineProperty(el, "value", {
+    get() { return value; },
+    set(v) {
+      value = String(v == null ? "" : v);
+      const opts = el.children.filter((c) => c && c.nodeName === "OPTION");
+      if (opts.length && !opts.some((o) => o.value === value)) value = "";
+    },
+  });
   // Assigning textContent replaces the element's contents in a real DOM.
   let text = "";
   Object.defineProperty(el, "textContent", {
@@ -147,7 +160,11 @@ export function makeEnvironment(apiImpl = {}, options = {}) {
       if (!elements.has(id)) elements.set(id, makeElement(id));
       return elements.get(id);
     },
-    createElement: () => makeElement("created"),
+    createElement: (tag) => {
+      const node = makeElement(tag || "created");
+      node.nodeName = String(tag || "div").toUpperCase();
+      return node;
+    },
     createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
     createDocumentFragment: () => {
       const frag = makeElement("fragment");
@@ -221,9 +238,11 @@ export function loadApp(env) {
   groupKey, entryGroupKey, groupSummary, renderGroupChips, matchesFilter,
   MAX_GROUP_NAME,
   renderGroupDropdown, draftGroupName, showGroupPicker, setPromptMode, NEW_GROUP,
-  toggleSelect, clearSelection, promptForGroupName,
+  toggleSelect, clearSelection, promptForGroupName, runBulk, importVrchatFavourites,
+  __test_deleteEntry: deleteEntry, __test_undoBuffer() { return undoBuffer; },
   get selection() { return selection; },
-  wire, renderGrid, renderHeader, render, renderLogs,
+  wire, renderGrid, renderHeader, render, renderLogs, renderDrawer,
+  __test_groupDropdownSig() { return groupDropdownSig; },
   setThumbBase, thumbUrlFor, lazyThumb, resolveThumbSrc, onThumbVisibility,
   thumbLoadFailed, PAGE_ROWS, PAGE_BUTTON_CAP, pageCount, clampPage, pageSlice,
   pageFor, currentPage, listTotal, renderPager, goToPage, goToActivePage,

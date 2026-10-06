@@ -1379,6 +1379,219 @@ test("changing group invalidates the grid", () => {
   assert.equal(cards().length, 4);
 });
 
+test("bulk delete offers undo, as its confirmation promises", async () => {
+  // Regression: runBulk's confirm dialog says "You can undo this for a few
+  // seconds afterwards" and then never offered one, because the entries were
+  // only looked up after the backend had removed them.
+  const deleted = [];
+  const api = {
+    bulk_action: async (ids, action) => {
+      if (action === "delete") deleted.push(...ids);
+      return { ok: true, changed: ids.length };
+    },
+    restore_entry: async (e) => ({ ok: true }),
+    get_state: async () => ({ revs: {}, entries: [], logs: [], changes: [] }),
+  };
+  const { env, app } = setup(api);
+  app.state = { ...app.state, entries: [
+    { id: "avtr_1", name: "One", tags: [] },
+    { id: "avtr_2", name: "Two", tags: [] },
+    { id: "avtr_3", name: "Three", tags: [] },
+  ] };
+  app.selection.clear();
+  app.selection.add("avtr_1");
+  app.selection.add("avtr_2");
+
+  const p = app.runBulk("delete");
+  await tick();
+  env.document.getElementById("confirm-ok").dispatch("click",
+    { preventDefault() {}, stopPropagation() {} });
+  await p;
+  await tick();
+
+  assert.deepEqual(deleted, ["avtr_1", "avtr_2"], "the delete went through");
+  assert.equal(app.__test_undoBuffer().length, 2,
+    "both deleted entries must be restorable");
+  assert.match(env.document.getElementById("undo-label").textContent, /Removed 2 avatars/);
+});
+
+test("cancelling the bulk delete offers no undo and deletes nothing", async () => {
+  let called = 0;
+  const api = {
+    bulk_action: async () => { called++; return { ok: true }; },
+    get_state: async () => ({ revs: {}, entries: [], logs: [], changes: [] }),
+  };
+  const { env, app } = setup(api);
+  app.state = { ...app.state, entries: [{ id: "avtr_9", name: "Kept", tags: [] }] };
+  app.selection.clear();
+  app.selection.add("avtr_9");
+
+  const p = app.runBulk("delete");
+  await tick();
+  env.document.getElementById("confirm-cancel").dispatch("click",
+    { preventDefault() {}, stopPropagation() {} });
+  await p;
+  await tick();
+
+  assert.equal(called, 0, "cancelling must not delete");
+  // Asserted on the buffer, not on the bar's class: the DOM shim builds
+  // elements without parsing index.html's class attribute, so "hidden" is never
+  // set on a fresh element and a class check here would pass or fail for
+  // reasons that have nothing to do with the behaviour.
+  assert.equal(app.__test_undoBuffer().length, 0,
+    "cancelling must not offer to undo something that did not happen");
+});
+
+test("importing VRChat favourites distinguishes nothing-new from empty", async () => {
+  // Regression: every outcome reported "Imported 0 avatar(s) from VRChat" in the
+  // status bar, which is indistinguishable from the button being broken.
+  const cases = [
+    { added: 3, already: 0, remote: 3, expect: /Imported 3 avatars/ },
+    { added: 0, already: 12, remote: 12, expect: /All 12 of your VRChat favourites/ },
+    { added: 0, already: 0, remote: 0, expect: /returned no favourites/ },
+  ];
+  for (const c of cases) {
+    const api = {
+      import_vrchat_favourites: async () => ({ ok: true, ...c }),
+      get_state: async () => ({ revs: {}, entries: [], logs: [], changes: [] }),
+    };
+    const { env, app } = setup(api);
+    await app.importVrchatFavourites();
+    const toast = env.document.getElementById("toast");
+    assert.match(toast.textContent, c.expect, `for ${JSON.stringify(c)}`);
+  }
+});
+
+test("the group dropdown is not rebuilt while the user is choosing", () => {
+  // Regression: renderGroupDropdown rewrote the <select>'s options on every
+  // 700ms poll. Replacing a select's options closes an open dropdown and drops
+  // the choice in flight, so picking "New group" did nothing at all.
+  const { env, app } = withGroups();
+  app.renderGroupDropdown({ group: "Furry" });
+  const select = env.document.getElementById("d-group");
+  const first = select.children;
+  assert.ok(first.length > 0, "the dropdown was populated");
+
+  // The user opens the dropdown and picks something. Re-rendering must not
+  // replace the nodes underneath them.
+  select.value = "mech";
+  app.renderGroupDropdown({ group: "Furry" });
+  assert.equal(select.children.length, first.length,
+    "a poll rebuilt the options out from under an open dropdown");
+  assert.equal(select.children, first, "the option elements are the same nodes");
+
+  // Re-rendering with no change must also leave the user's in-flight pick alone
+  // rather than snapping it back to the saved value.
+  app.renderGroupDropdown({ group: "Furry" }, "mech");
+  assert.equal(select.value, "mech", "the pending pick was discarded");
+});
+
+test("the dropdown is rebuilt when the group set really changes", () => {
+  // The guard above must not freeze the list: a group added by another avatar
+  // has to appear.
+  const { env, app } = withGroups();
+  app.renderGroupDropdown({ group: "Furry" });
+  const select = env.document.getElementById("d-group");
+  const before = select.children.length;
+
+  app.state = { ...app.state, entries: [
+    ...GROUPED,
+    { id: "avtr_new", name: "New", group: "Brand New", tags: [] },
+  ] };
+  app.renderGroupDropdown({ group: "Furry" });
+  assert.ok(select.children.length > before,
+    "a newly created group did not reach the dropdown");
+  assert.ok(select.children.some((o) => o.value === "brand new"),
+    "the new group is not selectable");
+});
+
+test("creating a group from the drawer dropdown saves it", async () => {
+  // The end-to-end version of the reported bug: pick "New group", type a name,
+  // and it must actually be saved onto the avatar.
+  const saved = [];
+  const api = {
+    save_details: async (id, name, notes, tags, group) => {
+      saved.push({ id, name, group });
+      return { ok: true };
+    },
+    get_state: async () => ({ revs: {}, entries: [], logs: [], changes: [] }),
+  };
+  const { env, app } = setup(api);
+  app.state = { ...app.state, entries: [
+    { id: "avtr_g1", name: "Subject", notes: "", tags: [], group: "" },
+  ] };
+  app.selectedId = "avtr_g1";
+  app.wire();
+  app.renderDrawer();
+
+  const select = env.document.getElementById("d-group");
+  // The sentinel is the last option, as shipped.
+  const sentinel = select.children[select.children.length - 1];
+  assert.match(sentinel.textContent, /New group/);
+
+  // Choosing it is what the user does; the change handler must then open the
+  // name prompt.
+  select.value = sentinel.value;
+  select.dispatch("change", { target: select });
+  await tick();
+
+  assert.equal(env.document.getElementById("modal-prompt").classList.contains("hidden"),
+    false, "the name prompt never opened");
+
+  env.document.getElementById("prompt-input").value = "  Furry  ";
+  env.document.getElementById("prompt-ok").dispatch("click",
+    { preventDefault() {}, stopPropagation() {} });
+  await tick();
+  await tick();
+
+  assert.equal(saved.length, 1, `the group was never saved (${JSON.stringify(saved)})`);
+  assert.equal(saved[0].group, "Furry", saved[0].group);
+  // The regression itself: the name must survive as a *selected* option, not
+  // just be saved. Assigning a <select> a value it has no option for selects
+  // nothing, so the dropdown went blank and captureDraft read "" and saved "No
+  // group" instead.
+  assert.notEqual(select.value, "",
+    "the dropdown went blank: the typed name was never added as an option");
+  assert.ok(select.children.some((o) => o.value === "Furry"),
+    "the typed name is not present as a selectable option");
+});
+
+test("typing a name that already exists reuses that group", async () => {
+  // Same casing-insensitive match as the dropdown keys, so "furry" must not fork
+  // a second "furry" group alongside "Furry".
+  const saved = [];
+  const api = {
+    save_details: async (id, name, notes, tags, group) => {
+      saved.push({ id, group });
+      return { ok: true };
+    },
+    get_state: async () => ({ revs: {}, entries: [], logs: [], changes: [] }),
+  };
+  const { env, app } = setup(api);
+  app.state = { ...app.state, entries: [
+    { id: "avtr_g2", name: "Subject", notes: "", tags: [], group: "" },
+    { id: "avtr_g3", name: "Other", notes: "", tags: [], group: "Furry" },
+  ] };
+  app.selectedId = "avtr_g2";
+  app.wire();
+  app.renderDrawer();
+
+  const select = env.document.getElementById("d-group");
+  select.value = select.children[select.children.length - 1].value;
+  select.dispatch("change", { target: select });
+  await tick();
+
+  env.document.getElementById("prompt-input").value = "furry";
+  env.document.getElementById("prompt-ok").dispatch("click",
+    { preventDefault() {}, stopPropagation() {} });
+  await tick();
+  await tick();
+
+  assert.equal(saved.length, 1, JSON.stringify(saved));
+  // The existing group's own casing, not the lowercased key that was typed.
+  assert.equal(saved[0].group, "Furry", saved[0].group);
+});
+
 test("a prior VRChat refusal does not disable Wear", async () => {
   const requested = [];
   const { env, app } = setup({ wear: async (id) => { requested.push(id); return { ok: true }; } });

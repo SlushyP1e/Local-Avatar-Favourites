@@ -167,6 +167,13 @@ function renderSelection() {
 async function runBulk(action, value) {
   const ids = [...selection];
   if (!ids.length) return;
+  // Captured before the delete, because afterwards the entries are gone from
+  // state and there is nothing left to restore. This is why bulk delete used to
+  // show no undo at all while its own confirmation promised one: the promise was
+  // made, and nothing was kept to keep it.
+  const doomed = action === "delete"
+    ? ids.map((id) => entryById(id)).filter(Boolean)
+    : [];
   if (action === "delete") {
     const yes = await showConfirm(
       "Delete",
@@ -182,6 +189,12 @@ async function runBulk(action, value) {
   }
   clearSelection();
   await refreshState();
+  if (action === "delete" && doomed.length) {
+    const label = doomed.length === 1
+      ? `Removed "${doomed[0].name || doomed[0].id}".`
+      : `Removed ${doomed.length} avatars.`;
+    offerUndo(doomed, label);
+  }
 }
 
 /* ----------------------------------------------------------------- undo */
@@ -1256,6 +1269,16 @@ function renderPlayerChanges(changes, force) {
   wrap.appendChild(frag);
 }
 
+// Signature of the options currently in the drawer's group dropdown.
+//
+// render() runs on every 700ms poll, and this function used to rewrite the
+// <select>'s options every time. Replacing a select's options closes an open
+// dropdown and discards the choice in flight, which is why picking "New group"
+// did nothing at all: the list was rebuilt out from under the click before the
+// change event could fire. The options are now only rewritten when they are
+// actually different; otherwise only the value is set.
+let groupDropdownSig = null;
+
 // Populates the drawer's group dropdown: every existing group, the current
 // one if it somehow is not in the list (a stale or hand-edited file), "No
 // group", and a New group entry.
@@ -1264,34 +1287,35 @@ function renderGroupDropdown(entry, keep) {
   if (!select) return;
   const current = groupKey(entry.group);
   const { groups } = groupSummary();
-  select.innerHTML = "";
-  const values = [];
 
-  const option = (value, label) => {
-    const opt = document.createElement("option");
-    opt.value = value;
-    opt.textContent = label;
-    select.appendChild(opt);
-    values.push(value);
-  };
-
-  let found = !current;
-  for (const g of groups) {
-    option(g.key, g.name);
-    if (g.key === current) found = true;
-  }
+  // Built first, so the signature can be compared before anything is touched.
+  const options = groups.map((g) => [g.key, g.name]);
   // The entry's own group is normally already in the list. If not -- a stale
   // filter, or a hand-edited favourites.json -- keep it selectable rather than
   // silently showing "No group" and inviting a change nobody made.
-  if (!found && current) option(current, (entry.group || "").trim());
-  option("", "No group");
-  option(NEW_GROUP, "＋ New group…");
+  if (current && !options.some(([value]) => value === current)) {
+    options.push([current, (entry.group || "").trim()]);
+  }
+  options.push(["", "No group"], [NEW_GROUP, "\uFF0B New group\u2026"]);
   // A pick the user has made but not yet saved has no option yet, and render()
   // runs on every poll, so keep it rather than snapping back to the saved
   // value for a moment.
   const wanted = keep || current;
-  if (keep && !values.includes(keep)) option(keep, keep);
-  select.value = wanted;
+  if (keep && !options.some(([value]) => value === keep)) options.push([keep, keep]);
+
+  const sig = JSON.stringify(options);
+  if (sig !== groupDropdownSig) {
+    groupDropdownSig = sig;
+    select.innerHTML = "";
+    for (const [value, label] of options) {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = label;
+      select.appendChild(opt);
+    }
+  }
+  // Assigning the same value is harmless; assigning a different one is the point.
+  if (select.value !== wanted) select.value = wanted;
 }
 
 function renderDrawer() {
@@ -2001,9 +2025,18 @@ async function importVrchatFavourites() {
     if (res && res.title) showAlert(res.title, res.message);
     return;
   }
-  toast(res.added
-    ? `Imported ${res.added} avatar${res.added === 1 ? "" : "s"} from VRChat.`
-    : "All your VRChat Favourites are already in your list.");
+  // Three distinct outcomes, because "Imported 0" reads as a failure whether it
+  // means "nothing new" or "the call came back empty".
+  let message;
+  if (!res.remote) {
+    message = "VRChat returned no favourites. Log in again in Settings and retry.";
+  } else if (res.added) {
+    message = `Imported ${res.added} avatar${res.added === 1 ? "" : "s"} from VRChat.`;
+  } else {
+    message = `All ${res.already || res.remote} of your VRChat favourites are `
+      + "already saved.";
+  }
+  toast(message, 5000);
   closeModal("modal-settings");
   await refreshState();
 }
@@ -2313,13 +2346,22 @@ function wire() {
     // otherwise the entry sits on the sentinel and looks ungrouped until the
     // next redraw.
     const entry = entryById(selectedId);
-    renderGroupDropdown(entry || {});
-    if (!name) return;
+    if (!name) {
+      renderGroupDropdown(entry || {});
+      return;
+    }
     const key = groupKey(name);
     const match = groupSummary().groups.find((g) => g.key === key);
     // Reuse the existing option when the typed name already matches a group
     // case-insensitively, so a new spelling cannot fork "Furry" into two.
-    $("d-group").value = match ? key : name;
+    const wanted = match ? match.key : name;
+    // The typed name has to be added as a real option *before* it is selected.
+    // Assigning a <select> a value it does not have selects nothing, so the
+    // value silently became "" -- which captureDraft then read and saved as "No
+    // group". That is why a brand new group came back blank and was never
+    // created, while the prompt had accepted the name perfectly well.
+    renderGroupDropdown(entry || {}, wanted);
+    $("d-group").value = wanted;
     // Re-capture: the draft frozen above still holds the sentinel's null, so
     // flushing it as-is would save no group at all.
     scheduleSave();
