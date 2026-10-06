@@ -49,11 +49,29 @@ let activeJob = null;
 const thumbCache = {};    // id -> data URI
 const thumbKey = {};      // id -> thumb filename currently cached
 const thumbPending = {};  // id -> true
-// Base64 thumbnails are held in the webview for the session. With hundreds of
-// avatars that is tens of megabytes, so the cache is capped and the oldest
-// entries evicted once it is full.
+// Base64 thumbnails are the *fallback* path, used only when the backend's
+// loopback thumbnail server is not running. Both limits are enforced: a count
+// cap alone is useless when the files range from 10 KB to 4 MB, and a byte cap
+// alone would let thousands of tiny placeholders pile up. 200 entries or 24 MB,
+// whichever arrives first, keeps a fallback session in the tens of megabytes
+// rather than the gigabytes the uncapped version reached.
 const THUMB_CACHE_MAX = 200;
+const THUMB_CACHE_MAX_BYTES = 24 * 1024 * 1024;
+let thumbBytes = 0;
 const thumbOrder = [];
+
+// How far ahead of the viewport a thumbnail is fetched, in CSS pixels. A
+// screenful of slack means scrolling never reveals an image that has not
+// already been asked for, while a list of a few thousand rows still only ever
+// holds a few dozen real images.
+const THUMB_MARGIN = "600px";
+
+// Shown wherever an avatar has no thumbnail yet. Shared by every placeholder
+// slot, so it costs one string in memory rather than one per row.
+const BLANK_THUMB =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' width='200' height='300'>"
+    + "<rect width='200' height='300' fill='#141414'/></svg>");
 
 // Group names are typed by hand, so they are bounded and stripped of control
 // characters before they reach a chip or an export. These two mirror
@@ -598,11 +616,19 @@ function placeholderDataUri(name) {
 }
 
 function cacheThumb(id, key, src) {
-  if (!(id in thumbCache)) thumbOrder.push(id);
+  const previous = thumbCache[id];
+  if (previous === undefined) {
+    thumbOrder.push(id);
+  } else if (previous !== src) {
+    thumbBytes -= previous.length;
+  }
   thumbCache[id] = src;
   thumbKey[id] = key;
-  while (thumbOrder.length > THUMB_CACHE_MAX) {
+  thumbBytes += src.length;
+  while (thumbOrder.length > THUMB_CACHE_MAX || thumbBytes > THUMB_CACHE_MAX_BYTES) {
     const evicted = thumbOrder.shift();
+    if (evicted === undefined) break;
+    thumbBytes -= (thumbCache[evicted] || "").length;
     delete thumbCache[evicted];
     delete thumbKey[evicted];
   }
@@ -635,12 +661,220 @@ function ensureThumb(entry) {
   return thumbCache[id] || "";
 }
 
+/* ---------------------------------------------------- lazy thumbnail loading */
+// A decoded avatar thumbnail costs about a megabyte, and the webview keeps a
+// decoded copy for every image that has been painted as long as the element
+// lives. Building one <img> per row therefore costs roughly a megabyte per row
+// no matter how small the file on disk is -- a few thousand favourites is a few
+// gigabytes, which is exactly what this replaces.
+//
+// So an <img> only gets a real source while it is near the viewport, and drops
+// back to a shared placeholder once it scrolls away. Off-screen rows then cost
+// a DOM node and nothing else.
+let thumbObserver = null;
+
+// Where cached thumbnails can be fetched from as plain URLs. Empty when the
+// backend's loopback server is not running, which is the signal to carry image
+// bytes across the bridge as base64 instead.
+let thumbBase = "";
+
+function setThumbBase(base) {
+  const next = typeof base === "string" ? base : "";
+  if (next === thumbBase) return;
+  thumbBase = next;
+  // Every base64 copy is now redundant, and it is the largest single thing the
+  // webview is holding, so drop the lot rather than waiting for eviction.
+  for (const id of Object.keys(thumbCache)) {
+    delete thumbCache[id];
+    delete thumbKey[id];
+  }
+  thumbOrder.length = 0;
+  thumbBytes = 0;
+}
+
+function thumbObserverReady() {
+  if (thumbObserver) return thumbObserver;
+  if (typeof IntersectionObserver !== "function") return null;
+  try {
+    // Root null, not the scroll container: intersection is already clipped by
+    // the scrolling ancestor, so this one observer covers both the avatar grid
+    // and the log lists without caring which is on screen.
+    thumbObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) onThumbVisibility(entry.target, entry.isIntersecting);
+    }, { root: null, rootMargin: THUMB_MARGIN });
+  } catch (err) {
+    return null;
+  }
+  return thumbObserver;
+}
+
+// A cached thumbnail as a plain URL, or "" when there is no loopback server to
+// fetch it from.
+function thumbUrlFor(name) {
+  if (!thumbBase || !name) return "";
+  return thumbBase + "/" + encodeURIComponent(name);
+}
+
+// Resolve an <img>'s real source from what it was registered with. Only ever
+// called for an image that is about to be shown.
+function resolveThumbSrc(img) {
+  const key = img.dataset.thumbKey;
+  if (!key) return "";
+  if (thumbBase) {
+    // Already proved this exact file will not load from the loopback server, so
+    // do not ask again on every repaint.
+    if (img.dataset.thumbBroken === key) return "";
+    return thumbUrlFor(key);
+  }
+  return ensureThumb({ id: img.dataset.thumbId, thumb: key }) || "";
+}
+
+function onThumbVisibility(img, visible) {
+  if (!visible) {
+    // Dropping the source is what actually frees the decoded bitmap. The element
+    // stays, so nothing reflows and scrolling back restores it.
+    img.src = BLANK_THUMB;
+    return;
+  }
+  if (img.dataset.thumbBroken === img.dataset.thumbKey) return;
+  const src = resolveThumbSrc(img);
+  img.src = src || BLANK_THUMB;
+}
+
+// If a loopback URL will not load, fall back to base64 for this image.
+//
+// Marked against the thumbnail's own filename, not as a bare flag: a refreshed
+// avatar gets a new filename, so it is allowed to try again, while a genuinely
+// missing file is attempted exactly once. Setting the marker *before* the
+// fallback is applied is what stops a broken base64 payload re-triggering this
+// handler for ever.
+function thumbLoadFailed(img) {
+  if (!thumbBase) return;
+  const key = img.dataset.thumbKey;
+  if (!key || img.dataset.thumbBroken === key) return;
+  img.dataset.thumbBroken = key;
+  const src = ensureThumb({ id: img.dataset.thumbId, thumb: key });
+  if (src) img.src = src;
+}
+
+function lazyThumb(img, entry, placeholder) {
+  if (!img) return placeholder || "";
+  const key = (entry && entry.thumb) || "";
+  const fallback = placeholder || BLANK_THUMB;
+  img.dataset.thumbId = entry ? entry.id : "";
+  img.dataset.thumbKey = key;
+  if (!key) {
+    img.src = fallback;
+    return fallback;
+  }
+  img.addEventListener("error", () => thumbLoadFailed(img));
+  const observer = thumbObserverReady();
+  if (!observer) {
+    // No IntersectionObserver: behave exactly as before, loading everything.
+    const src = resolveThumbSrc(img);
+    img.src = src || fallback;
+    return src || fallback;
+  }
+  img.src = BLANK_THUMB;
+  observer.observe(img);
+  return fallback;
+}
+
 function applyThumb(id) {
   const src = thumbCache[id];
   if (!src) return;
   document.querySelectorAll(`[data-thumb-id="${CSS.escape(id)}"]`).forEach((img) => {
     img.src = src;
   });
+}
+
+/* ------------------------------------------------------- progressive lists */
+// The three long lists here (the avatar grid and the two log tabs) can each hold
+// thousands of rows, and one row is not one node: a card is a dozen elements,
+// so a 5,000-avatar grid is tens of thousands of live nodes the webview carries
+// for as long as the view is open. Rendering the first page and extending as
+// the user scrolls keeps the live node count at roughly a screenful plus a page
+// while still letting them scroll through everything.
+//
+// How far each list has been extended is keyed on what the list is *showing*,
+// not on its contents, so a new avatar appearing at the top of the log does not
+// throw away the page the user had scrolled to.
+const PAGE_ROWS = 200;
+const pageSize = { grid: PAGE_ROWS, logs: PAGE_ROWS, changes: PAGE_ROWS };
+// null means "this list has never been drawn". Using "" for that would make the
+// very first render look like a filter change and quietly undo an extension the
+// user had already asked for.
+const pageKey = { grid: null, logs: null, changes: null };
+const listTotal = { grid: 0, logs: 0, changes: 0 };
+
+// Returns how many rows this list should draw, resetting to one page whenever
+// the filters, search, sort or tab changed since the last render. The key is the
+// JSON of the parts rather than a joined string, because a group name and a
+// search term are arbitrary text and must not be able to join into the same key.
+function pageFor(name, parts) {
+  const key = JSON.stringify(parts);
+  if (pageKey[name] !== null && pageKey[name] !== key) {
+    pageSize[name] = PAGE_ROWS;
+  }
+  pageKey[name] = key;
+  return pageSize[name];
+}
+
+function activeListName() {
+  if (currentView !== "logs") return "grid";
+  return logTab === "players" ? "changes" : "logs";
+}
+
+let listGrowing = false;
+
+function growActiveList() {
+  // Rebuilding the list changes its height, which in some engines re-fires the
+  // scroll event synchronously. Without this the handler can call itself before
+  // the first pass has finished updating the page size.
+  if (listGrowing) return;
+  const name = activeListName();
+  if (pageSize[name] >= listTotal[name]) return;
+  pageSize[name] = Math.min(listTotal[name], pageSize[name] + PAGE_ROWS);
+  listGrowing = true;
+  try {
+    if (name === "grid") renderGrid(true);
+    else renderLogs(true);
+  } finally {
+    listGrowing = false;
+  }
+}
+
+// Extend the list whose scroll container the user just reached the end of.
+// Called from a scroll listener, so it must be cheap and must not assume the
+// element really is a scroller -- the event also fires for inner elements.
+function growOnScroll(el) {
+  if (!el || (el !== $("grid-wrap") && el !== $("logs-wrap"))) return;
+  const name = activeListName();
+  if (pageSize[name] >= listTotal[name]) return;
+  const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+  if (!Number.isFinite(remaining) || remaining > 800) return;
+  growActiveList();
+}
+
+// The trailing row of a paged list. Gives the count that is *not* drawn, and a
+// button, so the rest is reachable without a scroll gesture (keyboard, touch
+// drag that never reaches the true bottom, or a screen reader).
+function renderMoreRow(name) {
+  const total = listTotal[name];
+  const shown = pageSize[name];
+  if (!total || shown >= total) return null;
+  const row = document.createElement("div");
+  row.className = "more-row";
+  const label = document.createElement("span");
+  label.className = "muted small";
+  label.textContent = `Showing ${shown.toLocaleString()} of ${total.toLocaleString()}`;
+  const btn = document.createElement("button");
+  btn.className = "btn small";
+  btn.textContent = "Show more";
+  btn.addEventListener("click", growActiveList);
+  row.appendChild(label);
+  row.appendChild(btn);
+  return row;
 }
 
 /* ------------------------------------------------------------------ render */
@@ -684,11 +918,17 @@ function renderGrid(force) {
     items: list.map((e) => [e.id, e.name, e.thumb, e.author, e.favorite, !!e.inaccessible,
       e.release_status, (e.platforms || []).join(","), (e.tags || []).join(",")]),
   });
+  // Reset to one page when the filters change, keep the page count when only the
+  // data underneath changed, so a background metadata refresh does not collapse
+  // a list the user is halfway down.
+  const shown = pageFor("grid",
+    [currentFilter, currentGroup, $("search").value, $("sort").value]);
   if (!force && sig === lastGridSig) return;
   lastGridSig = sig;
 
   const grid = $("grid");
   grid.innerHTML = "";
+  listTotal.grid = list.length;
 
   if (!list.length) {
     $("grid-empty").classList.remove("hidden");
@@ -699,7 +939,7 @@ function renderGrid(force) {
   $("count").textContent = `${list.length} avatar${list.length === 1 ? "" : "s"}`;
 
   const frag = document.createDocumentFragment();
-  for (const entry of list) {
+  for (const entry of list.slice(0, shown)) {
     const card = document.createElement("article");
     card.className = "card"
       + (entry.id === state.current_avatar_id ? " wearing" : "")
@@ -711,7 +951,6 @@ function renderGrid(force) {
     card.setAttribute("role", "button");
     card.setAttribute("aria-label", entry.name || "Avatar");
 
-    const src = ensureThumb(entry) || placeholderDataUri(entry.name);
     const favOn = entry.favorite ? "on" : "";
     const badges = [];
     if (entry.inaccessible) {
@@ -728,7 +967,7 @@ function renderGrid(force) {
 
     card.innerHTML = `
       <div class="poster">
-        <img data-thumb-id="${escapeHtml(entry.id)}" src="${src}" alt="" />
+        <img data-thumb-id="${escapeHtml(entry.id)}" alt="" />
         <button class="fav-btn ${favOn}" title="Favorite">♥</button>
         ${entry.id === state.current_avatar_id ? '<span class="badge wearing-badge">● Wearing</span>' : ""}
         <div class="poster-actions">
@@ -740,6 +979,10 @@ function renderGrid(force) {
         <div class="card-sub">${escapeHtml(cardSub(entry))}</div>
         ${badgesHtml}
       </div>`;
+
+    // Hands the image its real source only while it is near the viewport, and
+    // drops it again once it scrolls away.
+    lazyThumb(card.querySelector(".poster img"), entry, placeholderDataUri(entry.name));
 
     card.addEventListener("click", (e) => {
       // Ctrl/Cmd toggles selection, Shift extends a range, plain click opens
@@ -771,6 +1014,8 @@ function renderGrid(force) {
     });
     frag.appendChild(card);
   }
+  const more = renderMoreRow("grid");
+  if (more) frag.appendChild(more);
   grid.appendChild(frag);
 }
 
@@ -816,6 +1061,9 @@ function renderLogs(force) {
 }
 
 function renderAvatarLogs(logs, force) {
+  // Tab and search decide what this list shows, so they reset the page count;
+  // the rows changing underneath it must not.
+  const shown = pageFor("logs", [logTab, $("search").value]);
   const sig = JSON.stringify(logs.map((e) =>
     [e.id, e.name, e.count, e.last_seen, e.private, e.source, !!entryById(e.id)]));
   if (!force && sig === lastLogsSig) return;
@@ -823,16 +1071,15 @@ function renderAvatarLogs(logs, force) {
 
   const wrap = $("logs");
   wrap.innerHTML = "";
+  listTotal.logs = logs.length;
   $("logs-count").textContent = logs.length
     ? `${logs.length} avatar${logs.length === 1 ? "" : "s"} logged` : "";
   if (!logs.length) return;
 
   const frag = document.createDocumentFragment();
-  for (const log of logs) {
+  for (const log of logs.slice(0, shown)) {
     const fav = entryById(log.id);
     const name = log.name || (fav ? fav.name : "");
-    const src = fav ? (ensureThumb(fav) || placeholderDataUri(name || log.id))
-                    : placeholderDataUri(name || log.id);
     const countBadge = log.count > 1 ? `<span class="platform-badge">×${log.count}</span>` : "";
     const privateBadge = log.private ? `<span class="platform-badge">private</span>` : "";
     const sourceBadge = log.source
@@ -844,7 +1091,7 @@ function renderAvatarLogs(logs, force) {
     const row = document.createElement("div");
     row.className = "log-row" + (log.private ? " private" : "");
     row.innerHTML = `
-      <img class="log-thumb" data-thumb-id="${saved ? escapeHtml(log.id) : ""}" src="${src}" alt="" />
+      <img class="log-thumb" data-thumb-id="${saved ? escapeHtml(log.id) : ""}" alt="" />
       <div class="log-main">
         <div class="log-name">${escapeHtml(name || "Unknown avatar")}</div>
         <div class="log-sub">${escapeHtml(log.id)}</div>
@@ -857,6 +1104,10 @@ function renderAvatarLogs(logs, force) {
         <button class="btn small save-log"${disabled}>${saved ? "Saved" : "Save"}</button>
         <button class="btn small ghost forget-log" title="Remove from log">✕</button>
       </div>`;
+    // Only a saved avatar has an image on disk to show. An unsaved one keeps the
+    // cheap letter placeholder, so the log tab costs nothing extra.
+    if (fav) lazyThumb(row.querySelector(".log-thumb"), fav, placeholderDataUri(name || log.id));
+    else row.querySelector(".log-thumb").src = placeholderDataUri(name || log.id);
     row.querySelector(".save-log").addEventListener("click", () => saveFromLog(log.id));
     row.querySelector(".forget-log").addEventListener("click", () => forgetLog(log.id));
     row.addEventListener("contextmenu", (e) => {
@@ -878,10 +1129,13 @@ function renderAvatarLogs(logs, force) {
     });
     frag.appendChild(row);
   }
+  const more = renderMoreRow("logs");
+  if (more) frag.appendChild(more);
   wrap.appendChild(frag);
 }
 
 function renderPlayerChanges(changes, force) {
+  const shown = pageFor("changes", [logTab, $("search").value]);
   const sig = JSON.stringify(changes.map((e) =>
     [e.player, e.avatar, e.count, e.last_seen]));
   if (!force && sig === lastChangesSig) return;
@@ -889,12 +1143,13 @@ function renderPlayerChanges(changes, force) {
 
   const wrap = $("changes");
   wrap.innerHTML = "";
+  listTotal.changes = changes.length;
   $("logs-count").textContent = changes.length
     ? `${changes.length} change${changes.length === 1 ? "" : "s"} logged` : "";
   if (!changes.length) return;
 
   const frag = document.createDocumentFragment();
-  for (const change of changes) {
+  for (const change of changes.slice(0, shown)) {
     const initial = (change.player || "?").trim()[0] || "?";
     const countBadge = change.count > 1 ? `<span class="log-badge">×${change.count}</span>` : "";
     const row = document.createElement("div");
@@ -937,6 +1192,8 @@ function renderPlayerChanges(changes, force) {
     });
     frag.appendChild(row);
   }
+  const more = renderMoreRow("changes");
+  if (more) frag.appendChild(more);
   wrap.appendChild(frag);
 }
 
@@ -998,10 +1255,13 @@ function renderDrawer() {
   renderGroupDropdown(entry, editing ? $("d-group").value : null);
   suppressSave = false;
 
-  const src = ensureThumb(entry) || placeholderDataUri(entry.name);
+  // The drawer holds a single image and is only open while the user is looking
+  // at it, so it loads eagerly rather than through the scroll observer.
+  const src = thumbUrlFor(entry.thumb) || ensureThumb(entry) || placeholderDataUri(entry.name);
   const preview = $("preview");
-  if (preview.getAttribute("src") !== src) preview.src = src;
   preview.dataset.thumbId = entry.id;
+  preview.dataset.thumbKey = entry.thumb || "";
+  if (preview.getAttribute("src") !== src) preview.src = src;
 
   $("d-author").textContent = entry.author ? "by " + entry.author : "Author unknown";
   const badges = [];
@@ -1390,7 +1650,9 @@ async function openSettings() {
   $("set-exit-on-close").checked = s.exit_on_close !== false;
   $("set-motion").value = s.motion || "system";
   renderMotionNote();
-  $("set-max-avatar-log").value = s.max_avatar_log || 800;
+  // Fallbacks only: get_settings always reports the resolved value, so these
+  // match storage.DEFAULT_MAX_AVATAR_LOG / DEFAULT_MAX_PLAYER_CHANGES.
+  $("set-max-avatar-log").value = s.max_avatar_log || 200;
   $("set-max-player-changes").value = s.max_player_changes || 1000;
   renderLimitsNote();
   $("set-tray-note").textContent = s.tray
@@ -1615,6 +1877,10 @@ async function refreshState() {
   state.osc = next.osc || state.osc;
   state.discovery = next.discovery || state.discovery;
   state.version = next.version || state.version;
+  // Adopted on every poll rather than once at start-up: the loopback thumbnail
+  // server can fail to bind, and a backend that comes up late still needs the UI
+  // to notice.
+  setThumbBase(next.thumb_base);
   if (next.motion && next.motion !== state.motion) state.motion = next.motion;
   // Re-apply every poll so a change made outside the app is picked up.
   applyMotionPreference();
@@ -1742,6 +2008,15 @@ function setView(view) {
 }
 
 function wire() {
+  // The drawer preview is not lazy, but it gets the same one-shot fallback: a
+  // thumbnail the loopback server cannot find must still appear.
+  $("preview").addEventListener("error", () => thumbLoadFailed($("preview")));
+  // Reaching the end of a long list extends it by a page. Both scroll
+  // containers are covered, because either one can be the one on screen.
+  $("grid-wrap").addEventListener("scroll", () => growOnScroll($("grid-wrap")),
+    { passive: true });
+  $("logs-wrap").addEventListener("scroll", () => growOnScroll($("logs-wrap")),
+    { passive: true });
   $("bulk-clear").addEventListener("click", clearSelection);
   $("bulk-fav").addEventListener("click", () => runBulk("favorite"));
   $("bulk-wear").addEventListener("click", () => runBulk("wear"));

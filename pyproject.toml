@@ -51,7 +51,7 @@ ignore = [
 "app/selftest.py" = ["E402", "F841", "B010"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["api", "backend", "osc", "storage", "version", "versions",
+known-first-party = ["api", "backend", "osc", "storage", "thumbsrv", "version", "versions",
                      "vrcache", "vrcdetails", "vrclog"]
 
 [tool.mypy]

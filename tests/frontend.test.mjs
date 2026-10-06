@@ -187,6 +187,287 @@ test("a cached thumbnail refreshes its recency", async () => {
     "the touched entry should become most recent");
 });
 
+test("the fallback cache is capped by total size, not just by count", async () => {
+  // A count cap alone is meaningless when thumbnails range from 10 KB to 4 MB:
+  // 200 of the large ones is most of a gigabyte. Each response here is well over
+  // the 24 MB budget once a handful have landed, so eviction has to kick in
+  // before the count limit is reached.
+  const chunk = "A".repeat(512 * 1024);
+  const api = { get_thumbnail: async (id) => "data:image/png;base64," + id + chunk };
+  const { app } = setup(api);
+  for (let i = 0; i < 120; i++) app.ensureThumb({ id: "b" + i, thumb: "b" + i + ".png" });
+  await tick();
+
+  const cached = Object.keys(app.thumbCache).filter((k) => app.thumbCache[k]);
+  const bytes = cached.reduce((n, k) => n + app.thumbCache[k].length, 0);
+  assert.ok(cached.length < 120, `cache held every entry (${cached.length})`);
+  assert.ok(bytes <= 24 * 1024 * 1024 + 512 * 1024,
+    `cache held ${bytes} bytes, over the byte budget`);
+  assert.ok(app.thumbCache["b119"], "the newest thumbnail was evicted");
+  assert.equal(app.thumbCache["b0"], undefined, "the oldest was not evicted");
+});
+
+// ------------------------------------------------------- lazy thumbnails
+//
+// The memory fix. A decoded avatar thumbnail is about a megabyte and the
+// webview keeps one for every image it has painted, so a list of a few thousand
+// rows used to pin a few gigabytes. Only images near the viewport get a source.
+
+test("with the loopback server, a thumbnail is a URL and never base64", async () => {
+  let calls = 0;
+  const api = { get_thumbnail: async (id) => { calls++; return "data:image/png;base64,X"; } };
+  const { app } = setup(api);
+  app.setThumbBase("http://127.0.0.1:51234/tok");
+
+  const img = { dataset: {}, src: "", addEventListener() {} };
+  app.lazyThumb(img, { id: "avtr_x", thumb: "avtr_x.png" }, "ph");
+
+  // Registering an image must not fetch it at all.
+  assert.equal(calls, 0, "registration fetched the image eagerly");
+  assert.equal(img.dataset.thumbKey, "avtr_x.png");
+
+  app.onThumbVisibility(img, true);
+  assert.equal(img.src, "http://127.0.0.1:51234/tok/avtr_x.png", img.src);
+  assert.equal(calls, 0, "showing an image fetched base64 anyway");
+});
+
+test("scrolling an image out of view drops its source", () => {
+  const { app } = setup();
+  app.setThumbBase("http://127.0.0.1:1/tok");
+  const img = { dataset: {}, src: "", addEventListener() {} };
+  app.lazyThumb(img, { id: "avtr_y", thumb: "y.png" }, "ph");
+
+  app.onThumbVisibility(img, true);
+  const loaded = img.src;
+  assert.match(loaded, /\/tok\/y\.png$/);
+
+  app.onThumbVisibility(img, false);
+  assert.notEqual(img.src, loaded, "the real source must be released off-screen");
+  assert.ok(img.src.startsWith("data:image/svg+xml"), img.src);
+
+  app.onThumbVisibility(img, true);
+  assert.equal(img.src, loaded, "and restored when it comes back");
+});
+
+test("a thumbnail name is escaped into the URL", () => {
+  const { app } = setup();
+  app.setThumbBase("http://127.0.0.1:1/tok");
+  assert.equal(app.thumbUrlFor("a b&c.png"), "http://127.0.0.1:1/tok/a%20b%26c.png");
+  assert.equal(app.thumbUrlFor(""), "");
+});
+
+test("without the loopback server, images fall back to base64 across the bridge", async () => {
+  const api = { get_thumbnail: async (id) => "data:image/png;base64," + id };
+  const { env, app } = setup(api);
+  const img = env.document.registerThumbImage({ dataset: {}, src: "", addEventListener() {} });
+
+  // No observer available in this environment, so lazyThumb loads eagerly: the
+  // behaviour must be exactly what it was before the loopback server existed.
+  app.lazyThumb(img, { id: "avtr_z", thumb: "z.png" }, "ph");
+  // The bridge answers asynchronously, so the placeholder stands in until the
+  // patch below lands -- which is how it behaved before this change too.
+  assert.equal(img.src, "ph");
+  await tick();
+  assert.equal(img.src, "data:image/png;base64,avtr_z", img.src);
+});
+
+test("an avatar with no thumbnail shows the placeholder and asks for nothing", async () => {
+  let calls = 0;
+  const api = { get_thumbnail: async () => { calls++; return "x"; } };
+  const { app } = setup(api);
+  app.setThumbBase("http://127.0.0.1:1/tok");
+
+  const img = { dataset: {}, src: "", addEventListener() {} };
+  const shown = app.lazyThumb(img, { id: "avtr_w", thumb: null }, "ph");
+  await tick();
+
+  assert.equal(shown, "ph");
+  assert.equal(img.src, "ph");
+  assert.equal(calls, 0, "a thumbnail-less avatar must not be fetched");
+});
+
+test("switching to the loopback transport drops the base64 copies", async () => {
+  const api = { get_thumbnail: async (id) => "data:image/png;base64," + id };
+  const { app } = setup(api);
+  for (let i = 0; i < 20; i++) app.ensureThumb({ id: "c" + i, thumb: "c" + i });
+  await tick();
+  assert.ok(Object.keys(app.thumbCache).length > 0, "precondition: something cached");
+
+  app.setThumbBase("http://127.0.0.1:1/tok");
+  assert.equal(Object.keys(app.thumbCache).length, 0,
+    "base64 copies must not outlive the transport they were for");
+  assert.equal(app.thumbOrder.length, 0, "eviction order must not drift either");
+});
+
+test("a loopback URL that will not load falls back to base64", async () => {
+  const api = { get_thumbnail: async () => "data:image/png;base64,FALLBACK" };
+  const { env, app } = setup(api);
+  app.setThumbBase("http://127.0.0.1:1/tok");
+
+  const img = env.document.registerThumbImage({ dataset: {}, src: "", addEventListener() {} });
+  app.lazyThumb(img, { id: "avtr_f", thumb: "f.png" }, "ph");
+  app.onThumbVisibility(img, true);
+  assert.match(img.src, /127\.0\.0\.1/);
+
+  app.thumbLoadFailed(img);
+  await tick();
+  assert.equal(img.src, "data:image/png;base64,FALLBACK", img.src);
+});
+
+test("a failed fallback is not retried for ever", async () => {
+  // If the fallback also fails to load, the error handler runs again. Retrying
+  // unconditionally would set src to the same value again and spin.
+  let calls = 0;
+  const api = { get_thumbnail: async () => { calls++; return "data:image/png;base64,X"; } };
+  const { env, app } = setup(api);
+  app.setThumbBase("http://127.0.0.1:1/tok");
+
+  const img = env.document.registerThumbImage({ dataset: {}, src: "", addEventListener() {} });
+  app.lazyThumb(img, { id: "avtr_g", thumb: "g.png" }, "ph");
+  for (let i = 0; i < 5; i++) app.thumbLoadFailed(img);
+  await tick();
+  assert.equal(calls, 1, "the bridge was asked " + calls + " times");
+
+  // A refreshed avatar gets a new filename, and is allowed to try again.
+  app.thumbLoadFailed({ ...img, dataset: { thumbId: "avtr_g", thumbKey: "g2.png" } });
+  await tick();
+  assert.equal(calls, 2, "a new thumbnail must be retried");
+});
+
+// ------------------------------------------------------- progressive lists
+
+test("a long grid draws one page, not every row", () => {
+  const entries = Array.from({ length: 900 }, (_, i) => ({
+    id: "avtr_" + i, name: "Avatar " + i, tags: [], platforms: [], added: "2026-01-01T00:00:00+00:00",
+  }));
+  const { app } = setup();
+  app.state = { ...app.state, entries };
+  app.currentFilter = "all";
+  app.currentGroup = null;
+
+  assert.ok(app.PAGE_ROWS < 900, "the fixture must exceed one page");
+  app.renderGrid(true);
+  assert.equal(app.listTotal.grid, 900, "the full list is still known");
+  assert.equal(app.pageSize.grid, app.PAGE_ROWS,
+    "only one page is drawn until the user scrolls for more");
+});
+
+test("a long log draws one page, not every row", () => {
+  const logs = Array.from({ length: 640 }, (_, i) => ({
+    id: "avtr_log" + i, name: "Logged " + i, count: 1, last_seen: "2026-01-01T00:00:00+00:00",
+    private: false, source: "log",
+  }));
+  const { app } = setup();
+  app.state = { ...app.state, logs, changes: [] };
+  app.currentView = "logs";
+  app.logTab = "avatars";
+
+  app.renderLogs(true);
+  assert.equal(app.listTotal.logs, 640);
+  assert.equal(app.pageSize.logs, app.PAGE_ROWS);
+});
+
+test("changing the search starts the list over at one page", () => {
+  const logs = Array.from({ length: 640 }, (_, i) => ({
+    id: "avtr_log" + i, name: "Logged " + i, count: 1, last_seen: "2026-01-01T00:00:00+00:00",
+    private: false, source: "log",
+  }));
+  const { env, app } = setup();
+  app.state = { ...app.state, logs, changes: [] };
+  app.currentView = "logs";
+  app.logTab = "avatars";
+
+  app.renderLogs(true);
+  app.growActiveList();
+  assert.equal(app.pageSize.logs, app.PAGE_ROWS * 2, "scrolling adds a page");
+
+  // A new search is a different list, so it must not inherit the old scroll
+  // depth.
+  env.document.getElementById("search").value = "Logged 1";
+  app.renderLogs(true);
+  assert.equal(app.pageSize.logs, app.PAGE_ROWS, "a new search restarts at one page");
+});
+
+test("new rows arriving do not collapse a list the user is part-way down", () => {
+  const make = (n) => Array.from({ length: n }, (_, i) => ({
+    id: "avtr_log" + i, name: "Logged " + i, count: 1,
+    last_seen: `2026-01-0${(i % 9) + 1}T00:00:00+00:00`, private: false, source: "log",
+  }));
+  const { app } = setup();
+  app.state = { ...app.state, logs: make(640), changes: [] };
+  app.currentView = "logs";
+  app.logTab = "avatars";
+
+  app.renderLogs(true);
+  app.growActiveList();
+  assert.equal(app.pageSize.logs, app.PAGE_ROWS * 2);
+
+  // A new discovery lands at the top of the list; the user keeps their depth.
+  const fresh = [{ id: "avtr_new", name: "Fresh", count: 1,
+    last_seen: "2027-01-01T00:00:00+00:00", private: false, source: "log" }, ...make(640)];
+  app.state = { ...app.state, logs: fresh };
+  app.renderLogs(true);
+  assert.equal(app.pageSize.logs, app.PAGE_ROWS * 2,
+    "a data refresh must not throw away the page the user had scrolled to");
+});
+
+test("the paged list says how much is not drawn, and can draw more", () => {
+  const { app } = setup();
+  app.listTotal.logs = 640;
+  app.pageSize.logs = 200;
+
+  const row = app.renderMoreRow("logs");
+  assert.ok(row, "a partly drawn list must say so");
+  assert.equal(row.children[0].textContent, "Showing 200 of 640");
+  assert.equal(row.children[1].textContent, "Show more");
+
+  // Nothing to reveal once the whole list is on screen.
+  app.pageSize.logs = 640;
+  assert.equal(app.renderMoreRow("logs"), null);
+});
+
+test("scrolling to the end of a list extends it, scrolling elsewhere does not", () => {
+  const { env, app } = setup();
+  app.currentView = "home";
+  app.currentFilter = "all";
+  app.currentGroup = null;
+  app.listTotal.grid = 640;
+  app.pageSize.grid = 200;
+
+  const wrap = env.document.getElementById("grid-wrap");
+  wrap.scrollHeight = 5000;
+  wrap.clientHeight = 500;
+
+  wrap.scrollTop = 4500;
+  app.growOnScroll(wrap);
+  assert.equal(app.pageSize.grid, 400, "reaching the end adds a page");
+
+  // Not at the end yet.
+  wrap.scrollTop = 0;
+  app.growOnScroll(wrap);
+  assert.equal(app.pageSize.grid, 400, "scrolling part way must not extend the list");
+
+  // The scroll event also fires for inner elements; only the two list
+  // containers count.
+  wrap.scrollTop = 4900;
+  app.growOnScroll(env.document.getElementById("search"));
+  assert.equal(app.pageSize.grid, 400, "an unrelated scroller must be ignored");
+
+  // An element with no measurable geometry -- a hidden panel, or a stub.
+  app.growOnScroll(env.document.getElementById("logs-wrap"));
+  assert.equal(app.pageSize.grid, 400, "no geometry means no extension");
+});
+
+test("a list that is already fully drawn is not extended again", () => {
+  const { app } = setup();
+  app.currentView = "home";
+  app.listTotal.grid = 100;
+  app.pageSize.grid = 200;
+
+  app.growOnScroll({ scrollHeight: 5000, scrollTop: 4900, clientHeight: 500 });
+  assert.equal(app.pageSize.grid, 200, "nothing left to draw");
+});
+
 // ------------------------------------------------------------------- autosave
 
 test("closing the drawer flushes a pending edit", async () => {

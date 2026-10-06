@@ -532,6 +532,16 @@ code, .mono { font-family: "Cascadia Code", Consolas, monospace; }
   gap: 0.4rem;
   padding: 0.6rem var(--pad-x) 1.6rem;
 }
+/* Trailing row of a list that is only partly drawn. Spans the whole grid so it
+   reads as a control rather than another card. */
+.more-row {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 1rem 0 0.2rem;
+}
 .log-row {
   display: flex;
   align-items: center;

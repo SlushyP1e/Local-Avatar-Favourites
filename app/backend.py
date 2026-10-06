@@ -27,6 +27,7 @@ import storage
 from api import ApiError, AuthError, TwoFactorRequired, VRCApi
 from jobs import JobRegistry, JobRunner
 from osc import OSCBridge
+from thumbsrv import IMAGE_MIME, ThumbServer
 from version import __version__
 from versions import is_newer
 from vrcache import VRCacheWatcher
@@ -35,12 +36,6 @@ from vrclog import VRCLogWatcher
 
 RELEASES_API = "https://api.github.com/repos/SlushyP1e/Local-Avatar-Favourites/releases/latest"
 LOGGER = logging.getLogger(__name__)
-IMAGE_MIME = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-}
 
 # Caps on the two log lists. The defaults live in storage as settings so the
 # user can size them; these are only the fallbacks for when the setting is
@@ -135,6 +130,10 @@ class Backend:
         self._api_fallback_wear: tuple[str, float] | None = None
         self._jobs = JobRegistry()
         self._runner = JobRunner(self._jobs)
+        # Serves cached thumbnails to the webview over loopback so image bytes
+        # never cross the bridge as base64. Optional: if it cannot bind, the UI
+        # falls back to the bridge path and behaves the same, just heavier.
+        self._thumbs = ThumbServer()
 
         self.entries: list[dict] = storage.load_favourites()
         self._index: dict[str, dict] = {}
@@ -170,6 +169,7 @@ class Backend:
                 pass
         self._stopped = False
         if start_services:
+            self._thumbs.start()
             threading.Thread(target=self._prune_loop, daemon=True).start()
             threading.Thread(target=self._log_loop, daemon=True).start()
 
@@ -182,6 +182,7 @@ class Backend:
 
     def stop(self) -> None:
         self._stopped = True
+        self._thumbs.stop()
         self.osc.stop()
 
     def _log_loop(self) -> None:
@@ -479,9 +480,10 @@ class Backend:
                     "private": False,
                     "source": source,
                 })
-            if len(self.log) > self._log_limit():
+            limit = self._log_limit()
+            if len(self.log) > limit:
                 self.log.sort(key=lambda e: e.get("last_seen", ""))
-                self.log = self.log[-self._log_limit():]
+                self.log = self.log[-limit:]
             if save:
                 storage.save_log(self.log)
             self._touch("logs")
@@ -514,9 +516,10 @@ class Backend:
                     "last_seen": stamp,
                     "count": 1,
                 })
-            if len(self.changes) > self._change_limit():
+            limit = self._change_limit()
+            if len(self.changes) > limit:
                 self.changes.sort(key=lambda e: e.get("last_seen", ""))
-                self.changes = self.changes[-self._change_limit():]
+                self.changes = self.changes[-limit:]
             self._touch("changes")
         return True
 
@@ -621,6 +624,10 @@ class Backend:
                     "error": self.osc.error,
                     "seen_traffic": self.osc.seen_traffic(),
                 },
+                # Non-empty when the loopback thumbnail server is up. The UI
+                # points <img src> straight at it so image bytes never have to
+                # be base64-encoded across the bridge and held in JavaScript.
+                "thumb_base": self._thumbs.base_url,
             }
             state["entries"] = self._snapshot_entries() if changed("entries") else None
             state["logs"] = self._log_sorted() if changed("logs") else None
@@ -671,6 +678,13 @@ class Backend:
         return {"ok": True, "ids": ids, "total": self._cache.backlog_size()}
 
     def get_thumbnail(self, avatar_id: str) -> str:
+        """Return one thumbnail as a base64 data URI.
+
+        Only used when the loopback thumbnail server is unavailable, so image
+        bytes have to be carried across the bridge by hand. Keeping it working
+        matters more than it being fast: an unreachable server must degrade to
+        slow, not to blank posters.
+        """
         with self._lock:
             entry = self._entry(avatar_id)
             thumb = entry.get("thumb") if entry else None

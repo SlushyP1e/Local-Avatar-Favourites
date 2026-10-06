@@ -37,9 +37,16 @@ _MIGRATED = False
 MOTION_MODES = ("system", "full", "none")
 DEFAULT_MOTION = "full"
 
-# Log list caps. The values match what the app enforced unconditionally before
-# they became settings, so an upgrade changes nothing about existing behaviour.
-DEFAULT_MAX_AVATAR_LOG = 800
+# Log list caps.
+#
+# The avatar log is capped low on purpose. Every row is materialised as a DOM
+# node in the webview, and most of them carry a thumbnail, so the ceiling here is
+# really a ceiling on how much memory the log view can hold. A user who genuinely
+# wants more can raise it in Settings; a user who never looks at the setting
+# should not be quietly handed a list that costs gigabytes to render.
+DEFAULT_MAX_AVATAR_LOG = 200
+# Player changes are much cheaper per row: no id, no thumbnail, and nothing to
+# render but a name and an avatar name, so a larger cap costs almost nothing.
 DEFAULT_MAX_PLAYER_CHANGES = 1000
 # Bounds for those caps. One row is a legal floor -- someone may genuinely want
 # only the newest sighting -- and the ceiling is far above any real need, but it

@@ -1068,10 +1068,16 @@ def test_log_size_limits() -> None:
           str(b._log_limit()))
     check("changes cap default",
           b._change_limit() == storage.DEFAULT_MAX_PLAYER_CHANGES, str(b._change_limit()))
-    check("defaults match the old hard-coded caps",
-          storage.DEFAULT_MAX_AVATAR_LOG == 800
-          and storage.DEFAULT_MAX_PLAYER_CHANGES == 1000,
-          f"{storage.DEFAULT_MAX_AVATAR_LOG} / {storage.DEFAULT_MAX_PLAYER_CHANGES}")
+    # Pinned rather than merely "equal to the constant", because this is the
+    # value a new install gets. The avatar log is capped low on purpose: each row
+    # is a live DOM node in the webview and most carry a thumbnail, so the cap is
+    # really a ceiling on how much memory the log view can hold.
+    check("avatar cap default is 200",
+          storage.DEFAULT_MAX_AVATAR_LOG == 200,
+          str(storage.DEFAULT_MAX_AVATAR_LOG))
+    check("player changes cap default is 1000",
+          storage.DEFAULT_MAX_PLAYER_CHANGES == 1000,
+          str(storage.DEFAULT_MAX_PLAYER_CHANGES))
 
     b.settings["max_avatar_log"] = 3
     b.settings["max_player_changes"] = 2
@@ -1265,7 +1271,7 @@ def test_defaults_are_never_recorded() -> None:
     """A built-in default must not become a log entry at all.
 
     Not "recorded but hidden": dropped before anything is written, so it never
-    reaches avatar_log.json, never consumes one of the 800 capped slots, and
+    reaches avatar_log.json, never consumes one of the capped slots, and
     never appears to be a finding the user could save.
     """
     b = _isolated_backend()
@@ -1979,6 +1985,107 @@ def test_thumbnail_pruning() -> None:
         check("no thumbnail files remain",
               not [p for p in storage.THUMBS_DIR.iterdir() if p.is_file()])
         check("clear_thumbs on empty dir", storage.clear_thumbs() == 0)
+
+
+def test_thumbnail_http_server() -> None:
+    """The loopback server must serve cached images and nothing else.
+
+    It exists so image bytes never have to cross the bridge as base64, which is
+    what used to cost gigabytes on a large collection. That makes it a file
+    server on the user's machine, so the guards matter as much as the serving:
+    loopback only, a per-run token, and no path outside the cache directory.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    from thumbsrv import ThumbServer
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        storage.THUMBS_DIR = root / "thumbs"
+        storage.THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+        payload = b"\x89PNG\r\n\x1a\n" + b"payload-bytes" * 32
+        (storage.THUMBS_DIR / "avtr_shot.png").write_bytes(payload)
+        (root / "secret.txt").write_bytes(b"not a thumbnail")
+
+        server = ThumbServer()
+        check("base url is empty before start", server.base_url == "")
+        check("start succeeded", server.start() is True)
+        try:
+            base = server.base_url
+            check("base url points at loopback", base.startswith("http://127.0.0.1:"), base)
+            check("base url carries a token", len(server.token) >= 16, base)
+
+            def fetch(path: str, headers: dict | None = None):
+                request = urllib.request.Request(base + path, headers=headers or {})
+                try:
+                    with urllib.request.urlopen(request, timeout=5) as resp:
+                        return resp.status, resp.read(), dict(resp.headers)
+                except urllib.error.HTTPError as exc:
+                    return exc.code, exc.read(), dict(exc.headers)
+
+            status, body, headers = fetch("/avtr_shot.png")
+            check("image served", status == 200, str(status))
+            check("bytes are intact", body == payload, f"{len(body)} bytes")
+            check("served as png", headers.get("Content-Type") == "image/png",
+                  str(headers.get("Content-Type")))
+            check("length matches the file",
+                  headers.get("Content-Length") == str(len(payload)),
+                  str(headers.get("Content-Length")))
+            # Long-lived caching is what stops the webview re-fetching every
+            # image on every repaint.
+            check("cacheable", "max-age=31536000" in headers.get("Cache-Control", ""),
+                  str(headers.get("Cache-Control")))
+
+            etag = headers.get("ETag")
+            check("etag present", bool(etag), str(headers))
+            status, body, _ = fetch("/avtr_shot.png", {"If-None-Match": etag})
+            check("matching etag revalidates to 304", status == 304, str(status))
+            check("304 has no body", body == b"", f"{len(body)} bytes")
+
+            # A HEAD must describe the image without sending it.
+            head_request = urllib.request.Request(base + "/avtr_shot.png", method="HEAD")
+            with urllib.request.urlopen(head_request, timeout=5) as resp:
+                check("HEAD describes without a body",
+                      resp.status == 200 and resp.read() == b"")
+
+            # Everything below is a guard, not a feature.
+            status, _, _ = fetch("/wrong-token/avtr_shot.png")
+            check("wrong token refused", status == 404, str(status))
+            status, _, _ = fetch("/avtr_shot.png/../../secret.txt")
+            check("traversal refused", status == 404, str(status))
+            status, _, _ = fetch("/%2e%2e%2f%2e%2e%2fsecret.txt")
+            check("encoded traversal refused", status == 404, str(status))
+            status, _, _ = fetch("/" + urllib.parse.quote("../secret.txt"))
+            check("a decoded .. is refused", status == 404, str(status))
+            status, _, _ = fetch("/")
+            check("root is not a listing", status == 404, str(status))
+            status, _, _ = fetch("/does-not-exist.png")
+            check("missing file is a 404", status == 404, str(status))
+            check("the secret next door was never served",
+                  b"not a thumbnail" not in payload)
+        finally:
+            server.stop()
+        check("stop clears the base url", server.base_url == "")
+
+
+def test_backend_reports_the_thumbnail_url() -> None:
+    """The UI needs to be told where thumbnails live, and told when it is ""."""
+    b = _isolated_backend()
+    check("no server without services, so the base url is empty",
+          b.get_state()["thumb_base"] == "", b.get_state()["thumb_base"])
+
+    started = b._thumbs.start()
+    check("the backend's server starts on demand", started is True)
+    try:
+        reported = b.get_state()["thumb_base"]
+        check("base url reaches the UI", reported.startswith("http://127.0.0.1:"), reported)
+        check("the drawer can still ask for base64",
+              b.get_thumbnail("avtr_missing") == "")
+    finally:
+        b._thumbs.stop()
+    check("base url clears on stop", b.get_state()["thumb_base"] == "")
 
 
 def test_delete_leaves_thumbnail_for_undo() -> None:
@@ -2720,6 +2827,8 @@ def main() -> int:
         test_prune_respects_undo_grace,
         test_tray_state_reported,
         test_thumbnail_pruning,
+        test_thumbnail_http_server,
+        test_backend_reports_the_thumbnail_url,
         test_delete_leaves_thumbnail_for_undo,
     ]
     failed = 0

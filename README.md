@@ -128,8 +128,35 @@ would let the faster list quietly eat the slower one's budget.
 Lowering a cap takes effect immediately, keeping the **newest** rows and
 discarding the oldest. Settings says how many rows that would drop before you
 save, and the status bar confirms afterwards, because silently discarding rows
-you can currently see is the one outcome worth avoiding. The defaults, 800 and
-1000, are what the app enforced before these became settings.
+you can currently see is the one outcome worth avoiding.
+
+The defaults are 200 logged avatars and 1000 player changes. The avatar log is
+capped low on purpose: every row is a live element in the interface, so that
+number is really a ceiling on how much memory the log view can hold. Player
+changes are much cheaper per row — no ID and no thumbnail — which is why their
+default is higher.
+
+### Memory
+
+A few thousand saved avatars used to push the app past 3 GB of RAM. Two things
+were responsible, and both are fixed:
+
+- **Thumbnails are served over loopback instead of through the bridge.** Each
+  image used to be base64-encoded into a data URI, which put a copy of every
+  thumbnail in the Python string, in the bridge payload, and in the `src`
+  attribute of the `<img>` showing it — roughly three times the file size per
+  avatar, all held for as long as the view was open. The app now runs a tiny
+  HTTP server on `127.0.0.1` for the thumbnail cache only, and points `<img>`
+  straight at it. It is bound to loopback, guarded by a random per-run token,
+  and serves nothing outside the cache folder; if it cannot start, the UI falls
+  back to base64 by itself.
+- **Images load only near the viewport, and long lists draw a page at a time.**
+  The webview keeps a decoded bitmap for every image it has painted — about a
+  megabyte for a 512×512 avatar thumbnail — so a few thousand rows pinned a few
+  gigabytes regardless of how small the files were. Off-screen images now drop
+  their source and fall back to a shared placeholder, and the avatar grid and
+  both log tabs draw 200 rows at a time, extending as you scroll (or via the
+  **Show more** button) and saying how many are not drawn yet.
 
 The text log is scanned for IDs, but only from the handful of lines that mean an
 avatar is genuinely available to you. VRChat mentions avatar IDs in a lot of
@@ -327,6 +354,7 @@ app/
   osc.py        OSC sender + receiver (python-osc)
   api.py        optional VRChat API login + metadata/thumbnails
   storage.py    favourites.json, settings.json, thumbnail cache
+  thumbsrv.py   loopback-only server that streams the thumbnail cache
   jobs.py       progress and cancellation for long bulk operations
   tray.py       Windows notification-area icon
   vrcache.py    layered local avatar-ID discovery (read-only)

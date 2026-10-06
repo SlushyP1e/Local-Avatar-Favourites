@@ -117,6 +117,10 @@ export function makeEnvironment(apiImpl = {}, options = {}) {
   root.setAttribute = (k, v) => { root.attributes[k] = v; };
   root.attributes = {};
   const docListeners = new Map();
+  // Stand-ins for <img> elements the app has registered with registerThumbImage,
+  // so the selector app.js uses to patch a freshly loaded thumbnail finds them.
+  const thumbImages = [];
+  const THUMB_SELECTOR = /^\[data-thumb-id="(.*)"\]$/;
   const document = {
     activeElement: null,
     documentElement: root,
@@ -129,7 +133,16 @@ export function makeEnvironment(apiImpl = {}, options = {}) {
     createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
     createDocumentFragment: () => makeElement("fragment"),
     querySelector: () => null,
-    querySelectorAll: () => [],
+    querySelectorAll: (sel) => {
+      const match = THUMB_SELECTOR.exec(String(sel || ""));
+      if (!match) return [];
+      const id = match[1];
+      return thumbImages.filter((img) => img.dataset.thumbId === id);
+    },
+    registerThumbImage(img) {
+      thumbImages.push(img);
+      return img;
+    },
     addEventListener(type, fn) {
       if (!docListeners.has(type)) docListeners.set(type, []);
       docListeners.get(type).push(fn);
@@ -188,7 +201,12 @@ export function loadApp(env) {
   renderGroupDropdown, draftGroupName, showGroupPicker, setPromptMode, NEW_GROUP,
   toggleSelect, clearSelection, promptForGroupName,
   get selection() { return selection; },
-  wire, renderGrid, renderHeader, render,
+  wire, renderGrid, renderHeader, render, renderLogs,
+  setThumbBase, thumbUrlFor, lazyThumb, resolveThumbSrc, onThumbVisibility,
+  thumbLoadFailed, PAGE_ROWS, pageFor, pageSize, listTotal, growActiveList,
+  growOnScroll, renderMoreRow, activeListName,
+  get logTab() { return logTab; },
+  set logTab(v) { logTab = v; },
   get currentView() { return currentView; },
   set currentView(v) { currentView = v; },
   get currentFilter() { return currentFilter; },

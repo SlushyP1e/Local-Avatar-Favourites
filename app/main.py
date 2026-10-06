@@ -47,7 +47,7 @@ def _web_dir() -> str:
 # build/ between runs, and a stale bundle looks exactly like a broken feature:
 # the UI silently loses behaviour with no error anywhere.
 CSS_MARKERS = ("data-motion", "view-in-next", "prefers-reduced-motion",
-               ".group-picker", ".chip-count")
+               ".group-picker", ".chip-count", ".more-row")
 
 # Element ids app.js binds to at startup. A missing one throws in wire(), which
 # would leave every later listener unwired with no useful error.
@@ -178,6 +178,22 @@ def main() -> int:
         print(f"Local Avatar Favourites {__version__}{frozen}")
         print(f"  entries loaded : {len(backend.entries)}")
         print(f"  discovery      : {backend.discovery_state()['sources']}")
+
+        # The thumbnail server is what keeps a large collection from costing
+        # gigabytes of RAM. Nothing else in a bundle check touches it, so a build
+        # that shipped without it would look perfect here and then quietly fall
+        # back to base64 for the rest of the session.
+        thumbs = backend._thumbs
+        try:
+            thumb_ok = thumbs.start() and bool(thumbs.base_url)
+        except Exception:
+            thumb_ok = False
+        finally:
+            thumbs.stop()
+        print(f"  thumb server   : {'loopback OK' if thumb_ok else 'UNAVAILABLE'}")
+        if not thumb_ok:
+            return 1
+
         print(f"  tray available : {tray_available()}")
         print(f"  tray icon file : {icon or 'MISSING'}")
         # A stale bundle looks identical to a broken feature, so verify the
