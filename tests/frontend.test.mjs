@@ -671,6 +671,177 @@ test("the log list paginates too, and says which page", () => {
   assert.match(env.document.getElementById("logs-count").textContent, /page 1 of 3/);
 });
 
+// ----------------------------------------------------- infinite scroll option
+
+test("the grid is paged until the setting is turned on", () => {
+  // The default has to stay paged: paging is what keeps the DOM small, and a
+  // first-run user with thousands of favourites should not get that all at once.
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.renderGrid(true);
+
+  assert.equal(app.state.infinite_scroll, false, "off by default");
+  const { cards, pager } = gridRows(env);
+  assert.equal(cards.length, 50);
+  assert.ok(pager, "paging is still in force");
+});
+
+test("infinite scroll draws the whole grid and no pager", () => {
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.state = { ...app.state, infinite_scroll: true };
+
+  app.renderGrid(true);
+
+  assert.equal(app.infiniteGrid(), true);
+  const { cards, pager } = gridRows(env);
+  assert.equal(cards.length, 4000, "every avatar is drawn, not one page");
+  assert.equal(pager, null, "there is nothing to page to");
+  assert.equal(app.pagerFor("grid"), null);
+});
+
+test("the status bar drops the page number under infinite scroll", () => {
+  // Claiming "page 1 of 80" would be a dead end: there is no way to reach 80.
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.renderGrid(true);
+  assert.match(env.document.getElementById("count").textContent, /page 1 of 80/);
+
+  app.state = { ...app.state, infinite_scroll: true };
+  app.renderGrid(true);
+  const text = env.document.getElementById("count").textContent;
+  assert.equal(text, "4000 avatars", text);
+});
+
+test("infinite scroll still respects the filter and the search", () => {
+  // Drawing everything is not a licence to draw everything regardless of the
+  // filter, which is the whole point of visibleEntries.
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.state = { ...app.state, infinite_scroll: true };
+  env.document.getElementById("search").value = "Avatar 1";
+  app.renderGrid(true);
+
+  // "Avatar 1" also matches 10-19, 100-199, ... so this is deliberately loose:
+  // what matters is that it is far short of the full 4,000.
+  const drawn = gridRows(env).cards.length;
+  assert.ok(drawn > 0 && drawn < 4000, `drew ${drawn} rows`);
+});
+
+test("the log tabs stay paged whatever the grid is doing", () => {
+  // The log lists are bounded by the log limits and re-sorted constantly, so
+  // letting them grow unbounded is a cost with nothing in return.
+  const { env, app } = setup();
+  app.state = { ...app.state, infinite_scroll: true, logs: Array.from({ length: 120 }, (_, i) => ({
+    id: "avtr_log" + i, name: "Logged " + i, count: 1,
+    last_seen: "2026-01-01T00:00:00+00:00", private: false, source: "log",
+  })) };
+  app.currentView = "logs";
+  app.logTab = "avatars";
+
+  app.renderLogs(true);
+
+  const logs = env.document.getElementById("logs");
+  assert.equal(logs.children.length, 51, "50 rows plus the pager, as before");
+  assert.equal(app.pagerFor("logs").className, "pager");
+  assert.match(env.document.getElementById("logs-count").textContent, /page 1 of 3/);
+});
+
+test("jumping to a page while infinite scroll is on does nothing", () => {
+  // Nothing renders a page button in this mode, so this is the belt-and-braces
+  // path: a stale control must not be able to slice the list or scroll the user
+  // away from where they are reading.
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.renderGrid(true);
+
+  app.state = { ...app.state, infinite_scroll: true };
+  app.renderGrid(true);
+  const before = env.document.getElementById("grid-wrap").scrollTop;
+
+  app.goToPage("grid", 40);
+
+  assert.equal(app.currentPage.grid, 1, "unchanged: still page 1");
+  assert.equal(gridRows(env).cards.length, 4000, "the grid is not re-sliced");
+  assert.equal(env.document.getElementById("grid-wrap").scrollTop, before,
+    "and the scroll position is left alone");
+});
+
+test("switching back to paging restores the pager where the user was", () => {
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.renderGrid(true);
+  app.goToPage("grid", 40);
+
+  // The page number is preserved across the round trip on purpose, so toggling
+  // the setting on and off again is not a jump back to the top of a long list.
+  app.state = { ...app.state, infinite_scroll: true };
+  app.renderGrid(true);
+  assert.equal(gridRows(env).cards.length, 4000);
+  assert.equal(gridRows(env).pager, null);
+
+  app.state = { ...app.state, infinite_scroll: false };
+  app.renderGrid(true);
+  const { cards, pager } = gridRows(env);
+  assert.equal(cards.length, 50, "back to one page");
+  assert.ok(pager, "the pager comes back");
+  assert.equal(app.currentPage.grid, 40, "and returns to the page it was on");
+  assert.match(env.document.getElementById("count").textContent, /page 40 of 80/);
+});
+
+test("resuming paging after the list shrank lands on a real page", () => {
+  // The preserved page number must not survive as a dead end. Here the search
+  // both shrinks the list and resets the key, so this mostly re-checks existing
+  // clamp behaviour -- which is the point: turning the setting off must not
+  // introduce a page the user cannot get back from.
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  app.renderGrid(true);
+  app.goToPage("grid", 40);
+  app.state = { ...app.state, infinite_scroll: true };
+
+  env.document.getElementById("search").value = "Avatar 1";
+  app.renderGrid(true);
+  app.state = { ...app.state, infinite_scroll: false };
+  app.renderGrid(true);
+
+  const pages = app.pageCount(app.listTotal.grid);
+  assert.ok(app.currentPage.grid >= 1 && app.currentPage.grid <= pages,
+    `page ${app.currentPage.grid} of ${pages}`);
+  assert.ok(gridRows(env).cards.length > 0, "something is drawn");
+  assert.ok(gridRows(env).pager, "and the pager still offers a way back");
+});
+
+test("the settings note warns about the cost, and says how big the list is", () => {
+  const { env, app } = setup();
+  withAvatars(app, 4000);
+  const note = env.document.getElementById("set-infinite-note");
+
+  env.document.getElementById("set-infinite-scroll").checked = false;
+  app.renderInfiniteNote();
+  assert.match(note.textContent, /Off/);
+  assert.ok(!note.classList.contains("warn-text"), "off is not a warning");
+
+  env.document.getElementById("set-infinite-scroll").checked = true;
+  app.renderInfiniteNote();
+  assert.match(note.textContent, /4000 saved avatars/, note.textContent);
+  assert.match(note.textContent, /stays in memory/, note.textContent);
+  assert.match(note.textContent, /log tabs stay paged/, note.textContent);
+  assert.ok(note.classList.contains("warn-text"),
+    "a 4,000-avatar grid has to be flagged as expensive");
+});
+
+test("the note is calm about a small collection", () => {
+  // Warning about everything trains people to ignore warnings, and a 12-avatar
+  // grid is not a performance problem.
+  const { env, app } = setup();
+  withAvatars(app, 12);
+  env.document.getElementById("set-infinite-scroll").checked = true;
+  app.renderInfiniteNote();
+  const note = env.document.getElementById("set-infinite-note");
+  assert.ok(!note.classList.contains("warn-text"), note.textContent);
+});
+
 // ------------------------------------------------------------------- autosave
 
 test("closing the drawer flushes a pending edit", async () => {

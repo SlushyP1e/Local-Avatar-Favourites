@@ -184,6 +184,26 @@ still a row of buttons rather than 80. Changing the filter, search or sort
 returns to page 1; a background data refresh does not, so you stay where you
 were.
 
+### Continuous scrolling (opt-in)
+
+**Settings → Appearance → Scroll continuously instead of paging** turns the
+avatar grid into one uninterrupted list, so there is no page bar to click
+through. It is **off by default**, because it undoes the memory behaviour
+described above: every avatar you have saved becomes a live card holding a
+decoded thumbnail, and the grid repaints in full whenever the list changes rather
+than redrawing 50 rows.
+
+Settings states the cost in terms of your own collection rather than a general
+caveat, and marks it as a warning past a few hundred avatars, because that is
+roughly where scrolling and searching start to feel it. Under about 50 there is
+nothing to scroll anyway, so the setting changes nothing visible. Turning it on
+and off again returns you to the page you were on rather than the top.
+
+This applies to the avatar grid only. The two log tabs stay paged in both modes:
+their lists are already bounded by the log limits below, and they re-sort as new
+rows arrive, so an unbounded DOM there would cost memory with nothing to show
+for it.
+
 The text log is scanned for IDs, but only from the handful of lines that mean an
 avatar is genuinely available to you. VRChat mentions avatar IDs in a lot of
 places that have nothing to do with that, and harvesting all of them was the

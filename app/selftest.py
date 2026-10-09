@@ -2773,6 +2773,16 @@ def test_exit_on_close_setting() -> None:
     b.save_settings(9000, 9001)
     check("omitted flag is left alone", b.settings["exit_on_close"] is False)
 
+    # Both optional flags have to be independently omittable. Setting one through
+    # an older two-argument call must not reset the other, which is the kind of
+    # silent loss a new optional argument invites.
+    b.save_settings(9000, 9001, exit_on_close=False, infinite_scroll=True)
+    check("exit_on_close alone does not clear infinite scroll",
+          b.settings["infinite_scroll"] is True, str(b.settings["infinite_scroll"]))
+    b.save_settings(9000, 9001, infinite_scroll=True, exit_on_close=True)
+    check("infinite_scroll alone does not clear exit_on_close",
+          b.settings["exit_on_close"] is True, str(b.settings["exit_on_close"]))
+
 
 def test_tray_state_reported() -> None:
     b = _isolated_backend()
@@ -3005,6 +3015,56 @@ def test_motion_setting() -> None:
     check("omitted motion is left alone", b.settings["motion"] == "none")
 
 
+def test_infinite_scroll_setting() -> None:
+    """Continuous scrolling must survive a round trip and default to off."""
+    b = _isolated_backend()
+
+    # Off by default, not merely unset: an existing settings.json written by an
+    # older build has no such key, and that user must not silently have paging
+    # replaced by a grid that holds their entire collection in memory.
+    check("infinite scroll defaults off",
+          b.settings.get("infinite_scroll") is False,
+          str(b.settings.get("infinite_scroll")))
+    check("default is documented", storage.DEFAULT_SETTINGS["infinite_scroll"] is False)
+    check("reported in settings", b.get_settings()["infinite_scroll"] is False)
+    # Reported on the poll too, so the UI picks up a change made outside it.
+    check("reported in state", b.get_state()["infinite_scroll"] is False)
+
+    b.save_settings(9000, 9001, infinite_scroll=True)
+    check("turning it on sticks", b.settings["infinite_scroll"] is True,
+          str(b.settings["infinite_scroll"]))
+    check("turning it on persists",
+          storage.load_settings()["infinite_scroll"] is True,
+          str(storage.load_settings()["infinite_scroll"]))
+    check("turning it on is reported", b.get_settings()["infinite_scroll"] is True)
+    check("turning it on reaches the poll", b.get_state()["infinite_scroll"] is True)
+
+    b.save_settings(9000, 9001, infinite_scroll=False)
+    check("turning it back off works", b.settings["infinite_scroll"] is False,
+          str(b.settings["infinite_scroll"]))
+
+    # A checkbox posts a boolean, but JSON is not a type system and a hand-edited
+    # file can hold anything. Truthy junk must not arrive in the UI as a truthy
+    # value that then reads as "on" for a reason nobody chose.
+    for junk, expected in ((1, True), ("yes", True), (0, False), ("", False),
+                          ([], False), ({}, False)):
+        b.save_settings(9000, 9001, infinite_scroll=junk)
+        check(f"coerces {junk!r}", b.settings["infinite_scroll"] is expected,
+              str(b.settings["infinite_scroll"]))
+
+    # A hand-edited file gets the same treatment as everything else in
+    # sanitize_settings, rather than being passed through as-is.
+    storage.save_settings({"infinite_scroll": "off"})
+    check("hand-edited truthy string is on",
+          storage.load_settings()["infinite_scroll"] is True,
+          str(storage.load_settings()["infinite_scroll"]))
+
+    # Omitted means untouched, so the older narrower calls still work.
+    b.settings["infinite_scroll"] = True
+    b.save_settings(9000, 9001)
+    check("omitted infinite scroll is left alone", b.settings["infinite_scroll"] is True)
+
+
 def main() -> int:
     # Results carry real VRChat data, and VRChat names are full of characters a
     # legacy console cannot encode -- ［Protogen］Kuro alone is enough to raise
@@ -3097,6 +3157,7 @@ def main() -> int:
         test_wear_last,
         test_exit_on_close_setting,
         test_motion_setting,
+        test_infinite_scroll_setting,
         test_settings_save_unchanged_ports,
         test_undo_keeps_the_thumbnail,
         test_prune_respects_undo_grace,

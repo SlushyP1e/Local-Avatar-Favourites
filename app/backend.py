@@ -822,6 +822,9 @@ class Backend:
                 "discovery": self.discovery_state(),
                 "job": self._jobs.active(),
                 "motion": self.settings.get("motion", storage.DEFAULT_MOTION),
+                # Reported on every poll, not just through get_settings, so a
+                # change made outside the app is picked up like motion is.
+                "infinite_scroll": bool(self.settings.get("infinite_scroll", False)),
                 "tray": bool(getattr(self, "_tray", None)),
                 "osc": {
                     "listening": self.osc.listening,
@@ -852,6 +855,7 @@ class Backend:
             "discovery": self.discovery_state(),
             "exit_on_close": bool(self.settings.get("exit_on_close", True)),
             "motion": self.settings.get("motion", storage.DEFAULT_MOTION),
+            "infinite_scroll": bool(self.settings.get("infinite_scroll", False)),
             "max_avatar_log": self._log_limit(),
             "max_player_changes": self._change_limit(),
             "tray": bool(getattr(self, "_tray", None)),
@@ -1774,7 +1778,8 @@ class Backend:
 
     # ------------------------------------------------------------------ settings
     def save_settings(self, send_port, recv_port, exit_on_close=None, motion=None,
-                       max_avatar_log=None, max_player_changes=None) -> dict:
+                       max_avatar_log=None, max_player_changes=None,
+                       infinite_scroll=None) -> dict:
         try:
             send_port = int(send_port)
             recv_port = int(recv_port)
@@ -1799,6 +1804,12 @@ class Backend:
             self.settings["motion"] = (
                 mode if mode in storage.MOTION_MODES else storage.DEFAULT_MOTION
             )
+
+        # Grid paging. Optional like the others, so the narrower self-test calls
+        # still work, and coerced to a bool because JSON hands back whatever the
+        # UI sent rather than a real boolean.
+        if infinite_scroll is not None:
+            self.settings["infinite_scroll"] = bool(infinite_scroll)
 
         # Log caps, applied the same way: only when supplied, so the older
         # narrower calls still work. Rejected outright rather than clamped --

@@ -15,6 +15,7 @@ let state = {
   pending_2fa: false,
   version: "",
   motion: "full",
+  infinite_scroll: false,
   discovery: { sources: {}, backlog: 0, db_path: "" },
   osc: { listening: false, error: null, seen_traffic: false },
 };
@@ -816,6 +817,38 @@ const PAGE_ROWS = 50;
 // 10,000-row list does not render 200 buttons.
 const PAGE_BUTTON_CAP = 7;
 
+// True when the user has opted out of paging on the avatar grid, in which case
+// the whole list is drawn at once. Applies to the grid only: the log tabs stay
+// paged, because their lists are bounded by the log limits the user has already
+// agreed to and are re-sorted as new rows arrive, so a growing DOM there is a
+// cost with nothing to show for it.
+function infiniteGrid() {
+  return !!state.infinite_scroll;
+}
+
+// How many rows the grid may draw. The whole list when infinite scrolling is on,
+// otherwise one page.
+function gridSlice(name, list) {
+  if (name === "grid" && infiniteGrid()) return list;
+  return pageSlice(name, list);
+}
+
+// Paging is off entirely for the grid when infinite scrolling is on, so there is
+// no pager to draw -- not a pager that does nothing.
+function pagerFor(name) {
+  if (name === "grid" && infiniteGrid()) return null;
+  return renderPager(name);
+}
+
+// The status bar. Under infinite scrolling there are no pages to describe, so
+// this must not claim there is a page 1 of 7 the user cannot reach.
+function gridCountText(total) {
+  const n = `${total} avatar${total === 1 ? "" : "s"}`;
+  if (infiniteGrid()) return n;
+  const pages = pageCount(total);
+  return pages > 1 ? `${n} · page ${currentPage.grid} of ${pages}` : n;
+}
+
 // Which page each list is on. Not reset by a data refresh -- a new avatar
 // appearing must not throw the user back to page 1 -- but reset by anything that
 // changes what the list is showing.
@@ -869,6 +902,12 @@ function activeListName() {
 }
 
 function goToPage(name, page) {
+  // Infinite scrolling has no pages, so a call here must change nothing -- not
+  // the page number either. Deliberately left intact rather than reset to 1:
+  // nothing renders a page button in this mode, so this only fires from a stale
+  // control, and keeping the number means switching back to paging returns the
+  // user to the page they were on rather than to the top.
+  if (name === "grid" && infiniteGrid()) return;
   const pages = pageCount(listTotal[name]);
   const next = Math.min(Math.max(1, page), pages);
   if (next === currentPage[name]) return;
@@ -994,6 +1033,10 @@ function renderGrid(force) {
     q: $("search").value,
     s: $("sort").value,
     c: state.current_avatar_id,
+    // Part of the signature because it changes what the grid draws: toggling it
+    // in Settings has to repaint, and it arrives on the poll rather than with
+    // the save that set it.
+    inf: infiniteGrid(),
     items: list.map((e) => [e.id, e.name, e.thumb, e.author, e.favorite, !!e.inaccessible,
       e.release_status, (e.platforms || []).join(","), (e.tags || []).join(",")]),
   });
@@ -1011,16 +1054,15 @@ function renderGrid(force) {
     return;
   }
   $("grid-empty").classList.add("hidden");
+  // Recorded either way: listTotal.grid is what the clamp and the pager read,
+  // and under infinite scrolling clampPage is what stops a stale page number
+  // from surviving a later switch back to paging.
   pageFor("grid", [currentFilter, currentGroup, $("search").value,
     $("sort").value], list.length);
-  const pages = pageCount(list.length);
-  const page = currentPage.grid;
-  $("count").textContent = pages > 1
-    ? `${list.length} avatar${list.length === 1 ? "" : "s"} · page ${page} of ${pages}`
-    : `${list.length} avatar${list.length === 1 ? "" : "s"}`;
+  $("count").textContent = gridCountText(list.length);
 
   const frag = document.createDocumentFragment();
-  for (const entry of pageSlice("grid", list)) {
+  for (const entry of gridSlice("grid", list)) {
     const card = document.createElement("article");
     card.className = "card"
       + (entry.id === state.current_avatar_id ? " wearing" : "")
@@ -1095,7 +1137,7 @@ function renderGrid(force) {
     });
     frag.appendChild(card);
   }
-  const pager = renderPager("grid");
+  const pager = pagerFor("grid");
   if (pager) frag.appendChild(pager);
   grid.appendChild(frag);
 }
@@ -1767,6 +1809,10 @@ async function openSettings() {
   $("set-exit-on-close").checked = s.exit_on_close !== false;
   $("set-motion").value = s.motion || "system";
   renderMotionNote();
+  // Falling back to false matches storage.DEFAULT_SETTINGS: get_settings always
+  // reports the resolved value, so an older settings file simply gets paging.
+  $("set-infinite-scroll").checked = !!s.infinite_scroll;
+  renderInfiniteNote();
   // Fallbacks only: get_settings always reports the resolved value, so these
   // match storage.DEFAULT_MAX_AVATAR_LOG / DEFAULT_MAX_PLAYER_CHANGES.
   $("set-max-avatar-log").value = s.max_avatar_log || 200;
@@ -1863,7 +1909,8 @@ async function doLogout() {
 async function saveSettings() {
   const res = await call("save_settings", $("set-send").value, $("set-recv").value,
                          $("set-exit-on-close").checked, $("set-motion").value,
-                         $("set-max-avatar-log").value, $("set-max-player-changes").value);
+                         $("set-max-avatar-log").value, $("set-max-player-changes").value,
+                         $("set-infinite-scroll").checked);
   if (!res.ok) { showAlert("Invalid settings", res.message || "Could not save settings."); return; }
   closeModal("modal-settings");
   // Say so when rows were discarded, rather than letting the list quietly be
@@ -1982,6 +2029,39 @@ function renderLimitsNote() {
   el.classList.toggle("warn-text", bits.length > 0);
 }
 
+/* Warns about the cost of continuous scrolling, using the user's own collection
+   size rather than a vague caveat. The trade is real and asymmetric: paging
+   holds 50 rows alive whatever the collection size, so the same setting that is
+   pleasant at 200 avatars is what brings back the memory growth the pager
+   exists to prevent. */
+function renderInfiniteNote() {
+  const el = $("set-infinite-note");
+  if (!el) return;
+  if (!$("set-infinite-scroll").checked) {
+    el.textContent = "Off: the avatar grid shows 50 at a time with page buttons. "
+      + "Only those rows are held in memory, however many avatars you have saved.";
+    el.classList.remove("warn-text");
+    return;
+  }
+  const total = state.entries ? state.entries.length : 0;
+  // Thresholds are where the behaviour actually changes rather than round
+  // numbers: under one screenful there is nothing to scroll, and past a few
+  // hundred the grid stops being cheap to repaint on every poll.
+  let advice;
+  if (total <= 50) {
+    advice = "Your collection fits in one page anyway, so this changes nothing yet.";
+  } else if (total <= 300) {
+    advice = "That should still feel quick.";
+  } else {
+    advice = "Expect scrolling and search to get slower, and to use more memory.";
+  }
+  el.textContent = `On: all ${total} saved avatar${total === 1 ? "" : "s"} are drawn at `
+    + `once instead of 50 at a time. Every card stays in memory with its `
+    + `thumbnail, and the whole grid repaints whenever the list changes. ${advice} `
+    + "The log tabs stay paged either way.";
+  el.classList.toggle("warn-text", total > 300);
+}
+
 /* Spells out *why* nothing is moving. "Follow Windows" silently doing nothing
    reads as a broken app, so name the actual cause and the fix. */
 function renderMotionNote() {
@@ -2093,6 +2173,10 @@ async function refreshState() {
   // to notice.
   setThumbBase(next.thumb_base);
   if (next.motion && next.motion !== state.motion) state.motion = next.motion;
+  // Same reasoning as motion: adopted every poll so an edit to settings.json made
+  // outside the app takes effect. renderGrid() below repaints, because the flag
+  // is part of the grid's signature.
+  if (next.infinite_scroll != null) state.infinite_scroll = !!next.infinite_scroll;
   // Re-apply every poll so a change made outside the app is picked up.
   applyMotionPreference();
   renderJob(next.job);
@@ -2381,6 +2465,10 @@ function wire() {
   $("set-login").addEventListener("click", doLogin);
   $("set-logout").addEventListener("click", doLogout);
   $("set-motion").addEventListener("change", previewMotion);
+  // The note only; the grid itself is repainted by the next poll, which carries
+  // the saved value. Previewing it here would mean the grid changing under the
+  // user before they had committed to anything.
+  $("set-infinite-scroll").addEventListener("change", renderInfiniteNote);
   $("set-method").addEventListener("change", updateTwoFactorLabel);
   $("set-max-avatar-log").addEventListener("input", renderLimitsNote);
   $("set-max-player-changes").addEventListener("input", renderLimitsNote);

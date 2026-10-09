@@ -95,6 +95,11 @@ DEFAULT_SETTINGS = {
     # "Unnamed avatar" for the very avatars the user just blocked. Best effort
     # and cosmetic: an avatar blocked before it was ever named has no entry.
     "ignored_names": {},
+    # Draw the avatar grid as one continuous list instead of 50-row pages. Off by
+    # default because it is a memory trade, not a free win: every avatar the user
+    # has ever saved becomes a live card with its own decoded thumbnail, so the
+    # cost grows with the whole collection rather than with what is on screen.
+    "infinite_scroll": False,
 }
 
 
@@ -415,6 +420,7 @@ def sanitize_settings(raw) -> dict:
         settings[key] = value if isinstance(value, str) else ""
 
     settings["exit_on_close"] = bool(settings.get("exit_on_close", True))
+    settings["infinite_scroll"] = bool(settings.get("infinite_scroll", False))
 
     # Accept surrounding whitespace and any casing, so a hand-edited
     # "FULL" behaves the same as one saved through the UI.
