@@ -4,7 +4,7 @@ A small standalone Windows tool for VRChat that keeps an **unlimited local list 
 
 ![uses: OSC](https://img.shields.io/badge/uses-OSC-8a2be2) ![platform: Windows](https://img.shields.io/badge/platform-Windows-blue) ![built: Python](https://img.shields.io/badge/built-Python_3.11-green) ![license: MIT](https://img.shields.io/badge/license-MIT-green)
 
-![Local Avatar Favourites on a tablet](docs/tablet-demo.png)
+![Local Avatar Favourites on a tablet](docs/tablet-demo.webp)
 
 ![Local Avatar Favourites preview](docs/preview.gif)
 
